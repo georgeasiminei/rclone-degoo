@@ -173,11 +173,11 @@ The source-checkout wrapper provides friendly aliases and the same checks:
 ```
 
 `list` maps to `trash`, and `empty` maps to `empty-trash`. The wrapper defaults
-to the contained installation's `config/auth.json`, uses `build/rclone` from
-the checkout when present, and otherwise falls back to `rclone` on `PATH`. Set
-`RCLONE_DEGOO_AUTH` or `RCLONE_DEGOO_BIN`, or pass `--auth` or `--rclone`, to
-override either path. It passes the auth file through and never reads or
-displays its contents.
+to the contained installation's `config/auth.json`. It prefers a packaged
+`bin/rclone`, then a source checkout's `build/rclone`, then `rclone` from
+`PATH`. Set `RCLONE_DEGOO_AUTH` or `RCLONE_DEGOO_BIN`, or pass `--auth`
+or `--rclone`, to override either path. It passes the auth file through
+without reading or displaying its contents.
 
 Trash is not confined to one Degoo folder or vault. Listing can expose
 account-wide metadata, and emptying can destroy unrelated trash. Generic

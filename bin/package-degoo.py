@@ -40,6 +40,7 @@ DOC_FILES = (
 PACKAGE_ENTRIES = (
     ("contrib/degoo/install.sh", "install.sh"),
     ("contrib/degoo/uninstall.sh", "uninstall.sh"),
+    ("contrib/degoo/trash.sh", "trash.sh"),
     ("contrib/degoo/DISTRIBUTION.md", "README.md"),
     *((f"contrib/degoo/scripts/python/{name}", f"scripts/python/{name}") for name in PYTHON_HELPERS),
     *((f"docs/degoo/{name}", f"docs/{name}") for name in DOC_FILES),
@@ -238,6 +239,7 @@ def extracted_archive(archive_path: Path, expected_paths: set[str], destination:
                     f"{ROOT_NAME}/bin/rclone",
                     f"{ROOT_NAME}/install.sh",
                     f"{ROOT_NAME}/uninstall.sh",
+                    f"{ROOT_NAME}/trash.sh",
                 ) and not member.mode & 0o111:
                     raise PackageError(f"the package entrypoint is not executable: {member.name}")
             root = destination / ROOT_NAME
@@ -294,7 +296,7 @@ def validate_archive_launchers(archive_path: Path, expected_paths: set[str]) -> 
             "LC_ALL": "C",
         }
         Path(env["HOME"]).mkdir()
-        for name in ("install.sh", "uninstall.sh"):
+        for name in ("install.sh", "uninstall.sh", "trash.sh"):
             run_launcher_help(extracted / name, env)
 
 
@@ -369,7 +371,7 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
                             add_bytes(archive, arcname, data)
                             continue
                         with source.open("rb") as stream:
-                            mode = 0o755 if PurePosixPath(arcname).name in {"install.sh", "uninstall.sh"} else 0o644
+                            mode = 0o755 if PurePosixPath(arcname).name in {"install.sh", "uninstall.sh", "trash.sh"} else 0o644
                             archive.addfile(tar_info(arcname, source.stat().st_size, mode), stream)
             raw.flush()
             os.fsync(raw.fileno())
@@ -573,6 +575,7 @@ def self_check(root: Path) -> None:
         required_paths = {
             f"{ROOT_NAME}/install.sh",
             f"{ROOT_NAME}/uninstall.sh",
+            f"{ROOT_NAME}/trash.sh",
             f"{ROOT_NAME}/README.md",
             f"{ROOT_NAME}/bin/rclone",
             f"{ROOT_NAME}/licenses/COPYING",
@@ -590,7 +593,7 @@ def self_check(root: Path) -> None:
             binary_info = archive.getmember(f"{ROOT_NAME}/bin/rclone")
             if not binary_info.mode & 0o111:
                 raise PackageError("self-check found a non-executable packaged binary")
-            for launcher in (f"{ROOT_NAME}/install.sh", f"{ROOT_NAME}/uninstall.sh"):
+            for launcher in (f"{ROOT_NAME}/install.sh", f"{ROOT_NAME}/uninstall.sh", f"{ROOT_NAME}/trash.sh"):
                 launcher_info = archive.getmember(launcher)
                 if not launcher_info.mode & 0o111:
                     raise PackageError(f"self-check found a non-executable launcher: {launcher}")

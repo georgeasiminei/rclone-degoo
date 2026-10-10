@@ -77,6 +77,22 @@ Then log in and finish setup using the contained helpers:
 ~/.local/share/rclone-degoo/service.sh enable
 ```
 
+## Account trash
+
+The packaged `trash.sh` helper wraps the account-wide Degoo trash commands and
+uses the packaged `bin/rclone` automatically:
+
+```sh
+./trash.sh list --auth ~/.config/rclone-degoo/auth.json
+./trash.sh list --auth ~/.config/rclone-degoo/auth.json --limit 10 --json
+./trash.sh empty --auth ~/.config/rclone-degoo/auth.json --dry-run
+./trash.sh empty --auth ~/.config/rclone-degoo/auth.json --yes
+```
+
+Trash is account-wide, not vault-scoped. Emptying it is irreversible and prompts
+twice unless `--yes` is supplied. The wrapper does not read or print the auth
+file contents. There is no restore operation.
+
 ## Mount, upgrade, and recover
 
 At the end of setup, the wizard prints the install directory, mount path,
@@ -168,6 +184,7 @@ rclone-degoo/
   README.md
   install.sh
   uninstall.sh
+  trash.sh
   bin/rclone
   scripts/python/*.py
   docs/*.md

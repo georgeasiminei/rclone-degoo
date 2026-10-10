@@ -147,6 +147,7 @@ limits and verify_upload; explicit command-line flags take precedence.`, Args: c
 	}}
 	root.AddCommand(initialize, login, logout, mount, status)
 	addSetupCommands(root)
+	addTrashCommands(root)
 }
 
 func promptPassword(prompt string) (string, error) {

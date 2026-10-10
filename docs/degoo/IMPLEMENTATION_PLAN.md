@@ -63,7 +63,8 @@ mutating. This is deliberately not exposed through generic rclone cleanup or
 remote paths because the operation is account-wide and crypt/chunker would
 otherwise propagate a dangerous folder-shaped feature. No restore operation is
 provided. `contrib/degoo/trash.sh` wraps only these explicit commands and
-passes the private auth path without reading it.
+passes the private auth path without reading it. The wrapper is included in
+the distributable package and exercised by the packaging self-check.
 
 1. Implement the provider request contracts from the pinned Python reference
    in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and

@@ -807,3 +807,184 @@ func TestChecksumRepresentationAndReadLimit(t *testing.T) {
 		t.Fatalf("Checksum consumed %d excess bytes", len("tail-data")-reader.Len())
 	}
 }
+
+func TestItemUnmarshalJSONRecycleFlag(t *testing.T) {
+	data := []byte(`{"ID":"17","Name":"example.txt","ParentID":"3","Category":6,"Size":"42","IsInRecycleBin":true}`)
+	var item Item
+	if err := json.Unmarshal(data, &item); err != nil {
+		t.Fatalf("unmarshal Item: %v", err)
+	}
+	if !item.IsInRecycleBin {
+		t.Fatal("IsInRecycleBin was not decoded")
+	}
+}
+
+func TestListTrashPaginatesAndHonorsLimit(t *testing.T) {
+	tokens := &testTokens{initial: "token"}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		if body == nil {
+			return
+		}
+		variables := body["variables"].(map[string]any)
+		if variables["Order"] != float64(3) {
+			t.Errorf("Order = %v, want 3", variables["Order"])
+		}
+		page := requests.Add(1)
+		if page == 1 {
+			if variables["Limit"] != float64(2) {
+				t.Errorf("first-page Limit = %v, want 2", variables["Limit"])
+			}
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"getDeletedFiles": map[string]any{
+				"Items":     []map[string]any{{"ID": "1", "Name": "first", "ParentID": "parent", "Category": 6, "Size": "10", "IsInRecycleBin": true}},
+				"NextToken": "opaque-cursor",
+			}}})
+			return
+		}
+		if variables["NextToken"] != "opaque-cursor" {
+			t.Errorf("NextToken = %v, want opaque-cursor", variables["NextToken"])
+		}
+		if variables["Limit"] != float64(1) {
+			t.Errorf("second-page Limit = %v, want 1", variables["Limit"])
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getDeletedFiles": map[string]any{
+			"Items": []map[string]any{{"ID": "2", "Name": "second", "ParentID": "parent", "Category": 6, "Size": "20", "IsInRecycleBin": true}},
+		}}})
+	}))
+	defer server.Close()
+
+	items, err := newTestClient(server, tokens).ListTrash(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("ListTrash: %v", err)
+	}
+	if len(items) != 2 || items[0].ID != "1" || items[1].ID != "2" || requests.Load() != 2 {
+		t.Fatalf("unexpected result: items=%v requests=%d", items, requests.Load())
+	}
+	if !items[0].IsInRecycleBin || !items[1].IsInRecycleBin {
+		t.Fatalf("trash items were not marked as in the recycle bin: %#v", items)
+	}
+}
+
+func TestListTrashListsAllPagesWhenLimitIsZero(t *testing.T) {
+	tokens := &testTokens{initial: "token"}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		if body == nil {
+			return
+		}
+		variables := body["variables"].(map[string]any)
+		if variables["Limit"] != float64(maxLimit) {
+			t.Errorf("Limit = %v, want %d", variables["Limit"], maxLimit)
+		}
+		page := requests.Add(1)
+		result := map[string]any{"Items": []map[string]any{{"ID": fmt.Sprint(page), "Name": "item", "Category": 6, "Size": 1, "IsInRecycleBin": true}}}
+		if page == 1 {
+			result["NextToken"] = "cursor"
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"getDeletedFiles": result}})
+			return
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getDeletedFiles": result}})
+	}))
+	defer server.Close()
+
+	items, err := newTestClient(server, tokens).ListTrash(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("ListTrash: %v", err)
+	}
+	if len(items) != 2 || items[0].ID != "1" || items[1].ID != "2" || requests.Load() != 2 {
+		t.Fatalf("unexpected result: items=%v requests=%d", items, requests.Load())
+	}
+}
+
+func TestListTrashRejectsNonRecycledItem(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getDeletedFiles": map[string]any{
+			"Items": []map[string]any{{"ID": "1", "Name": "active", "Category": 6, "Size": 1, "IsInRecycleBin": false}},
+		}}})
+	}))
+	defer server.Close()
+
+	_, err := newTestClient(server, &testTokens{initial: "token"}).ListTrash(context.Background(), 0)
+	if err == nil || !strings.Contains(err.Error(), "was not marked as in the recycle bin") {
+		t.Fatalf("ListTrash error = %v, want non-recycled item rejection", err)
+	}
+}
+
+func TestListTrashRejectsDuplicateIDsAcrossPages(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		page := requests.Add(1)
+		result := map[string]any{"Items": []map[string]any{{"ID": "duplicate", "Name": "item", "Category": 6, "Size": 1, "IsInRecycleBin": true}}}
+		if page == 1 {
+			result["NextToken"] = "next"
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getDeletedFiles": result}})
+	}))
+	defer server.Close()
+
+	_, err := newTestClient(server, &testTokens{initial: "token"}).ListTrash(context.Background(), 0)
+	if err == nil || !strings.Contains(err.Error(), `duplicate item ID "duplicate"`) {
+		t.Fatalf("ListTrash error = %v, want duplicate ID error", err)
+	}
+}
+
+func TestListTrashRejectsRepeatedCursor(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		page := requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getDeletedFiles": map[string]any{
+			"Items":     []map[string]any{{"ID": fmt.Sprint(page), "Name": "item", "Category": 6, "Size": 1, "IsInRecycleBin": true}},
+			"NextToken": "same",
+		}}})
+	}))
+	defer server.Close()
+
+	_, err := newTestClient(server, &testTokens{initial: "token"}).ListTrash(context.Background(), 0)
+	if err == nil || !strings.Contains(err.Error(), "response repeated a pagination cursor") {
+		t.Fatalf("ListTrash error = %v, want repeated cursor error", err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("ListTrash requests = %d, want 2", requests.Load())
+	}
+}
+
+func TestDeleteTrashItemsSendsBulkIDsAndAcknowledgement(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		if body == nil {
+			return
+		}
+		variables := body["variables"].(map[string]any)
+		if variables["IsInRecycleBin"] != true {
+			t.Errorf("IsInRecycleBin = %v, want true", variables["IsInRecycleBin"])
+		}
+		ids := variables["IDs"].([]any)
+		if len(ids) != 2 || ids[0].(map[string]any)["FileID"] != "1" || ids[1].(map[string]any)["FileID"] != "2" {
+			t.Errorf("IDs = %#v, want bulk trash IDs 1 and 2", ids)
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"setDeleteFile5": true}})
+	}))
+	defer server.Close()
+
+	if err := newTestClient(server, &testTokens{initial: "token"}).DeleteTrashItems(context.Background(), []string{"1", "2"}); err != nil {
+		t.Fatalf("DeleteTrashItems: %v", err)
+	}
+}
+
+func TestDeleteTrashItemsNoopForEmptyInput(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"setDeleteFile5": true}})
+	}))
+	defer server.Close()
+
+	if err := newTestClient(server, &testTokens{initial: "token"}).DeleteTrashItems(context.Background(), nil); err != nil {
+		t.Fatalf("DeleteTrashItems: %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("DeleteTrashItems sent %d requests, want zero", requests.Load())
+	}
+}
