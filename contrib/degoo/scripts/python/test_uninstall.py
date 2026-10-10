@@ -151,6 +151,12 @@ class UninstallTest(unittest.TestCase):
         ):
             code, stdout, stderr = self.invoke_terminal("y\ny\nn\n\nREMOVE\n")
         self.assertEqual(code, 0, stderr)
+        self.assertIn(str(destination), stdout)
+        self.assertIn("vault encryption key", stdout)
+        self.assertIn("account tokens", stdout)
+        self.assertIn("mount settings", stdout)
+        self.assertIn("local cache", stdout)
+        self.assertIn("local logs", stdout)
         self.assertIn("Remote encrypted files were left untouched", stdout)
         self.assertFalse(self.root.exists())
         self.assertEqual((destination / "config/vault.json").read_bytes(), self.vault_bytes)
@@ -159,6 +165,48 @@ class UninstallTest(unittest.TestCase):
         self.assertFalse((destination / "logs").exists())
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
         self.assertEqual((destination / "config/vault.json").stat().st_mode & 0o777, 0o600)
+
+    def test_wizard_retries_invalid_retention_paths_without_changing_selection(self) -> None:
+        destination = self.base / "retained-state"
+        outside = self.base / "outside"
+        outside.mkdir(mode=0o700)
+        symlink = self.base / "backup-link"
+        symlink.symlink_to(outside, target_is_directory=True)
+        with (
+            mock.patch.object(uninstall, "_default_retention_directory", return_value=destination),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, stdout, stderr = self.invoke_terminal(
+                f"y\nn\nn\nN\n{symlink / 'backup'}\n{destination}\nREMOVE\n"
+            )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("created only if at least one keep option is answered Yes", stdout)
+        self.assertIn("Backup directory path", stdout)
+        self.assertIn("this is not a yes/no question", stdout)
+        self.assertIn("must be absolute", stdout)
+        self.assertIn("symlink path components", stdout)
+        self.assertIn("selected retention still needs a valid private backup path", stdout)
+        self.assertIn("press Ctrl+C to cancel and restart", stdout)
+        self.assertFalse(self.root.exists())
+        self.assertEqual((destination / "config/vault.json").read_bytes(), self.vault_bytes)
+        self.assertFalse((destination / "cache").exists())
+        self.assertFalse((destination / "logs").exists())
+
+    def test_wizard_without_retention_skips_backup_path_and_summarizes_removal(self) -> None:
+        with (
+            mock.patch.object(uninstall, "_default_retention_directory", side_effect=AssertionError("unexpected backup prompt")),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, stdout, stderr = self.invoke_terminal("n\nn\nn\nDISCARD\nREMOVE\n")
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("Backup directory path", stdout)
+        self.assertIn("vault encryption key", stdout)
+        self.assertIn("account tokens", stdout)
+        self.assertIn("mount settings", stdout)
+        self.assertIn("local cache", stdout)
+        self.assertIn("local logs", stdout)
+        self.assertIn("Remote encrypted files were left untouched", stdout)
+        self.assertFalse(self.root.exists())
 
     def test_wizard_requires_explicit_secret_discard_confirmation(self) -> None:
         code, stdout, stderr = self.invoke_terminal("n\nn\nn\nno\n")
@@ -404,9 +452,26 @@ class UninstallTest(unittest.TestCase):
         self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
         return direct, wanted, unit
 
-    def _fake_systemctl(self, direct: Path, wanted: Path, unit: Path):
+    def _fake_systemctl(
+        self,
+        direct: Path,
+        wanted: Path,
+        unit: Path,
+        *,
+        disable_status: int = 0,
+        reload_status: int = 0,
+        active_after_reload: str = "inactive",
+        load_after_reload: str = "not-found",
+        initial_fragment: Path | None = None,
+        fragment_after_reload: Path | None = None,
+    ):
         calls: list[list[str]] = []
         real_run = subprocess.run
+        state = {
+            "load": "loaded",
+            "active": "active",
+            "fragment": str(initial_fragment or direct),
+        }
 
         def run(command: list[str], **kwargs: object):
             if command[0] != "systemctl":
@@ -414,14 +479,28 @@ class UninstallTest(unittest.TestCase):
             args = command[2:]
             calls.append(args)
             if args[0] == "show":
-                stdout = str(direct).encode()
+                stdout = (
+                    f"LoadState={state['load']}\n"
+                    f"ActiveState={state['active']}\n"
+                    f"FragmentPath={state['fragment']}\n"
+                ).encode()
             else:
                 stdout = b""
+            returncode = 0
+            if args[0] == "stop":
+                state["active"] = "inactive"
             if args[0] == "disable":
                 for path in (wanted, direct):
                     if path.is_symlink():
                         path.unlink()
-            return uninstall.subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=b"")
+                returncode = disable_status
+            if args[0] == "daemon-reload":
+                state["active"] = active_after_reload
+                if not direct.exists() and not wanted.exists():
+                    state["load"] = load_after_reload
+                    state["fragment"] = str(fragment_after_reload) if fragment_after_reload else ""
+                returncode = reload_status
+            return uninstall.subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr=b"")
 
         return calls, run
 
@@ -448,7 +527,7 @@ class UninstallTest(unittest.TestCase):
         self.assertTrue(wanted.is_symlink())
         self.assertTrue(self.root.exists())
 
-    def test_uninstall_disables_and_removes_only_its_external_service_links(self) -> None:
+    def test_uninstall_stops_before_disabling_and_reloads_after_removing_owned_links(self) -> None:
         direct, wanted, unit = self._add_owned_service_links()
         unrelated = direct.parent / "other.service"
         unrelated.write_text("keep", encoding="ascii")
@@ -465,7 +544,175 @@ class UninstallTest(unittest.TestCase):
         self.assertFalse(direct.exists())
         self.assertFalse(wanted.exists())
         self.assertEqual(unrelated.read_text(encoding="ascii"), "keep")
-        self.assertEqual([call[0] for call in calls], ["show", "disable", "daemon-reload"])
+        self.assertEqual(
+            [call[0] for call in calls],
+            ["show", "stop", "disable", "daemon-reload", "show"],
+        )
+        self.assertNotIn("--now", calls[2])
+        self.assertIn("owned user service", stdout)
+        self.assertIn("systemd was reloaded", stdout)
+
+    def test_disable_failure_after_systemd_removes_links_keeps_install_for_retry(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        backup = self.backup()
+        calls, fake = self._fake_systemctl(direct, wanted, unit, disable_status=1)
+        with (
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, stdout, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 2)
+        self.assertIn("could not be disabled safely", stderr)
+        self.assertNotIn("Removed the isolated local Degoo install", stdout)
+        self.assertEqual([call[0] for call in calls], ["show", "stop", "disable"])
+        self.assertNotIn("--now", calls[-1])
+        self.assertFalse(direct.exists())
+        self.assertFalse(wanted.exists())
+        self.assertTrue(self.root.exists())
+
+    def test_missing_recorded_links_still_stop_exact_loaded_root_unit(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        direct.unlink()
+        wanted.unlink()
+        backup = self.backup()
+        calls, fake = self._fake_systemctl(direct, wanted, unit, initial_fragment=unit)
+        with (
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([call[0] for call in calls], ["show", "stop", "daemon-reload", "show"])
+        self.assertFalse(self.root.exists())
+
+    def test_daemon_reload_failure_keeps_root_and_mount_layout_for_retry(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        backup = self.backup()
+        calls, fake = self._fake_systemctl(direct, wanted, unit, reload_status=1)
+        with (
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 2)
+        self.assertIn("could not reload after removing", stderr)
+        self.assertEqual([call[0] for call in calls], ["show", "stop", "disable", "daemon-reload"])
+        self.assertTrue(self.root.exists())
+        self.assertTrue((self.root / "mount").is_dir())
+
+    def test_exact_owned_link_missing_from_manifest_is_cleaned(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["service_links"] = []
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+        backup = self.backup()
+        calls, fake = self._fake_systemctl(direct, wanted, unit)
+        with (
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([call[0] for call in calls], ["show", "stop", "disable", "daemon-reload", "show"])
+        self.assertFalse(direct.exists())
+        self.assertFalse(wanted.exists())
+        self.assertFalse(self.root.exists())
+
+    def test_unrecorded_home_link_is_found_when_wrapper_config_home_is_inside_install(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        wanted.unlink()
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["service_config_home"] = ""
+        manifest["service_links"] = []
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+        backup = self.backup()
+        calls, fake = self._fake_systemctl(direct, wanted, unit)
+        with (
+            mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "config")}),
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([call[0] for call in calls], ["show", "stop", "disable", "daemon-reload", "show"])
+        self.assertFalse(direct.exists())
+        self.assertFalse(self.root.exists())
+
+    def test_conflicting_systemd_fragment_is_never_stopped(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        backup = self.backup()
+        conflict = self.base / "other" / "rclone-degoo.service"
+        calls, fake = self._fake_systemctl(direct, wanted, unit, initial_fragment=conflict)
+        with mock.patch.object(uninstall.subprocess, "run", side_effect=fake):
+            code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 2)
+        self.assertIn("resolved the service name to another unit", stderr)
+        self.assertEqual([call[0] for call in calls], ["show"])
+        self.assertTrue(self.root.exists())
+        self.assertTrue(direct.is_symlink())
+        self.assertTrue(wanted.is_symlink())
+
+    def test_active_owned_unit_after_reload_prevents_root_removal(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        backup = self.backup()
+        calls, fake = self._fake_systemctl(direct, wanted, unit, active_after_reload="active")
+        with (
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 2)
+        self.assertIn("still active after cleanup", stderr)
+        self.assertEqual([call[0] for call in calls], ["show", "stop", "disable", "daemon-reload", "show"])
+        self.assertTrue(self.root.exists())
+
+    def test_failed_unit_state_is_not_reported_as_inactive_after_cleanup(self) -> None:
+        with self.assertRaisesRegex(uninstall.CleanupError, "inactive"):
+            uninstall._check_service_fragment(
+                {"LoadState": "not-found", "ActiveState": "failed", "FragmentPath": ""},
+                set(),
+            )
+
+    def test_loaded_inactive_owned_unit_after_reload_prevents_root_removal(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        backup = self.backup()
+        calls, fake = self._fake_systemctl(
+            direct,
+            wanted,
+            unit,
+            load_after_reload="loaded",
+            fragment_after_reload=unit,
+        )
+        with (
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 2)
+        self.assertIn("still has the owned service loaded", stderr)
+        self.assertEqual([call[0] for call in calls], ["show", "stop", "disable", "daemon-reload", "show"])
+        self.assertTrue(self.root.exists())
+
+    def test_unrecorded_unrelated_same_name_link_is_left_alone(self) -> None:
+        unit_dir = self.home / ".config/systemd/user"
+        unit_dir.mkdir(parents=True, mode=0o700)
+        for directory in (self.home / ".config", self.home / ".config/systemd", unit_dir):
+            directory.chmod(0o700)
+        other_unit = self.base / "other.service"
+        other_unit.write_text("keep", encoding="ascii")
+        direct = unit_dir / "rclone-degoo.service"
+        direct.symlink_to(other_unit)
+        backup = self.backup()
+        calls: list[list[str]] = []
+        with (
+            mock.patch.object(uninstall, "_systemctl_user", side_effect=AssertionError("unrelated unit queried")),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(direct.is_symlink())
+        self.assertEqual(direct.resolve(), other_unit)
+        self.assertEqual(other_unit.read_text(encoding="ascii"), "keep")
 
 
 if __name__ == "__main__":

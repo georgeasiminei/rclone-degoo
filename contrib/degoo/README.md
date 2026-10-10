@@ -168,6 +168,16 @@ Running `uninstall.sh` with no arguments in a terminal, or with `--wizard`,
 starts guided cleanup. It offers to copy vault/account configuration, cache,
 and logs to a private directory outside the install; each choice defaults to
 No. You can enter a backup path or use the suggested timestamped directory.
+
+A private backup is an owner-only folder outside the install, created only
+when you choose to keep something. At its path prompt, press Enter for the
+suggested path or type an absolute path; `N` is not a path. To remove all local
+state without a backup, choose No for configuration, cache, and logs, then
+confirm `DISCARD` and `REMOVE`. Start cleanup from outside the install
+(`cd ~` first). Deleting the encryption settings means a fresh setup should
+create a new dedicated vault folder with a new name.
+Leave the existing folder ID and vault-config import prompts blank.
+
 If uploads are pending, cleanup refuses to discard their cache. To remove the
 local install while preserving those changes, retain both the cache and its
 matching configuration. If you choose not to retain the vault config, type
@@ -182,6 +192,6 @@ recreate the installed launchers and resume work:
 ```
 
 Cleanup stops the service linked to this install, removes its owned systemd
-links, and deletes only local files selected for removal. Remote encrypted
-files, account-wide sessions, and lingering settings remain untouched. Empty
-shared directories under the user systemd config path may remain.
+links, reloads the user manager, and deletes the contained local files. Remote
+encrypted files, account-wide sessions, and lingering settings remain
+untouched. Empty shared directories under the user systemd config path may remain.
