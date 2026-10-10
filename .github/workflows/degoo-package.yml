@@ -1,0 +1,69 @@
+---
+# Build and package the Linux amd64 Degoo vault distribution archive.
+# The archive and its SHA-256 sidecar are produced by bin/package-degoo.py,
+# uploaded as a workflow artifact after staging updates that change code.
+
+name: degoo-package
+
+on:
+  push:
+    branches:
+      - staging
+    paths-ignore:
+      - 'docs/**'
+      - 'graphics/**'
+      - '**/*.md'
+      - '**/*.rst'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package-linux-amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history keeps the packaging provenance (branch, commit) valid.
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+
+      - name: Validate packaging tool
+        run: python3 bin/package-degoo.py --self-check
+
+      - name: Build rclone
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p build
+          go build -o build/rclone .
+
+      - name: Create distribution archive
+        run: |
+          python3 bin/package-degoo.py \
+            --binary build/rclone \
+            --output dist/rclone-degoo-linux-amd64.tar.gz
+
+      - name: Verify archive checksum
+        run: |
+          cd dist
+          sha256sum -c rclone-degoo-linux-amd64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-degoo-linux-amd64
+          path: |
+            dist/rclone-degoo-linux-amd64.tar.gz
+            dist/rclone-degoo-linux-amd64.tar.gz.sha256
+          if-no-files-found: error

@@ -79,6 +79,18 @@ login and vault setup:
 
 ## Build the distributable archive
 
+GitHub Actions builds the Linux amd64 archive after code changes are merged
+into `staging` (or pushed directly to it). Documentation-only updates under
+`docs/` or `graphics/`, or to Markdown and reStructuredText files, are skipped.
+Changes that include both documentation and code still build. This is the
+fork's only workflow; pull requests, tags, and other branches do not run it.
+
+Download the `rclone-degoo-linux-amd64` artifact from a successful
+[`degoo-package` run](https://github.com/georgeasiminei/rclone-degoo/actions/workflows/degoo-package.yml).
+Extract the artifact ZIP to get `rclone-degoo-linux-amd64.tar.gz` and its
+`.sha256` sidecar, then verify the checksum as shown below. These builds are
+workflow artifacts rather than GitHub releases.
+
 From the repository root, build the Degoo-enabled binary and create the Linux
 amd64 archive with its SHA-256 sidecar:
 

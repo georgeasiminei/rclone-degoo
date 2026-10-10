@@ -3,6 +3,7 @@ _junk/
 rclone
 rclone.exe
 build
+dist/
 /docs/public/
 /docs/.hugo_build.lock
 /docs/static/img/logos/
