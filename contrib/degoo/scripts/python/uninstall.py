@@ -290,6 +290,251 @@ def _validate_backup(path_arg: str, root: Path, vault_bytes: bytes | None) -> No
         raise CleanupError("the vault backup does not match the installed vault configuration")
 
 
+def _default_retention_directory() -> Path:
+    """Return a new timestamped private retention path beside the install."""
+    parent = expected_root().parent
+    timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    base = parent / f"rclone-degoo-backup-{timestamp}"
+    candidate = base
+    suffix = 1
+    while os.path.lexists(candidate):
+        candidate = base.with_name(f"{base.name}-{suffix}")
+        suffix += 1
+    return candidate
+
+
+def _validate_retention_directory(path_arg: str | Path, root: Path) -> Path:
+    """Validate a new external retention directory without creating it."""
+    path = Path(path_arg)
+    if not path.is_absolute() or ".." in path.parts:
+        raise CleanupError("the retention directory must be absolute and contain no parent traversal")
+    path = Path(os.path.normpath(str(path)))
+    try:
+        common = os.path.commonpath((str(root), str(path)))
+    except ValueError:
+        raise CleanupError("the retention directory is invalid") from None
+    if common == str(root) or common == str(path):
+        raise CleanupError("the retention directory must be outside the install root")
+    _check_components(path.parent)
+    _check_directory(path.parent)
+    parent_info = os.lstat(path.parent)
+    if parent_info.st_uid != os.getuid() or parent_info.st_mode & 0o022:
+        raise CleanupError("the retention parent must be owned by the current user and not writable by others")
+    if os.path.lexists(path):
+        raise CleanupError("the retention directory already exists")
+    return path
+
+
+def _open_checked_directory(path: Path) -> int:
+    """Open an owned directory without following a symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise CleanupError("a retained directory could not be opened safely") from None
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        os.close(fd)
+        raise CleanupError("a retained directory has unsafe ownership or permissions")
+    return fd
+
+
+def _fsync_directory(fd: int) -> None:
+    """Make directory entries durable before their source is removed."""
+    try:
+        os.fsync(fd)
+    except OSError:
+        raise CleanupError("retained state could not be flushed safely") from None
+
+
+def _copy_file_at(source_fd: int, destination_fd: int, name: str, *, executable: bool = False) -> None:
+    """Copy one regular file between checked directory descriptors."""
+    try:
+        before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+    except OSError:
+        raise CleanupError("a retained file changed while it was being inspected") from None
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022 or before.st_mode & 0o6000:
+        raise CleanupError("a retained file has unsafe ownership or permissions")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        source_file = os.open(name, flags, dir_fd=source_fd)
+    except OSError:
+        raise CleanupError("a retained file could not be opened safely") from None
+    try:
+        opened = os.fstat(source_file)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise CleanupError("a retained file changed while being opened")
+        output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            destination_file = os.open(name, output_flags, 0o700 if executable else 0o600, dir_fd=destination_fd)
+        except OSError:
+            raise CleanupError("a retained file could not be created safely") from None
+        try:
+            while True:
+                chunk = os.read(source_file, 65536)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_file, view)
+                    if written <= 0:
+                        raise CleanupError("a retained file could not be written completely")
+                    view = view[written:]
+            after = os.fstat(source_file)
+            if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise CleanupError("a retained file changed while it was being copied")
+            os.fchmod(destination_file, 0o700 if executable else 0o600)
+            os.fsync(destination_file)
+        finally:
+            os.close(destination_file)
+    finally:
+        os.close(source_file)
+
+
+def _copy_directory_contents(source_fd: int, destination_fd: int) -> None:
+    """Copy a checked directory tree without retaining symbolic links."""
+    try:
+        with os.scandir(source_fd) as iterator:
+            children = sorted(iterator, key=lambda entry: entry.name)
+    except OSError:
+        raise CleanupError("a retained directory could not be inspected safely") from None
+    for child in children:
+        try:
+            info = child.stat(follow_symlinks=False)
+        except OSError:
+            raise CleanupError("a retained directory changed while it was being inspected") from None
+        if stat.S_ISDIR(info.st_mode):
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise CleanupError("a retained directory has unsafe ownership or permissions")
+            source_child = -1
+            destination_child = -1
+            try:
+                os.mkdir(child.name, 0o700, dir_fd=destination_fd)
+                source_child = os.open(
+                    child.name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=source_fd,
+                )
+                destination_child = os.open(
+                    child.name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=destination_fd,
+                )
+            except OSError:
+                if source_child >= 0:
+                    os.close(source_child)
+                if destination_child >= 0:
+                    os.close(destination_child)
+                raise CleanupError("a retained directory could not be copied safely") from None
+            try:
+                opened = os.fstat(source_child)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise CleanupError("a retained directory changed while being opened")
+                _copy_directory_contents(source_child, destination_child)
+            finally:
+                if source_child >= 0:
+                    os.close(source_child)
+                if destination_child >= 0:
+                    os.close(destination_child)
+        elif stat.S_ISREG(info.st_mode):
+            _copy_file_at(source_fd, destination_fd, child.name)
+        else:
+            raise CleanupError("symbolic links and special files cannot be retained")
+    _fsync_directory(destination_fd)
+
+
+def _copy_retained_directory(source: Path, destination: Path) -> None:
+    """Copy an audited install directory to a new owner-private destination."""
+    try:
+        os.mkdir(destination, 0o700)
+    except OSError:
+        raise CleanupError("a retained directory could not be created safely") from None
+    os.chmod(destination, 0o700)
+    source_fd = _open_checked_directory(source)
+    destination_fd = _open_checked_directory(destination)
+    try:
+        _copy_directory_contents(source_fd, destination_fd)
+        parent_fd = _open_checked_directory(destination.parent)
+        try:
+            _fsync_directory(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
+
+
+def _copy_retained_file(source: Path, destination_directory: Path, *, executable: bool = False) -> None:
+    """Copy one install file into an owner-private retention directory."""
+    source_fd = _open_checked_directory(source.parent)
+    destination_fd = _open_checked_directory(destination_directory)
+    try:
+        _copy_file_at(source_fd, destination_fd, source.name, executable=executable)
+        _fsync_directory(destination_fd)
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
+
+
+def _create_retention_directory(path: Path) -> None:
+    """Create a new external directory suitable for private retained state."""
+    try:
+        os.mkdir(path, 0o700)
+        os.chmod(path, 0o700)
+    except OSError:
+        raise CleanupError("the private retention directory could not be created safely") from None
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise CleanupError("the private retention directory has unsafe ownership or permissions")
+    parent_fd = _open_checked_directory(path.parent)
+    try:
+        _fsync_directory(parent_fd)
+    finally:
+        os.close(parent_fd)
+    retained_fd = _open_checked_directory(path)
+    try:
+        _fsync_directory(retained_fd)
+    finally:
+        os.close(retained_fd)
+
+
+def _retain_state(
+    root: Path,
+    destination: Path,
+    *,
+    keep_config: bool,
+    keep_cache: bool,
+    keep_logs: bool,
+    pending: bool,
+) -> None:
+    """Copy selected local state to the private external retention directory."""
+    _validate_retention_directory(destination, root)
+    _create_retention_directory(destination)
+    if keep_config:
+        _copy_retained_directory(root / "config", destination / "config")
+    if keep_cache:
+        _copy_retained_directory(root / "cache", destination / "cache")
+    if keep_logs:
+        _copy_retained_directory(root / "logs", destination / "logs")
+    _copy_retained_file(root / "install.json", destination)
+    if pending:
+        try:
+            os.mkdir(destination / "bin", 0o700)
+        except OSError:
+            raise CleanupError("the recovery binary directory could not be created safely") from None
+        destination_fd = _open_checked_directory(destination)
+        try:
+            _fsync_directory(destination_fd)
+        finally:
+            os.close(destination_fd)
+        _copy_retained_file(root / "bin/rclone", destination / "bin", executable=True)
+
+
 def _unescape_mountinfo(text: str) -> str:
     """Decode octal escapes in a mountinfo field."""
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), text)
@@ -718,9 +963,10 @@ def _inventory(root: Path, manifest: dict[str, Any], entries: list[dict[str, str
     sys.stdout.write("\n")
 
 
-def uninstall(args: argparse.Namespace) -> int:
+def _inspect_install(root_arg: str) -> tuple[Path, dict[str, Any], bool, list[dict[str, str]]]:
+    """Validate and inventory the fixed local install before any action."""
     expected = expected_root()
-    supplied = Path(args.root)
+    supplied = Path(root_arg)
     if not supplied.is_absolute() or ".." in supplied.parts:
         raise CleanupError("--root must be an absolute path without parent traversal")
     root = Path(os.path.normpath(str(supplied)))
@@ -728,25 +974,95 @@ def uninstall(args: argparse.Namespace) -> int:
         raise CleanupError("--root must be the isolated ~/.local/share/rclone-degoo directory")
     _check_components(root)
     layout = _validate_layout(root)
-    points = read_mountpoints()
-    mounted = _mount_state(root, points)
+    mounted = _mount_state(root, read_mountpoints())
     entries = _audit_tree(root)
+    return root, layout, mounted, entries
+
+
+def _prompt_yes_no(prompt: str, *, default: bool = False) -> bool:
+    """Ask a terminal yes/no question with an explicit default."""
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{prompt} {suffix} ").strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Please answer yes or no.")
+
+
+def _wizard(args: argparse.Namespace) -> int:
+    """Guide the user through retaining selected local state and cleanup."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise CleanupError("--wizard requires an interactive terminal; use --inventory or --delete-local")
+
+    root, layout, _, _ = _inspect_install(args.root)
+    print("This removes local Degoo mount files only. Degoo remote data will be left untouched.")
+    print("Selected items are copied to a new private directory before local removal.")
+    keep_config = _prompt_yes_no("Keep vault, account login, and mount configuration?")
+    keep_cache = _prompt_yes_no("Keep the local cache?")
+    keep_logs = _prompt_yes_no("Keep local logs?")
+
+    retention_directory: Path | None = None
+    if keep_config or keep_cache or keep_logs:
+        default_directory = _default_retention_directory()
+        typed_directory = input(f"Private backup directory [{default_directory}]: ").strip()
+        retention_directory = _validate_retention_directory(typed_directory or default_directory, root)
+        print(f"Selected local state will be copied to {retention_directory}.")
+
+    discard_secret = False
+    if layout["vault_bytes"] is not None and not keep_config and not args.vault_backup:
+        answer = input("To delete the only local vault secret, type DISCARD: ").strip()
+        if answer != "DISCARD":
+            print("Cancelled; the local install was left unchanged.")
+            return 1
+        discard_secret = True
+    answer = input("To remove the local Degoo install, type REMOVE: ").strip()
+    if answer != "REMOVE":
+        print("Cancelled; the local install was left unchanged.")
+        return 1
+
+    args.delete_local = True
+    args.keep_config = keep_config
+    args.keep_cache = keep_cache
+    args.keep_logs = keep_logs
+    args.keep_directory = str(retention_directory) if retention_directory is not None else None
+    args.discard_vault_secret = discard_secret
+    return uninstall(args)
+
+
+def uninstall(args: argparse.Namespace) -> int:
+    root, layout, mounted, entries = _inspect_install(args.root)
 
     if not args.delete_local:
         _inventory(root, layout["manifest"], entries, mounted)
         return 0
 
+    keep_config = args.keep_config
+    keep_cache = args.keep_cache
+    keep_logs = args.keep_logs
+    retain_state = keep_config or keep_cache or keep_logs
+    retention_directory = None
+    if retain_state:
+        retention_directory = _validate_retention_directory(args.keep_directory or _default_retention_directory(), root)
+
     vault_exists = layout["vault_bytes"] is not None
     if args.vault_backup:
         _validate_backup(args.vault_backup, root, layout["vault_bytes"])
-    elif vault_exists and not args.discard_vault_secret:
+    elif vault_exists and not (args.discard_vault_secret or keep_config):
         raise CleanupError("local deletion requires --vault-backup or --discard-vault-secret")
 
     config_exists = (root / "config/rclone.conf").exists()
     binary_exists = (root / "bin/rclone").exists()
+    pending_files = 0
+    pending_bytes = 0
+    pending_state = False
     if vault_exists and config_exists and binary_exists:
-        files, size = _pending_uploads(root)
-        if files != 0 or size != 0:
+        pending_files, pending_bytes = _pending_uploads(root)
+        pending_state = pending_files != 0 or pending_bytes != 0
+        if pending_state and not (keep_config and keep_cache):
             raise CleanupError("pending local uploads remain; the install and cache were preserved")
 
     # Check once before stopping a service, then check again under the cache lock.
@@ -762,9 +1078,13 @@ def uninstall(args: argparse.Namespace) -> int:
     # Holding rclone's flock prevents a new mount from racing the status check.
     lock_fd = _acquire_cache_lock(root, 10 if mounted else 0)
     try:
+        pending_files = 0
+        pending_bytes = 0
+        pending_state = False
         if vault_exists and config_exists and binary_exists:
-            files, size = _pending_uploads(root)
-            if files != 0 or size != 0:
+            pending_files, pending_bytes = _pending_uploads(root)
+            pending_state = pending_files != 0 or pending_bytes != 0
+            if pending_state and not (keep_config and keep_cache):
                 raise CleanupError("pending local uploads remain; the install and cache were preserved")
         elif _cache_has_data(root, _cache_lock_path(root)):
             raise CleanupError("the rclone configuration is incomplete and the cache is not empty")
@@ -780,6 +1100,15 @@ def uninstall(args: argparse.Namespace) -> int:
             raise CleanupError("the isolated mount became active during cleanup")
         _require_empty_mount_directory(root)
         _audit_tree(root)
+        if retention_directory is not None:
+            _retain_state(
+                root,
+                retention_directory,
+                keep_config=keep_config,
+                keep_cache=keep_cache,
+                keep_logs=keep_logs,
+                pending=pending_state,
+            )
         # Removing the empty mountpoint first makes a concurrent re-mount fail
         # before recursive deletion can traverse a mounted filesystem.
         try:
@@ -793,7 +1122,17 @@ def uninstall(args: argparse.Namespace) -> int:
     finally:
         os.close(lock_fd)
 
-    print("Removed the isolated local Degoo install. Remote encrypted files were left untouched.")
+    if pending_state:
+        print(
+            "Removed the isolated local Degoo install. Pending local uploads "
+            f"({pending_files} files, {pending_bytes} bytes) were preserved in {retention_directory}. "
+            f"To resume them, restore that directory's contents to {expected_root()}, then run "
+            "`./contrib/degoo/install.sh --binary "
+            f"{expected_root()}/bin/rclone --upgrade` from the rclone-degoo project checkout. "
+            "Degoo remote data was left untouched."
+        )
+    else:
+        print("Removed the isolated local Degoo install. Remote encrypted files were left untouched.")
     return 0
 
 
@@ -802,10 +1141,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=str(expected_root()), help="isolated install root (defaults to ~/.local/share/rclone-degoo)")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--delete-local", action="store_true", help="unmount safely and remove the isolated local install")
-    actions.add_argument("--dry-run", action="store_true", help="inventory the install without changing it (the default)")
+    actions.add_argument("--inventory", "--dry-run", dest="inventory", action="store_true", help="inventory the install without changing it")
+    actions.add_argument("--wizard", action="store_true", help="interactively choose local state to retain and remove the install")
     gate = parser.add_mutually_exclusive_group()
     gate.add_argument("--vault-backup", help="private backup file that exactly matches config/vault.json")
     gate.add_argument("--discard-vault-secret", action="store_true", help="explicitly allow deleting the only local vault secret")
+    parser.add_argument("--keep-config", action="store_true", help="copy vault, Degoo login, and mount configuration to a private retention directory")
+    parser.add_argument("--keep-cache", action="store_true", help="copy the local cache to a private retention directory")
+    parser.add_argument("--keep-logs", action="store_true", help="copy local logs to a private retention directory")
+    parser.add_argument("--keep-directory", help="new external private directory for retained state (defaults to a timestamped path)")
     return parser
 
 
@@ -814,6 +1158,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if (args.vault_backup or args.discard_vault_secret) and not args.delete_local:
         parser.error("--vault-backup and --discard-vault-secret require --delete-local")
+    keep_selected = args.keep_config or args.keep_cache or args.keep_logs
+    if args.keep_directory and not keep_selected:
+        parser.error("--keep-directory requires at least one --keep-* option")
+    if (keep_selected or args.keep_directory) and not args.delete_local and not args.wizard:
+        parser.error("--keep-* options require --delete-local or --wizard")
+    if args.discard_vault_secret and args.keep_config:
+        parser.error("--discard-vault-secret cannot be combined with --keep-config")
+    if args.wizard or (not args.delete_local and not args.inventory and sys.stdin.isatty() and sys.stdout.isatty()):
+        try:
+            return _wizard(args)
+        except CleanupError as exc:
+            print(f"uninstall refused: {exc}", file=sys.stderr)
+            return 2
+        except OSError:
+            print("uninstall refused: filesystem access failed safely", file=sys.stderr)
+            return 2
+        except (EOFError, KeyboardInterrupt):
+            print("Cancelled; the local install was left unchanged.")
+            return 1
     try:
         return uninstall(args)
     except CleanupError as exc:

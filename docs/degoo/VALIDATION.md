@@ -8,6 +8,32 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Installer and cleanup wizards
+
+The wizard changes were checked offline on 2026-10-10:
+
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover
+  -s contrib/degoo/scripts/python -p 'test_*.py'`: all 63 tests passed.
+  Coverage includes default answers with real local installation and setup,
+  failed login/setup, directory selection, upgrades from the old script layout,
+  retention of pending writes, and refusal to delete after a backup failure.
+- `go build` passed. Shell syntax and launcher help checks passed.
+- The packaging self-check, Markdown lint, and `git diff --check` passed.
+- The Linux amd64 archive was extracted into a temporary home. Its launchers,
+  staged installation with the actual built binary, inventory, and local
+  cleanup passed without touching the user's installation.
+- A full `make quicktest` run failed in mount and Docker mount tests because
+  `fusermount3` was absent. The archive test found an incompatible external
+  `rclone`; it passed with the freshly built executable first on `PATH`.
+  The RC version test rejected the branch slash in the Makefile-generated
+  version; `RCLONE_CONFIG=/notfound go test ./fs/rc` passed without that version
+  override. The remaining packages passed in the full run.
+
+These checks did not install system packages, use account credentials, or
+create a remote vault. Package-manager commands and provider responses were
+mocked. Live wizard login, package installation, and FUSE mounting remain
+environment-dependent checks.
+
 ## Offline checks
 
 The completed offline checks use HTTP fixtures for Degoo and local storage for

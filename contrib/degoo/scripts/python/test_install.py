@@ -79,6 +79,9 @@ class InstallTest(unittest.TestCase):
         self.assertIn("--settings", mount_wrapper)
         self.assertIn(f"ROOT={shlex.quote(str(self.root))}", mount_wrapper)
         self.assertIn("$ROOT/tools:/usr/bin:/bin", mount_wrapper)
+        self.assertTrue((self.root / "scripts/python/install.py").is_file())
+        self.assertFalse((self.root / "install.py").exists())
+        self.assertIn("scripts/python/login.py", (self.root / "login.sh").read_text())
         for wrapper in self.root.glob("*.sh"):
             result = subprocess.run(["/bin/sh", "-n", str(wrapper)], check=False, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, f"{wrapper.name}: {result.stderr}")
@@ -175,9 +178,14 @@ class InstallTest(unittest.TestCase):
         (self.root / "config/login.json").write_text('{"email":"owner@example.test"}\n', encoding="utf-8")
         (self.root / "config/login.json").chmod(0o600)
         self.write_binary(self.binary, "# version two\n")
+        legacy_helper = self.root / "install.py"
+        legacy_helper.write_text("# old installer layout\n", encoding="utf-8")
+        legacy_helper.chmod(0o700)
 
         code, _, stderr = self.invoke("--upgrade")
         self.assertEqual(code, 0, stderr)
+        self.assertFalse(legacy_helper.exists())
+        self.assertTrue((self.root / "scripts/python/install.py").is_file())
         self.assertEqual(vault_path.read_bytes(), vault_before)
         self.assertEqual((self.root / "config/rclone.conf").read_bytes(), config_before)
         self.assertEqual(settings_path.read_bytes(), settings_before)

@@ -17,6 +17,24 @@ folder is now available and has been used for limited provider probes. The
 original sequence below remains the release acceptance guide; live gates
 cannot be inferred from mock results or from the partial live probes.
 
+The contained install and cleanup experience is part of the user handoff.
+`install.sh` starts the setup wizard for a terminal invocation without options
+or with `--wizard`; `--binary` retains the noninteractive install path, and
+`--no-wizard` supports staging before login. The wizard checks Python 3.10 or
+newer, a FUSE helper, writable `/dev/fuse`, and `mountpoint`. It can offer to
+install `fuse3` and `util-linux` with a detected `apt-get`, `dnf`, `pacman`, or
+`zypper`; when mount dependencies remain unavailable, it can still configure
+the vault but does not enable the service. Go is required only to build from a
+checkout, and the wizard can offer that build if it finds no binary.
+
+The folder picker queries account root ID `0` to discover device folders,
+suggests a discovered device ID for new vault creation, and defaults the new
+child name to `rclone-degoo-vault`. Root ID `0` is not accepted as a vault ID or
+creation parent. The uninstaller's `--inventory` mode is read-only; its wizard
+can retain config, cache, and logs in a new owner-private directory. Pending
+uploads can proceed only when both the matching config and cache are retained.
+Cleanup leaves remote data untouched.
+
 1. Implement the provider request contracts from the pinned Python reference
    in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and
    partial registration failures. See [API_EVIDENCE.md](API_EVIDENCE.md).

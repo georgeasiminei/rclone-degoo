@@ -88,6 +88,17 @@ the separate vault secret, automatic renewal, and simple local-file setup.
 
 ### Configuration and data safety
 
+- Provide Linux installer and uninstaller wizards with step by step prompts.
+  Suggest defaults for settings that can be inferred; account email and
+  password have no invented defaults.
+- List dependencies even when installed, and offer to install missing ones.
+- Offer to keep selected local state during uninstall. Preserve pending
+  changes and the configuration needed to recover them; remote removal is
+  separate from removing the local installation.
+- Keep scripts organized in their own directories, including a Python
+  subdirectory. Select a dedicated vault under a discovered Degoo device
+  folder by default when creation at account root ID `0` is unsupported.
+
 Configuration must provide a way to set these values or their equivalents:
 
 - The remote root directory reserved for the encrypted vault.

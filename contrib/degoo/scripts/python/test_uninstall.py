@@ -83,6 +83,22 @@ class UninstallTest(unittest.TestCase):
             result = uninstall.main(["--root", str(self.root), *extra])
         return result, stdout.getvalue(), stderr.getvalue()
 
+    def invoke_terminal(self, responses: str, *extra: str) -> tuple[int, str, str]:
+        class Terminal(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        stdin = Terminal(responses)
+        stdout = Terminal()
+        stderr = Terminal()
+        with (
+            mock.patch.object(uninstall.sys, "stdin", stdin),
+            mock.patch.object(uninstall.sys, "stdout", stdout),
+            mock.patch.object(uninstall.sys, "stderr", stderr),
+        ):
+            result = uninstall.main(["--root", str(self.root), *extra])
+        return result, stdout.getvalue(), stderr.getvalue()
+
     def backup(self) -> Path:
         directory = self.base / "backup"
         directory.mkdir(mode=0o700)
@@ -111,6 +127,108 @@ class UninstallTest(unittest.TestCase):
             code = uninstall.main([])
         self.assertEqual(code, 0, stderr.getvalue())
         self.assertEqual(json.loads(stdout.getvalue())["root"], str(self.root))
+
+    def test_inventory_flag_forces_read_only_mode_on_a_terminal(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(uninstall.sys.stdin, "isatty", return_value=True),
+            mock.patch.object(uninstall.sys.stdout, "isatty", return_value=True),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = uninstall.main(["--root", str(self.root), "--inventory"])
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertEqual(json.loads(stdout.getvalue())["mode"], "inventory")
+        self.assertTrue(self.root.exists())
+
+    def test_wizard_copies_selected_config_and_cache_to_private_directory(self) -> None:
+        destination = self.base / "retained-state"
+        self.write_private(self.root / "cache/pending.bin", b"pending bytes")
+        with (
+            mock.patch.object(uninstall, "_default_retention_directory", return_value=destination),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, stdout, stderr = self.invoke_terminal("y\ny\nn\n\nREMOVE\n")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("Remote encrypted files were left untouched", stdout)
+        self.assertFalse(self.root.exists())
+        self.assertEqual((destination / "config/vault.json").read_bytes(), self.vault_bytes)
+        self.assertEqual((destination / "config/auth.json").read_bytes(), b'{"access_token":"test-only-token"}\n')
+        self.assertEqual((destination / "cache/pending.bin").read_bytes(), b"pending bytes")
+        self.assertFalse((destination / "logs").exists())
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((destination / "config/vault.json").stat().st_mode & 0o777, 0o600)
+
+    def test_wizard_requires_explicit_secret_discard_confirmation(self) -> None:
+        code, stdout, stderr = self.invoke_terminal("n\nn\nn\nno\n")
+        self.assertEqual(code, 1, stderr)
+        self.assertIn("Cancelled", stdout)
+        self.assertTrue(self.root.exists())
+
+    def test_pending_uploads_can_be_retained_only_with_config_and_cache(self) -> None:
+        destination = self.base / "pending-recovery"
+        self.write_private(self.root / "cache/pending.bin", b"pending bytes")
+        self.write_rclone("Pending local uploads: 2 files, 123 bytes")
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()):
+            code, stdout, stderr = self.invoke(
+                "--delete-local",
+                "--keep-config",
+                "--keep-cache",
+                "--keep-directory",
+                str(destination),
+            )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("were preserved in", stdout)
+        self.assertFalse(self.root.exists())
+        self.assertEqual((destination / "cache/pending.bin").read_bytes(), b"pending bytes")
+        self.assertEqual((destination / "config/vault.json").read_bytes(), self.vault_bytes)
+        self.assertTrue((destination / "bin/rclone").stat().st_mode & 0o100)
+        self.assertTrue((destination / "install.json").exists())
+
+    def test_pending_uploads_still_refuse_removal_without_both_retained_groups(self) -> None:
+        destination = self.base / "config-only"
+        self.write_rclone("Pending local uploads: 1 files, 12 bytes")
+        code, _, stderr = self.invoke(
+            "--delete-local",
+            "--keep-config",
+            "--keep-directory",
+            str(destination),
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("pending local uploads remain", stderr)
+        self.assertTrue(self.root.exists())
+        self.assertFalse(destination.exists())
+
+    def test_retention_directory_rejects_symlinked_ancestors(self) -> None:
+        outside = self.base / "outside"
+        outside.mkdir(mode=0o700)
+        link = self.base / "backup-link"
+        link.symlink_to(outside, target_is_directory=True)
+        destination = link / "retained"
+        code, _, stderr = self.invoke(
+            "--delete-local",
+            "--keep-config",
+            "--keep-directory",
+            str(destination),
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("symlink path components", stderr)
+        self.assertTrue(self.root.exists())
+        self.assertFalse((outside / "retained").exists())
+
+    def test_retention_copy_failure_preserves_install(self) -> None:
+        destination = self.base / "partial-retention"
+        with mock.patch.object(uninstall, "_copy_retained_file", side_effect=uninstall.CleanupError("copy failed")):
+            code, _, stderr = self.invoke(
+                "--delete-local",
+                "--keep-config",
+                "--keep-directory",
+                str(destination),
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("copy failed", stderr)
+        self.assertTrue(self.root.exists())
 
     def test_local_delete_requires_a_vault_backup_or_explicit_discard(self) -> None:
         code, _, stderr = self.invoke("--delete-local")

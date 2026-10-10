@@ -120,7 +120,7 @@ def _run_create(root: Path, parent_id: str, name: str) -> str:
 def _finish_install(root: Path, folder_id: str, name: str, *, created: bool, vault_config: str | None) -> int:
     command = [
         sys.executable,
-        str(root / "install.py"),
+        str(root / "scripts/python/install.py"),
         "--binary",
         str(root / "bin/rclone"),
         "--folder-id",

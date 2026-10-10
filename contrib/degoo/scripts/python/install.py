@@ -23,7 +23,7 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("install.py", "info.py", "login.py", "service.py", "setup.py", "uninstall.py")
+SOURCE_FILES = ("install.py", "info.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py")
 MAX_CONFIG_SIZE = 1024 * 1024
 DEFAULT_MOUNT_SETTINGS = {
     "cache_max_size": "20G",
@@ -344,7 +344,7 @@ def shell_wrapper(name: str, root: Path) -> bytes:
             "#!/bin/sh\nset -eu\n"
             f"ROOT={root_text}\n"
             "export PYTHONDONTWRITEBYTECODE=1\n"
-            "exec python3 \"$ROOT/info.py\" --root \"$ROOT\" \"$@\"\n"
+            "exec python3 \"$ROOT/scripts/python/info.py\" --root \"$ROOT\" \"$@\"\n"
         )
         return content.encode("utf-8")
     if name == "service.sh":
@@ -352,13 +352,20 @@ def shell_wrapper(name: str, root: Path) -> bytes:
             "#!/bin/sh\nset -eu\n"
             f"ROOT={root_text}\n"
             "export PYTHONDONTWRITEBYTECODE=1\n"
-            "exec python3 \"$ROOT/service.py\" --root \"$ROOT\" \"$@\"\n"
+            "exec python3 \"$ROOT/scripts/python/service.py\" --root \"$ROOT\" \"$@\"\n"
         )
         return content.encode("utf-8")
     if name == "login.sh":
-        command = f"exec python3 {shell_quote(root / 'login.py')} --root \"$ROOT\" \"$@\""
+        command = f"exec python3 {shell_quote(root / 'scripts/python/login.py')} --root \"$ROOT\" \"$@\""
     elif name == "setup.sh":
-        command = f"exec python3 {shell_quote(root / 'setup.py')} --root \"$ROOT\" \"$@\""
+        command = f"exec python3 {shell_quote(root / 'scripts/python/setup.py')} --root \"$ROOT\" \"$@\""
+    elif name == "install.sh":
+        command = (
+            "if [ \"$#\" -eq 0 ]; then set -- --wizard; fi\n"
+            f"exec python3 {shell_quote(root / 'scripts/python/install.py')} \"$@\""
+        )
+    elif name == "uninstall.sh":
+        command = f"exec python3 {shell_quote(root / 'scripts/python/uninstall.py')} --root \"$ROOT\" \"$@\""
     elif name == "mount.sh":
         command = (
             f"exec \"$ROOT/bin/rclone\" --config \"$ROOT/config/rclone.conf\" "
@@ -561,6 +568,8 @@ def _install(args: argparse.Namespace) -> int:
 
     for name in ("bin", "config", "cache", "mount", "tools", "tmp", "logs"):
         ensure_private_directory(root / name)
+    ensure_private_directory(root / "scripts")
+    ensure_private_directory(root / "scripts/python")
     if manifest is None:
         manifest = {
             "version": 1,
@@ -621,7 +630,7 @@ def _install(args: argparse.Namespace) -> int:
         source = Path(__file__).absolute().parent / source_name
         if not source.is_file() or source.is_symlink():
             raise InstallError("the contained installer source files are incomplete")
-        destination = root / source_name
+        destination = root / "scripts/python" / source_name
         data = source.read_bytes()
         write_private_file(destination, data, replace=os.path.lexists(destination), mode=0o700)
 
@@ -635,8 +644,13 @@ def _install(args: argparse.Namespace) -> int:
         else:
             validate_rclone_config(existing_rclone_config, root, folder_id)
 
-    for wrapper in ("login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh", "info.sh"):
+    for wrapper in ("install.sh", "uninstall.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh", "info.sh"):
         write_private_file(root / wrapper, shell_wrapper(wrapper, root), replace=os.path.lexists(root / wrapper), mode=0o700)
+    if args.upgrade:
+        for source_name in SOURCE_FILES:
+            legacy = root / source_name
+            if read_private_file(legacy, missing_ok=True) is not None:
+                legacy.unlink()
     write_private_file(root / "rclone-degoo.service", service_unit(root), replace=os.path.lexists(root / "rclone-degoo.service"), mode=0o600)
     install_fuse_helper(root)
 
@@ -727,7 +741,10 @@ def install(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", required=True, help="path to a Linux rclone executable built with the Degoo command")
+    parser.add_argument("--binary", help="path to a Linux rclone executable built with the Degoo command")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--wizard", action="store_true", help="ask for installation and vault settings step by step")
+    mode.add_argument("--no-wizard", action="store_true", help="install without interactive setup (requires --binary)")
     parser.add_argument("--folder-id", help="ID of an existing dedicated Degoo folder (account root 0 is refused)")
     parser.add_argument("--folder-name", help="optional human-readable name for the dedicated folder")
     parser.add_argument("--vault-config", help="private existing vault configuration to import on another machine")
@@ -737,8 +754,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    arguments = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(arguments)
     try:
+        if args.wizard or (not arguments and sys.stdin.isatty()):
+            import wizard
+            return wizard.run(args)
+        if not args.binary:
+            parser.error("--binary is required for noninteractive installation; use --wizard for guided setup")
         return install(args)
     except InstallError as exc:
         print(f"install refused: {exc}", file=sys.stderr)
@@ -746,6 +770,9 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         print("install refused: filesystem access failed safely", file=sys.stderr)
         return 2
+    except (EOFError, KeyboardInterrupt):
+        print("Installation cancelled; any completed setup is preserved.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
