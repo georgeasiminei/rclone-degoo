@@ -8,9 +8,13 @@ Linux FUSE -> VFS full cache -> chunker -> crypt -> Degoo
 ```
 
 The implementation is experimental. Offline tests exercise the request shapes
-and vault behavior. Current Degoo endpoint availability, folder behavior,
-download ranges, account renewal, and the provider object-size limit still
-need acceptance against a disposable live vault.
+and vault behavior. A disposable live vault passed encrypted publication,
+fresh-cache readback, and CDN range reads. Account renewal, larger live files,
+and the provider object-size limit remain acceptance gates; see
+[VALIDATION.md](VALIDATION.md) for the tested scope.
+
+For a contained installation and cleanup, see
+[INSTALLATION.md](INSTALLATION.md).
 
 ## Setup
 
@@ -20,9 +24,9 @@ without changing existing personal files. Use a separate private directory
 for account tokens and the vault configuration:
 
 ```sh
-install -d -m 700 "$HOME/.config/rclone-degoo"
-install -d -m 700 "$HOME/.cache/rclone-degoo"
-./rclone degoo login "$HOME/.config/rclone-degoo/auth.json" --email you@example.com
+install -d -m 700 ~/.config/rclone-degoo
+install -d -m 700 ~/.cache/rclone-degoo
+./rclone degoo login ~/.config/rclone-degoo/auth.json --email you@example.com
 ```
 
 Login prompts for the account password. It saves access and refresh tokens in
@@ -47,10 +51,10 @@ Create a vault configuration, with a password independent of the account
 password, then mount it:
 
 ```sh
-./rclone degoo init "$HOME/.config/rclone-degoo/vault.json" \
-  --remote degoo-test: --cache-dir "$HOME/.cache/rclone-degoo"
-mkdir -p "$HOME/degoo-vault"
-./rclone degoo mount "$HOME/.config/rclone-degoo/vault.json" "$HOME/degoo-vault"
+./rclone degoo init ~/.config/rclone-degoo/vault.json \
+  --remote degoo-test: --cache-dir ~/.cache/rclone-degoo
+mkdir -p ~/degoo-vault
+./rclone degoo mount ~/.config/rclone-degoo/vault.json ~/degoo-vault
 ```
 
 The command runs in the foreground. Use a service manager for unattended
@@ -89,7 +93,7 @@ directory across restarts and login failures. Dirty files are reloaded by VFS
 and uploaded when the same vault is mounted again with working credentials.
 
 ```sh
-./rclone degoo status "$HOME/.config/rclone-degoo/vault.json"
+./rclone degoo status ~/.config/rclone-degoo/vault.json
 ```
 
 Status counts dirty cached files and their logical byte sizes without reading
@@ -109,8 +113,8 @@ fails; restore the original identity before reusing that cache.
 Stop the mount before logging out:
 
 ```sh
-fusermount -u "$HOME/degoo-vault"
-./rclone degoo logout "$HOME/.config/rclone-degoo/auth.json"
+fusermount -u ~/degoo-vault
+./rclone degoo logout ~/.config/rclone-degoo/auth.json
 ```
 
 Logout removes only the token file. It leaves the vault password, cache,

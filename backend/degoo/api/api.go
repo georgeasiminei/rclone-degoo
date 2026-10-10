@@ -162,8 +162,8 @@ type Item struct {
 	CreationTime time.Time
 }
 
-// UnmarshalJSON accepts Degoo's numeric fields whether the service encodes them
-// as JSON numbers or as decimal strings.
+// UnmarshalJSON accepts numeric fields as JSON numbers or decimal strings and
+// timestamps as Unix milliseconds or RFC3339 strings.
 func (item *Item) UnmarshalJSON(data []byte) error {
 	var wire struct {
 		ID                   string          `json:"ID"`
@@ -226,11 +226,35 @@ func parseInt(value json.RawMessage) (int64, error) {
 }
 
 func parseMillis(value json.RawMessage) (time.Time, error) {
+	if raw := strings.TrimSpace(string(value)); raw == "" || raw == "null" {
+		return time.Time{}, nil
+	}
 	ms, err := parseInt(value)
-	if err != nil || ms == 0 {
+	if err == nil {
+		if ms == 0 {
+			return time.Time{}, nil
+		}
+		return time.UnixMilli(ms), nil
+	}
+	var text string
+	if stringErr := json.Unmarshal(value, &text); stringErr != nil {
 		return time.Time{}, err
 	}
-	return time.UnixMilli(ms), nil
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return time.Time{}, nil
+	}
+	if ms, parseErr := strconv.ParseInt(text, 10, 64); parseErr == nil {
+		if ms == 0 {
+			return time.Time{}, nil
+		}
+		return time.UnixMilli(ms), nil
+	}
+	parsed, parseErr := time.Parse(time.RFC3339Nano, text)
+	if parseErr != nil {
+		return time.Time{}, parseErr
+	}
+	return parsed, nil
 }
 
 // KeyValue represents a named field returned in an upload authorization.
@@ -721,9 +745,24 @@ func (c *Client) Upload(ctx context.Context, auth AuthData, name, checksum strin
 	return nil
 }
 
+func mutationAcknowledgement(operation string, raw json.RawMessage) (string, error) {
+	switch strings.TrimSpace(string(raw)) {
+	case "true":
+		return "", nil
+	case "", "null", "false":
+		return "", &Error{operation: operation, message: "mutation was not acknowledged"}
+	}
+	var result string
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", &Error{operation: operation, message: "response contained an invalid mutation acknowledgement"}
+	}
+	return result, nil
+}
+
 // Register creates the Degoo metadata record after its bytes are uploaded.
 // A failure is returned as-is because the caller must retain pending data until
-// it can determine whether registration succeeded.
+// it can determine whether registration succeeded. It returns legacy string
+// responses and an empty string for a boolean success acknowledgement.
 func (c *Client) Register(ctx context.Context, parentID, name, checksum string, size int64, created time.Time) (string, error) {
 	fileInfo := map[string]string{
 		"Name":         name,
@@ -733,15 +772,16 @@ func (c *Client) Register(ctx context.Context, parentID, name, checksum string, 
 		"CreationTime": strconv.FormatInt(created.UnixMilli(), 10),
 	}
 	var response struct {
-		SetUploadFile3 string `json:"setUploadFile3"`
+		SetUploadFile3 json.RawMessage `json:"setUploadFile3"`
 	}
 	if err := c.graphql(ctx, "SetUploadFile3", registerMutation, map[string]any{"FileInfos": []map[string]string{fileInfo}}, &response, true); err != nil {
 		return "", err
 	}
-	return response.SetUploadFile3, nil
+	return mutationAcknowledgement("SetUploadFile3", response.SetUploadFile3)
 }
 
-// Mkdir creates a Degoo folder placeholder and returns the provider response.
+// Mkdir creates a Degoo folder placeholder and returns a string provider response.
+// A boolean success acknowledgement returns an empty string.
 func (c *Client) Mkdir(ctx context.Context, parentID, name string) (string, error) {
 	fileInfo := map[string]string{
 		"Name":         name,
@@ -751,45 +791,58 @@ func (c *Client) Mkdir(ctx context.Context, parentID, name string) (string, erro
 		"CreationTime": strconv.FormatInt(time.Now().UnixMilli(), 10),
 	}
 	var response struct {
-		SetUploadFile3 string `json:"setUploadFile3"`
+		SetUploadFile3 json.RawMessage `json:"setUploadFile3"`
 	}
 	if err := c.graphql(ctx, "SetUploadFile3", registerMutation, map[string]any{"FileInfos": []map[string]string{fileInfo}}, &response, true); err != nil {
 		return "", err
 	}
-	return response.SetUploadFile3, nil
+	return mutationAcknowledgement("SetUploadFile3", response.SetUploadFile3)
 }
 
 // Rename changes the name of one Degoo item.
 func (c *Client) Rename(ctx context.Context, id, newName string) error {
 	var response struct {
-		SetRenameFile string `json:"setRenameFile"`
+		SetRenameFile json.RawMessage `json:"setRenameFile"`
 	}
-	return c.graphql(ctx, "SetRenameFile", renameMutation, map[string]any{
+	if err := c.graphql(ctx, "SetRenameFile", renameMutation, map[string]any{
 		"FileRenames": []map[string]string{{"ID": id, "NewName": newName}},
-	}, &response, true)
+	}, &response, true); err != nil {
+		return err
+	}
+	_, err := mutationAcknowledgement("SetRenameFile", response.SetRenameFile)
+	return err
 }
 
 // Move moves one Degoo item under a new parent.
 func (c *Client) Move(ctx context.Context, id, newParent string) error {
 	var response struct {
-		SetMoveFile string `json:"setMoveFile"`
+		SetMoveFile json.RawMessage `json:"setMoveFile"`
 	}
-	return c.graphql(ctx, "SetMoveFile", moveMutation, map[string]any{
+	if err := c.graphql(ctx, "SetMoveFile", moveMutation, map[string]any{
 		"Copy":        false,
 		"NewParentID": newParent,
 		"FileIDs":     []string{id},
-	}, &response, true)
+	}, &response, true); err != nil {
+		return err
+	}
+	_, err := mutationAcknowledgement("SetMoveFile", response.SetMoveFile)
+	return err
 }
 
-// Delete moves an item to the recycle bin or permanently deletes it.
-func (c *Client) Delete(ctx context.Context, id string, permanent bool) error {
+// Delete recycles an active item when inRecycleBin is false. When true, the
+// item must already be in the recycle bin and is permanently deleted.
+func (c *Client) Delete(ctx context.Context, id string, inRecycleBin bool) error {
 	var response struct {
-		SetDeleteFile5 string `json:"setDeleteFile5"`
+		SetDeleteFile5 json.RawMessage `json:"setDeleteFile5"`
 	}
-	return c.graphql(ctx, "SetDeleteFile5", deleteMutation, map[string]any{
-		"IsInRecycleBin": permanent,
+	if err := c.graphql(ctx, "SetDeleteFile5", deleteMutation, map[string]any{
+		"IsInRecycleBin": inRecycleBin,
 		"IDs":            []map[string]string{{"FileID": id}},
-	}, &response, true)
+	}, &response, true); err != nil {
+		return err
+	}
+	_, err := mutationAcknowledgement("SetDeleteFile5", response.SetDeleteFile5)
+	return err
 }
 
 // Download returns an open response body after validating a full or ranged GET.

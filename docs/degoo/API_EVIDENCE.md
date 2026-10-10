@@ -31,6 +31,34 @@ category 6 placeholder and delayed promotion to category 2 after a child is
 added. Category 6 also describes ordinary documents. Empty directories and
 promotion must be verified against a live disposable vault before release.
 
-No live credentials were used during this implementation. CDN range support,
-current object caps, token behavior, and metadata publication consistency
-remain live acceptance gates.
+## Live evidence (2026-10-10)
+
+Authenticated discovery and a dedicated generated-data test folder confirmed
+these differences from the original offline fixtures:
+
+- Metadata timestamps can be RFC3339 strings, including timezone offsets,
+  rather than only decimal Unix milliseconds.
+- `SetUploadFile3` can acknowledge success with JSON `true` instead of a
+  string. Mutation decoding accepts successful booleans and legacy strings,
+  and rejects false, missing, null, or unexpected acknowledgements.
+- Newly acknowledged creates using encrypted names can initially produce
+  category 0 zero-size placeholders. Only the app's own confirmed creation
+  allows adding the marker; existing zero-size category 0 files are not adopted.
+- Creating a child promoted a category 6 folder to category 2 with a different
+  ID. The original entry became an empty category 0 ghost. The internal marker
+  moved to the new folder and retained the name derived from the original ID.
+- Creating a test folder under an existing device container worked; creation
+  directly under account root was rejected.
+- A surviving same-name category 0 placeholder caused file rename to change
+  the uploaded file's parent back to that placeholder. Renaming the verified
+  placeholder to a unique reserved name resolved the issue. Automatic
+  retirement requires the moved marker and an empty placeholder.
+- `IsInRecycleBin=true` hard deletion rejected an active replacement backup.
+  Recycling with `false` removed it from the live parent listing. A subsequent
+  hard deletion of the recycled setup-owned retired folder succeeded.
+- A 2 MiB encrypted logical file published successfully. A fresh-cache mount
+  passed an offset read through the CDN and a full plaintext SHA-256 match.
+
+No credentials, signed URLs, account filenames, or folder identifiers are
+recorded here. Current object caps and long-lived token behavior remain live
+acceptance gates; see [VALIDATION.md](VALIDATION.md) for the tested scope.

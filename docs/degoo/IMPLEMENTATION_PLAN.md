@@ -1,13 +1,21 @@
 # Degoo private vault implementation plan
 
-**Status:** Implemented with offline validation (2026-10-10). Live acceptance
-is pending because no disposable test vault is available.
+**Status (2026-10-10):** Core implementation and offline validation are
+complete; live smoke checks passed against a dedicated disposable Degoo
+folder. A 2 MiB logical file has been fully published and verified after
+remounting with a fresh cache, including a CDN range read and matching full
+SHA-256. Root-level empty-file, overwrite, truncate, and rename readbacks passed
+after a fresh-cache remount. Nested creation, readback, rename, and deletion
+also passed, followed by an empty fresh-cache remount. Live
+limits above 20 GiB, pagination beyond 1,000 entries, and account-token
+lifetime are unverified, so the vault is not yet accepted for normal use.
 
 ## Implementation decisions and validation plan
 
-The user selected implementation of the Degoo mount and offline validation;
-no disposable live vault is available. The original sequence below remains
-the release acceptance guide. Live gates cannot be inferred from mock results.
+The original offline implementation checks are complete. A dedicated live test
+folder is now available and has been used for limited provider probes. The
+original sequence below remains the release acceptance guide; live gates
+cannot be inferred from mock results or from the partial live probes.
 
 1. Implement the provider request contracts from the pinned Python reference
    in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and
@@ -39,16 +47,46 @@ size. This does not establish the live provider limit. The vault uses rclone
 crypt's existing format and chunker version 2 `simplejson` manifests, with
 SHA1 for all files and encrypted manifest contents.
 
-Folder promotion is an explicit live uncertainty: the raw backend uses an
-opaque internal child marker to distinguish the reference's directory
-placeholders from ordinary empty documents. The marker contains no user
-name or content. Verify empty directories, promotion, rename, and cleanup in
-a disposable live vault before release. Remote orphan garbage collection,
-multi-writer coordination, and distributed atomic rename remain unsupported.
+Live probes on 2026-10-10 established that creating the dedicated folder under
+the account's device root succeeds, while a create request under account root
+ID `0` is rejected. Responses include RFC3339 timestamp strings and boolean
+mutation acknowledgements. The newly created encrypted-name placeholder was
+observed as a zero-size `Cat0`, not `Cat6`; the original placeholder stays in
+its parent while only its child marker moves into the returned `newCat2` folder.
+A generated 2 MiB logical file was fully
+published as encrypted chunks and an encrypted manifest, with pending uploads
+reaching zero. After unmount, validation moved the old cache aside and
+remounted with a new empty private cache. A seek to 1 MiB + 123 and 65,536-byte
+read succeeded, and the complete readback SHA-256 matched the generated
+source, demonstrating live CDN range behavior and logical-file visibility
+after remount. The redundant old cache was removed after this proof.
+
+A same-name original `Cat0` ghost caused the parent check for the final rename
+upload to be true before the operation and false afterward. The backend now
+retires verified-empty ghosts automatically, with tests passing; it does not
+generally delete non-empty ghosts. Root-level empty-file, overwrite, truncate,
+and rename operations passed readback after a fresh-cache remount. Generated
+empty and lifecycle-test files were deleted, and a fresh mount root listing
+verified their removal as a smoke check. Live cleanup also required recycling
+active items, waiting for recycle visibility, and then hard-deleting them; the
+retired setup ghost and 23 failed generated uploads were successfully cleaned
+up. Current nested-directory handling is limited to a newly created empty
+encrypted-name placeholder when that `Mkdir` is acknowledged and pre-lookup
+finds no existing entry. Nested directory creation, child-file fresh-cache
+readback, directory rename, file deletion, and empty-directory removal passed.
+A final fresh-cache remount confirmed an empty vault and zero pending uploads.
+Live support above
+20 GiB, pagination beyond 1,000 entries, and account-token lifetime remain
+unverified. Remote orphan garbage collection, multi-writer coordination, and
+distributed atomic rename remain unsupported.
 
 See [USAGE.md](USAGE.md) for configuration, commands, recovery behavior, and
 the live acceptance checklist. [VALIDATION.md](VALIDATION.md) records offline
-results and reproducible checks.
+results, current live observations, and reproducible checks. The contained
+installation and local-only cleanup flow are documented in
+[INSTALLATION.md](INSTALLATION.md) and
+[contrib/degoo/README.md](../../contrib/degoo/README.md); cleanup deliberately
+leaves remote encrypted objects untouched.
 
 ## Original advisory handoff
 
