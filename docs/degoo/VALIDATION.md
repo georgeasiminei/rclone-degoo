@@ -122,8 +122,9 @@ token was rejected with HTTP 403. The status does not establish whether the
 refresh token expired, was revoked, or endpoint access was forbidden. The auth
 client now reports this safely and can adopt fresh tokens saved by interactive
 login. After fresh interactive login, an explicit renewal request succeeded
-and saved new private authentication state. Renewal after the next real token
-expiry and successful long-term unattended operation remain unverified.
+and saved new private authentication state. A later metadata lookup renewed
+the saved token after its real expiry and completed successfully. Successful
+long-term unattended operation across repeated renewal cycles remains unverified.
 
 The live provider limit above 20 GiB, pagination beyond 1,000 entries, and
 failure recovery under Degoo's consistency model remain unverified. Keep all live
@@ -171,3 +172,21 @@ service. Validation completed:
 
 These checks establish the contained installation and persistence behavior;
 they do not remove the long-term renewal and remaining live acceptance gates.
+
+## Information report follow-up
+
+The contained `info.sh` reports local mount/service state, private config paths
+and their roles, saved cache settings, pending writes, token expiry hints, and
+bounded disk/cache allocation estimates. The default report excludes the cloud
+mount and does not contact Degoo. An optional `--check-remote` checks only vault
+ancestry, suppresses raw provider errors, and may renew authentication.
+
+- All 44 offline information-report, installer, and uninstall tests passed.
+- The installed local report completed in under 0.1 seconds on the live host.
+  Mount and service were active, lingering was enabled, and pending uploads
+  were zero. Cache allocation and install allocation are reported separately.
+- The metadata-only remote check confirmed the configured vault location.
+  A saved access token that had genuinely expired was renewed successfully.
+- The updated secret-free Linux archive passed its packager self-check and an
+  offline install, local report, and complete uninstall using the real binary
+  under a temporary home. The archive includes the backend license notice.

@@ -23,7 +23,7 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("install.py", "login.py", "service.py", "setup.py", "uninstall.py")
+SOURCE_FILES = ("install.py", "info.py", "login.py", "service.py", "setup.py", "uninstall.py")
 MAX_CONFIG_SIZE = 1024 * 1024
 DEFAULT_MOUNT_SETTINGS = {
     "cache_max_size": "20G",
@@ -339,6 +339,14 @@ def shell_quote(value: str | Path) -> str:
 
 def shell_wrapper(name: str, root: Path) -> bytes:
     root_text = shell_quote(root)
+    if name == "info.sh":
+        content = (
+            "#!/bin/sh\nset -eu\n"
+            f"ROOT={root_text}\n"
+            "export PYTHONDONTWRITEBYTECODE=1\n"
+            "exec python3 \"$ROOT/info.py\" --root \"$ROOT\" \"$@\"\n"
+        )
+        return content.encode("utf-8")
     if name == "service.sh":
         content = (
             "#!/bin/sh\nset -eu\n"
@@ -627,7 +635,7 @@ def _install(args: argparse.Namespace) -> int:
         else:
             validate_rclone_config(existing_rclone_config, root, folder_id)
 
-    for wrapper in ("login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh"):
+    for wrapper in ("login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh", "info.sh"):
         write_private_file(root / wrapper, shell_wrapper(wrapper, root), replace=os.path.lexists(root / wrapper), mode=0o700)
     write_private_file(root / "rclone-degoo.service", service_unit(root), replace=os.path.lexists(root / "rclone-degoo.service"), mode=0o600)
     install_fuse_helper(root)

@@ -96,6 +96,21 @@ Stop the mount before upgrading. The installer refuses an active mount or cache
 lock and preserves the vault secret, account tokens, email, rclone settings,
 mount settings, and cache. It also refuses an upgrade that changes the folder ID.
 
+## Inspect local status
+
+Run `~/.local/share/rclone-degoo/info.sh` for a local report of the configured
+vault location, actual mount state, user-service state, cache settings, pending
+local uploads, disk use, and a bounded estimate of install-file allocation.
+The default report does not contact Degoo. It never prints the vault password,
+account email, access or refresh tokens, or raw provider errors. Pending-upload
+counts describe local dirty cache state; they do not verify cloud contents.
+
+Use `info.sh --check-remote` when you also want the current remote folder
+ancestry. That check contacts Degoo and may refresh account authentication. The
+report prints only validated folder names and a sanitized success or failure
+state. Local token expiry is only a decoded JWT hint and does not establish
+whether the server will accept or refresh the token.
+
 ## Uninstall
 
 The default command inventories the install without changing it. `--root` is
@@ -135,5 +150,5 @@ Degoo folder untouched. Remote removal is separate.
 Run the offline installer, login, service, setup, and cleanup checks with:
 
 ```sh
-python3 -m unittest contrib.degoo.test_install contrib.degoo.test_uninstall
+python3 -m unittest contrib.degoo.test_install contrib.degoo.test_info contrib.degoo.test_uninstall
 ```

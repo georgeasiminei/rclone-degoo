@@ -23,6 +23,8 @@ REQUIRED_FILES = (
     "contrib/degoo/login.py",
     "contrib/degoo/setup.py",
     "contrib/degoo/service.py",
+    "contrib/degoo/info.py",
+    "backend/degoo/NOTICE",
     "contrib/degoo/uninstall.py",
     "contrib/degoo/README.md",
     "docs/degoo/INSTALLATION.md",
@@ -50,6 +52,7 @@ enable the user service:
     ~/.local/share/rclone-degoo/folders.sh
     ~/.local/share/rclone-degoo/setup.sh --parent-id DEVICE_ID --name EncryptedVault
     ~/.local/share/rclone-degoo/service.sh enable
+    ~/.local/share/rclone-degoo/info.sh
 
 The installer keeps account credentials, vault settings, cache, logs, and
 runtime files inside ~/.local/share/rclone-degoo. This archive contains only

@@ -29,6 +29,7 @@ container ID, then create your dedicated vault:
 ~/.local/share/rclone-degoo/setup.sh --parent-id DEVICE_ID --name EncryptedVault
 ~/.local/share/rclone-degoo/service.sh enable
 ls ~/.local/share/rclone-degoo/mount
+~/.local/share/rclone-degoo/info.sh
 ```
 
 For a service that also starts before login and survives logout, enable user
@@ -43,6 +44,12 @@ not change it automatically or disable an existing setting during uninstall.
 For manual foreground mounting, use `mount.sh` instead of enabling the service.
 See [installation and cleanup](docs/degoo/INSTALLATION.md) for configuration,
 existing vaults, service management, and uninstall.
+
+`info.sh` reports the mount and service state, configuration locations and
+settings, pending uploads, authentication expiry, and local disk/cache use.
+Its size scan is bounded and excludes the mounted cloud tree. Use
+`info.sh --check-remote` for an optional metadata-only credential and location
+check; it does not download file contents or total the remote vault size.
 
 ## Cache and verification
 

@@ -65,6 +65,7 @@ to a vault at a time.
   location.sh         show the vault's remote ancestor folders
   mount.sh            foreground mount launcher
   status.sh           pending-upload status
+  info.sh             local mount, cache, disk, config, and auth overview
   stop.sh             stop/unmount the vault
   service.sh          enable, disable, start, stop, restart, or inspect service
   uninstall.py        local cleanup tool
@@ -132,6 +133,30 @@ Use `service.sh disable` to stop the service and remove automatic startup.
 Keep only one mount process for this cache. Before replacing a binary, stop the
 service or manual mount and use the installer's upgrade operation. Upgrade
 preserves credentials, the vault secret, cache, and existing mount settings.
+
+## Information report
+
+```sh
+~/.local/share/rclone-degoo/info.sh
+~/.local/share/rclone-degoo/info.sh --check-remote
+```
+
+The default report uses local state. It shows the mounted directory, cached
+remote location, service state, config file locations and roles, cache settings
+and their effects, pending uploads, token expiry, and local disk usage. It never
+prints passwords, salts, email addresses, account tokens, or signed URLs.
+
+Local size estimates use a bounded scan that excludes the cloud mount and does
+not follow symlinks. Sparse cache files are counted by their allocated blocks.
+Outside usage means other data on the same local filesystem; it is not a scan
+of your home or server. Truncated scans are labelled approximate.
+
+`--check-remote` additionally performs a bounded metadata-only lookup of the
+vault and its ancestors. It can establish whether credentials currently work
+or a fresh login is required, and update the displayed remote location. It
+does not download file contents or enumerate the cloud to calculate its size.
+Zero pending uploads indicates no dirty local writes, rather than an
+independent remote integrity audit.
 
 ## Cache settings and verification
 
