@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/backend/degoo/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/object"
@@ -33,19 +34,41 @@ type mockItem struct {
 }
 
 type mockDegoo struct {
-	mu            sync.Mutex
-	items         map[string]mockItem
-	uploads       map[string][]byte
-	nextID        int
-	failRegister  bool
-	corruptUpload bool
-	registerSeen  chan struct{}
+	mu                         sync.Mutex
+	items                      map[string]mockItem
+	uploads                    map[string][]byte
+	nextID                     int
+	failRegister               bool
+	failInitialMkdirAck        bool
+	corruptUpload              bool
+	promoteOnMarker            bool
+	initialPlaceholderCategory int
+	renameRoutesViaAlias       bool
+	listLagForName             string
+	listLagID                  string
+	listLagOldName             string
+	listLagFinalName           string
+	listLagResponses           int
+	listLagRemaining           int
+	getItemSawFinalName        bool
+	overlayParentZero          bool
+	backupID                   string
+	backupDeletedBeforeVisible bool
+	deleteCalls                []deleteCall
+	failDeleteIDs              map[string]bool
+	registerSeen               chan struct{}
+}
+
+type deleteCall struct {
+	id        string
+	permanent bool
 }
 
 func newMockDegoo() *mockDegoo {
 	return &mockDegoo{
-		items:   map[string]mockItem{"vault": {id: "vault", name: "vault", category: 2}},
-		uploads: make(map[string][]byte),
+		items:                      map[string]mockItem{"vault": {id: "vault", name: "vault", category: 2}},
+		uploads:                    make(map[string][]byte),
+		initialPlaceholderCategory: 6,
 	}
 }
 
@@ -131,14 +154,26 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 		if !ok {
 			data = map[string]any{"getOverlay4": nil}
 		} else {
-			data = map[string]any{"getOverlay4": mock.itemJSON(item, request)}
+			if id == mock.listLagID && item.name == mock.listLagFinalName {
+				mock.getItemSawFinalName = true
+			}
+			overlayItem := item
+			if mock.overlayParentZero {
+				overlayItem.parentID = "0"
+			}
+			data = map[string]any{"getOverlay4": mock.itemJSON(overlayItem, request)}
 		}
 	case "GetFileChildren5":
 		parentID, _ := input.Variables["ParentID"].(string)
 		items := make([]map[string]any, 0)
 		for _, item := range mock.items {
 			if item.parentID == parentID {
-				items = append(items, mock.itemJSON(item, request))
+				listedItem := item
+				if item.id == mock.listLagID && mock.listLagRemaining > 0 {
+					listedItem.name = mock.listLagOldName
+					mock.listLagRemaining--
+				}
+				items = append(items, mock.itemJSON(listedItem, request))
 			}
 		}
 		data = map[string]any{"getFileChildren5": map[string]any{"Items": items}}
@@ -167,20 +202,65 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 		id := fmt.Sprintf("item-%d", mock.nextID)
 		size, _ := strconv.ParseInt(fmt.Sprint(info["Size"]), 10, 64)
 		createdMS, _ := strconv.ParseInt(fmt.Sprint(info["CreationTime"]), 10, 64)
-		item := mockItem{id: id, name: name, parentID: parentID, category: 6, size: size, created: time.UnixMilli(createdMS)}
+		category := mock.initialPlaceholderCategory
+		if strings.HasPrefix(name, directoryMarkerPrefix) {
+			category = 6
+		}
+		item := mockItem{id: id, name: name, parentID: parentID, category: category, size: size, created: time.UnixMilli(createdMS)}
 		if checksum != "" {
 			item.content = append([]byte(nil), mock.uploads[name]...)
+		} else if mock.promoteOnMarker && strings.HasPrefix(name, directoryMarkerPrefix) {
+			placeholder, ok := mock.items[parentID]
+			if ok {
+				placeholder.category = 0
+				mock.items[parentID] = placeholder
+				mock.nextID++
+				promotedID := fmt.Sprintf("promoted-%d", mock.nextID)
+				mock.items[promotedID] = mockItem{
+					id: promotedID, name: placeholder.name, parentID: placeholder.parentID, category: 2,
+				}
+				item.parentID = promotedID
+			}
 		}
 		mock.items[id] = item
-		data = map[string]any{"setUploadFile3": "OK"}
+		if checksum == "" && mock.failInitialMkdirAck && !strings.HasPrefix(name, directoryMarkerPrefix) {
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if checksum == "" {
+			data = map[string]any{"setUploadFile3": true}
+		} else {
+			data = map[string]any{"setUploadFile3": "OK"}
+		}
 	case "SetRenameFile":
 		rows := input.Variables["FileRenames"].([]any)
 		row := rows[0].(map[string]any)
 		id, _ := row["ID"].(string)
 		name, _ := row["NewName"].(string)
 		item := mock.items[id]
+		oldName := item.name
 		item.name = name
+		if mock.renameRoutesViaAlias && !isInternalName(name) {
+			parent, ok := mock.items[item.parentID]
+			if ok && parent.category == 2 {
+				for _, sibling := range mock.items {
+					if sibling.id != parent.id && sibling.name == parent.name && sibling.parentID == parent.parentID && sibling.size == 0 && (sibling.category == 0 || sibling.category == 6) {
+						item.parentID = sibling.id
+						break
+					}
+				}
+			}
+		}
 		mock.items[id] = item
+		if strings.HasPrefix(name, backupPrefix) {
+			mock.backupID = id
+		}
+		if name == mock.listLagForName {
+			mock.listLagID = id
+			mock.listLagOldName = oldName
+			mock.listLagFinalName = name
+			mock.listLagRemaining = mock.listLagResponses
+		}
 		data = map[string]any{"setRenameFile": "OK"}
 	case "SetMoveFile":
 		ids := input.Variables["FileIDs"].([]any)
@@ -194,6 +274,15 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 		ids := input.Variables["IDs"].([]any)
 		row := ids[0].(map[string]any)
 		id, _ := row["FileID"].(string)
+		permanent, _ := input.Variables["IsInRecycleBin"].(bool)
+		mock.deleteCalls = append(mock.deleteCalls, deleteCall{id: id, permanent: permanent})
+		if mock.failDeleteIDs[id] {
+			writeTestJSON(writer, map[string]any{"errors": []any{map[string]string{"message": "simulated delete rejection"}}})
+			return
+		}
+		if id == mock.backupID && mock.listLagRemaining > 0 {
+			mock.backupDeletedBeforeVisible = true
+		}
 		delete(mock.items, id)
 		data = map[string]any{"setDeleteFile5": "OK"}
 	default:
@@ -236,6 +325,10 @@ func newTestFs(t *testing.T, mock *mockDegoo) (*Fs, *httptest.Server) {
 }
 
 func newTestFsAtRoot(t *testing.T, mock *mockDegoo, root string) (fs.Fs, *httptest.Server, error) {
+	return newTestFsAtRootID(t, mock, root, "vault")
+}
+
+func newTestFsAtRootID(t *testing.T, mock *mockDegoo, root, rootID string) (fs.Fs, *httptest.Server, error) {
 	t.Helper()
 	server := httptest.NewServer(mock)
 	claims := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix())))
@@ -251,7 +344,7 @@ func newTestFsAtRoot(t *testing.T, mock *mockDegoo, root string) (fs.Fs, *httpte
 		t.Fatal(err)
 	}
 	f, err := NewFs(context.Background(), "test", root, configmap.Simple{
-		"auth_file": authPath, "root_folder_id": "vault", "api_key": "test-key",
+		"auth_file": authPath, "root_folder_id": rootID, "api_key": "test-key",
 		"api_url": server.URL, "rest_url": server.URL,
 	})
 	return f, server, err
@@ -432,7 +525,7 @@ func TestDirectoryPlaceholderAndDuplicateNames(t *testing.T) {
 	mock := newMockDegoo()
 	mock.items["real-folder"] = mockItem{id: "real-folder", name: "folder", parentID: "vault", category: 2}
 	mock.items["placeholder"] = mockItem{id: "placeholder", name: "folder", parentID: "vault", category: 6, size: 0}
-	mock.items["marker"] = mockItem{id: "marker", name: directoryMarkerName("placeholder"), parentID: "placeholder", category: 6, size: 0}
+	mock.items["marker"] = mockItem{id: "marker", name: directoryMarkerName("placeholder"), parentID: "real-folder", category: 6, size: 0}
 	mock.items["empty-file"] = mockItem{id: "empty-file", name: "empty", parentID: "vault", category: 6, size: 0}
 	mock.items["duplicate-1"] = mockItem{id: "duplicate-1", name: "ambiguous", parentID: "vault", category: 6, size: 4}
 	mock.items["duplicate-2"] = mockItem{id: "duplicate-2", name: "ambiguous", parentID: "vault", category: 6, size: 4}
@@ -466,6 +559,411 @@ func TestDirectoryPlaceholderAndDuplicateNames(t *testing.T) {
 	}
 	if empty == nil {
 		t.Fatal("ordinary empty Cat6 item was not listed as a file")
+	}
+}
+
+func TestCreateDirReconcilesCategoryPromotion(t *testing.T) {
+	mock := newMockDegoo()
+	mock.promoteOnMarker = true
+	mock.items["untouched-empty"] = mockItem{id: "untouched-empty", name: "empty", parentID: "vault", category: 6, size: 0}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	ctx := context.Background()
+	if err := f.Mkdir(ctx, "folder"); err != nil {
+		t.Fatalf("Mkdir promoted folder: %v", err)
+	}
+
+	mock.mu.Lock()
+	var promoted mockItem
+	var placeholder mockItem
+	var marker mockItem
+	for _, item := range mock.items {
+		switch {
+		case item.name == "folder" && item.category == 2:
+			promoted = item
+		case strings.HasPrefix(item.name, retiredDirectoryPrefix) && item.category == 0:
+			placeholder = item
+		case strings.HasPrefix(item.name, directoryMarkerPrefix):
+			marker = item
+		}
+	}
+	mock.mu.Unlock()
+	if promoted.id == "" || placeholder.id == "" || marker.id == "" {
+		t.Fatalf("promotion state = promoted %#v, placeholder %#v, marker %#v", promoted, placeholder, marker)
+	}
+	if marker.parentID != promoted.id || marker.name != directoryMarkerName(placeholder.id) {
+		t.Fatalf("marker = %#v, want marker hashed from placeholder %q under promoted folder %q", marker, placeholder.id, promoted.id)
+	}
+	resolvedID, err := f.findDir(ctx, "folder", false)
+	if err != nil || resolvedID != promoted.id {
+		t.Fatalf("resolved folder ID = %q, %v; want promoted ID %q", resolvedID, err, promoted.id)
+	}
+	entries, err := f.List(ctx, "")
+	if err != nil {
+		t.Fatalf("List root: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("root entries = %#v, want promoted folder and unrelated empty file", entries)
+	}
+	children, err := f.List(ctx, "folder")
+	if err != nil || len(children) != 0 {
+		t.Fatalf("List promoted folder = %#v, %v; want hidden marker only", children, err)
+	}
+	if err := f.Mkdir(ctx, "folder"); err != nil {
+		t.Fatalf("idempotent Mkdir after promotion: %v", err)
+	}
+	if err := f.Rmdir(ctx, "folder"); err != nil {
+		t.Fatalf("Rmdir promoted folder: %v", err)
+	}
+	mock.mu.Lock()
+	_, placeholderExists := mock.items[placeholder.id]
+	_, promotedExists := mock.items[promoted.id]
+	_, markerExists := mock.items[marker.id]
+	_, emptyExists := mock.items["untouched-empty"]
+	mock.mu.Unlock()
+	if placeholderExists || promotedExists || markerExists || !emptyExists {
+		t.Fatalf("post-Rmdir items: placeholder=%v promoted=%v marker=%v unrelated-empty=%v", placeholderExists, promotedExists, markerExists, emptyExists)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	for _, call := range mock.deleteCalls {
+		if call.permanent {
+			t.Fatalf("Rmdir used permanent deletion for internal item %q", call.id)
+		}
+	}
+}
+
+func TestCreateDirUsesMarkerToPromoteNewCategoryZeroPlaceholder(t *testing.T) {
+	mock := newMockDegoo()
+	mock.promoteOnMarker = true
+	mock.initialPlaceholderCategory = 0
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	if err := f.Mkdir(context.Background(), "folder"); err != nil {
+		t.Fatalf("Mkdir category-zero placeholder: %v", err)
+	}
+	entries, err := f.List(context.Background(), "")
+	if err != nil {
+		t.Fatalf("List after Mkdir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Remote() != "folder" {
+		t.Fatalf("root entries = %#v, want the created folder", entries)
+	}
+	if _, ok := entries[0].(*fs.Dir); !ok {
+		t.Fatalf("root entry type = %T, want directory", entries[0])
+	}
+}
+
+func TestCreateDirDoesNotAdoptExistingCategoryZeroEmptyFile(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["empty-file"] = mockItem{id: "empty-file", name: "empty", parentID: "vault", category: 0, size: 0}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	if _, err := f.CreateDir(context.Background(), "vault", "empty"); !errors.Is(err, fs.ErrorDirExists) {
+		t.Fatalf("CreateDir existing category-zero empty file error = %v, want %v", err, fs.ErrorDirExists)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if len(mock.items) != 2 {
+		t.Fatalf("items after CreateDir = %#v, want no marker or new directory", mock.items)
+	}
+}
+
+func TestCreateDirDoesNotAdoptUnconfirmedCategoryZeroPlaceholder(t *testing.T) {
+	mock := newMockDegoo()
+	mock.initialPlaceholderCategory = 0
+	mock.failInitialMkdirAck = true
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	if _, err := f.CreateDir(context.Background(), "vault", "folder"); err == nil || !strings.Contains(err.Error(), "unconfirmed create") {
+		t.Fatalf("CreateDir error = %v, want unconfirmed category-zero refusal", err)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if len(mock.items) != 2 {
+		t.Fatalf("items after ambiguous create = %#v, want only the new unmarked placeholder", mock.items)
+	}
+	for _, item := range mock.items {
+		if strings.HasPrefix(item.name, directoryMarkerPrefix) {
+			t.Fatalf("ambiguous create was adopted and marker %q was written", item.name)
+		}
+	}
+}
+
+func TestCategoryPromotionDoesNotHideUnmarkedDuplicate(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["promoted"] = mockItem{id: "promoted", name: "folder", parentID: "vault", category: 2}
+	mock.items["placeholder"] = mockItem{id: "placeholder", name: "folder", parentID: "vault", category: 0, size: 0}
+	mock.items["empty-file"] = mockItem{id: "empty-file", name: "folder", parentID: "vault", category: 6, size: 0}
+	mock.items["marker"] = mockItem{id: "marker", name: directoryMarkerName("placeholder"), parentID: "promoted", category: 6, size: 0}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	if _, err := f.List(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "ambiguous duplicate name") {
+		t.Fatalf("List error = %v, want ambiguity for unmarked duplicate", err)
+	}
+}
+
+func TestRetiredPlaceholderPreventsSameNameRenameRouting(t *testing.T) {
+	mock := newMockDegoo()
+	mock.renameRoutesViaAlias = true
+	mock.items["ghost-folder"] = mockItem{id: "ghost-folder", name: "folder", parentID: "vault", category: 0, size: 0}
+	mock.items["real-folder"] = mockItem{id: "real-folder", name: "folder", parentID: "vault", category: 2}
+	mock.items["folder-marker"] = mockItem{id: "folder-marker", name: directoryMarkerName("ghost-folder"), parentID: "real-folder", category: 6, size: 0}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	ctx := context.Background()
+
+	mock.mu.Lock()
+	mock.items["routing-probe"] = mockItem{id: "routing-probe", name: temporaryPrefix + "probe", parentID: "real-folder", category: 6, size: 1}
+	mock.mu.Unlock()
+	if err := f.api.Rename(ctx, "routing-probe", "probe-final"); err != nil {
+		t.Fatalf("rename preflight probe: %v", err)
+	}
+	mock.mu.Lock()
+	preflight := mock.items["routing-probe"]
+	delete(mock.items, "routing-probe")
+	mock.mu.Unlock()
+	if preflight.parentID != "ghost-folder" {
+		t.Fatalf("mock alias routing parent = %q, want ghost alias before retirement", preflight.parentID)
+	}
+
+	folderID, found, err := f.FindLeaf(ctx, "vault", "folder")
+	if err != nil || !found || folderID != "real-folder" {
+		t.Fatalf("FindLeaf folder = %q, %v, %v; want promoted directory", folderID, found, err)
+	}
+	mock.mu.Lock()
+	ghost := mock.items["ghost-folder"]
+	mock.mu.Unlock()
+	if ghost.name != retiredDirectoryName(ghost.id) || !isInternalName(ghost.name) {
+		t.Fatalf("ghost name = %q, want hidden retired alias", ghost.name)
+	}
+
+	content := []byte("encrypted test data")
+	obj, err := f.Put(ctx, strings.NewReader(string(content)), object.NewStaticObjectInfo("folder/cipher", time.Now(), int64(len(content)), true, nil, f))
+	if err != nil {
+		t.Fatalf("Put through promoted folder: %v", err)
+	}
+	if obj.(*Object).ParentID() != "real-folder" {
+		t.Fatalf("published parent = %q, want promoted directory", obj.(*Object).ParentID())
+	}
+	if err := obj.Remove(ctx); err != nil {
+		t.Fatalf("remove test object: %v", err)
+	}
+	if err := f.Rmdir(ctx, "folder"); err != nil {
+		t.Fatalf("Rmdir folder with retired alias: %v", err)
+	}
+	mock.mu.Lock()
+	_, ghostExists := mock.items["ghost-folder"]
+	_, folderExists := mock.items["real-folder"]
+	_, markerExists := mock.items["folder-marker"]
+	mock.mu.Unlock()
+	if ghostExists || folderExists || markerExists {
+		t.Fatalf("Rmdir left internal items: ghost=%v folder=%v marker=%v", ghostExists, folderExists, markerExists)
+	}
+}
+
+func TestNonemptyPromotedPlaceholderIsNotRetired(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["ghost-folder"] = mockItem{id: "ghost-folder", name: "folder", parentID: "vault", category: 0, size: 0}
+	mock.items["real-folder"] = mockItem{id: "real-folder", name: "folder", parentID: "vault", category: 2}
+	mock.items["folder-marker"] = mockItem{id: "folder-marker", name: directoryMarkerName("ghost-folder"), parentID: "real-folder", category: 6, size: 0}
+	mock.items["preserved-user-file"] = mockItem{id: "preserved-user-file", name: "user-data", parentID: "ghost-folder", category: 6, size: 5}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	if _, _, err := f.FindLeaf(context.Background(), "vault", "folder"); err == nil || !strings.Contains(err.Error(), "contains data") {
+		t.Fatalf("FindLeaf error = %v, want fail-closed nonempty alias error", err)
+	}
+	mock.mu.Lock()
+	ghost := mock.items["ghost-folder"]
+	_, childExists := mock.items["preserved-user-file"]
+	mock.mu.Unlock()
+	if ghost.name != "folder" || !childExists {
+		t.Fatalf("nonempty alias changed: name=%q child-preserved=%v", ghost.name, childExists)
+	}
+}
+
+func TestNewFsRetiresConfiguredRootPlaceholder(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["device"] = mockItem{id: "device", name: "device", category: 1}
+	mock.items["root-placeholder"] = mockItem{id: "root-placeholder", name: "vault-root", parentID: "device", category: 0, size: 0}
+	mock.items["real-root"] = mockItem{id: "real-root", name: "vault-root", parentID: "device", category: 2}
+	mock.items["root-marker"] = mockItem{id: "root-marker", name: directoryMarkerName("root-placeholder"), parentID: "real-root", category: 6, size: 0}
+	f, server, err := newTestFsAtRootID(t, mock, "", "real-root")
+	defer server.Close()
+	if err != nil {
+		t.Fatalf("NewFs: %v", err)
+	}
+	if got := f.(*Fs).RootFolderID(); got != "real-root" {
+		t.Fatalf("RootFolderID = %q, want configured root", got)
+	}
+	mock.mu.Lock()
+	ghost := mock.items["root-placeholder"]
+	mock.mu.Unlock()
+	if ghost.name != retiredDirectoryName(ghost.id) {
+		t.Fatalf("configured root placeholder name = %q, want retired internal name", ghost.name)
+	}
+}
+
+func TestReplacementWaitsForPublishedListing(t *testing.T) {
+	mock := newMockDegoo()
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	ctx := context.Background()
+	oldData := []byte("previous encrypted version")
+	old, err := f.Put(ctx, strings.NewReader(string(oldData)), object.NewStaticObjectInfo("cipher", time.Now(), int64(len(oldData)), true, nil, f))
+	if err != nil {
+		t.Fatalf("initial Put: %v", err)
+	}
+	oldID := old.(*Object).ID()
+	mock.mu.Lock()
+	mock.listLagForName = "cipher"
+	mock.listLagResponses = 3
+	mock.overlayParentZero = true
+	mock.mu.Unlock()
+
+	newData := []byte("replacement encrypted version")
+	if err := old.Update(ctx, strings.NewReader(string(newData)), object.NewStaticObjectInfo("cipher", time.Now(), int64(len(newData)), true, nil, f)); err != nil {
+		t.Fatalf("Update with delayed listing: %v", err)
+	}
+	current, err := f.NewObject(ctx, "cipher")
+	if err != nil {
+		t.Fatalf("NewObject after delayed listing: %v", err)
+	}
+	if current.(*Object).ID() == oldID {
+		t.Fatalf("current ID = %q, want replacement distinct from old ID %q", current.(*Object).ID(), oldID)
+	}
+	if current.(*Object).ParentID() != "vault" {
+		t.Fatalf("published parent ID = %q, want canonical listing parent %q", current.(*Object).ParentID(), "vault")
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if !mock.getItemSawFinalName {
+		t.Fatal("GetItem never confirmed the final name during listing lag")
+	}
+	if mock.backupDeletedBeforeVisible {
+		t.Fatal("old backup was deleted before the published listing became visible")
+	}
+	if _, exists := mock.items[oldID]; exists {
+		t.Fatal("old backup remains after published replacement was confirmed")
+	}
+	if len(mock.deleteCalls) != 1 || mock.deleteCalls[0].id != oldID || mock.deleteCalls[0].permanent {
+		t.Fatalf("replacement delete calls = %#v, want one recycle-bin deletion of old object", mock.deleteCalls)
+	}
+}
+
+func TestRemoveRecyclesBackupsBeforeActiveObject(t *testing.T) {
+	mock := newMockDegoo()
+	backupName, err := newBackupName("cipher")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.items["active"] = mockItem{id: "active", name: "cipher", parentID: "vault", category: 6, size: 4, content: []byte("live")}
+	mock.items["backup"] = mockItem{id: "backup", name: backupName, parentID: "vault", category: 6, size: 3, content: []byte("old")}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	obj, err := f.NewObject(context.Background(), "cipher")
+	if err != nil {
+		t.Fatalf("NewObject: %v", err)
+	}
+	if err := obj.Remove(context.Background()); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if len(mock.deleteCalls) != 2 || mock.deleteCalls[0].id != "backup" || mock.deleteCalls[1].id != "active" {
+		t.Fatalf("delete order = %#v, want backup before active object", mock.deleteCalls)
+	}
+	for _, call := range mock.deleteCalls {
+		if call.permanent {
+			t.Fatalf("Remove used permanent deletion for %q", call.id)
+		}
+	}
+	if len(mock.items) != 1 {
+		t.Fatalf("remaining items = %#v, want only vault", mock.items)
+	}
+}
+
+func TestRemoveRetainsActiveObjectWhenBackupCleanupFails(t *testing.T) {
+	mock := newMockDegoo()
+	backupName, err := newBackupName("cipher")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.items["active"] = mockItem{id: "active", name: "cipher", parentID: "vault", category: 6, size: 4, content: []byte("live")}
+	mock.items["backup"] = mockItem{id: "backup", name: backupName, parentID: "vault", category: 6, size: 3, content: []byte("old")}
+	mock.failDeleteIDs = map[string]bool{"backup": true}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	obj, err := f.NewObject(context.Background(), "cipher")
+	if err != nil {
+		t.Fatalf("NewObject: %v", err)
+	}
+	if err := obj.Remove(context.Background()); err == nil {
+		t.Fatal("Remove succeeded despite backup cleanup failure")
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if _, exists := mock.items["active"]; !exists {
+		t.Fatal("active object was deleted despite backup cleanup failure")
+	}
+	if _, exists := mock.items["backup"]; !exists {
+		t.Fatal("backup unexpectedly disappeared after simulated delete failure")
+	}
+	if len(mock.deleteCalls) != 1 || mock.deleteCalls[0].id != "backup" || mock.deleteCalls[0].permanent {
+		t.Fatalf("delete calls = %#v, want only a recycle-bin deletion attempt for backup", mock.deleteCalls)
+	}
+}
+
+func TestWaitForIDsGoneRequiresAbsence(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["target"] = mockItem{id: "target", name: "file", parentID: "vault", category: 6}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	if err := f.waitForIDsGone(context.Background(), "vault", []string{"target"}, time.Millisecond); err == nil {
+		t.Fatal("waitForIDsGone succeeded while the target remained visible")
+	}
+	mock.mu.Lock()
+	delete(mock.items, "target")
+	mock.mu.Unlock()
+	if err := f.waitForIDsGone(context.Background(), "vault", []string{"target"}, time.Second); err != nil {
+		t.Fatalf("waitForIDsGone for absent target: %v", err)
+	}
+}
+
+func TestPublishedParentDiagnosticComparesPreAndPostRename(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["staged-private-id"] = mockItem{
+		id: "staged-private-id", name: "final-cipher-name", parentID: "other-private-parent", category: 6, size: 4,
+		content: []byte("data"),
+	}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	staged := api.Item{ID: "staged-private-id", Name: temporaryPrefix + "pending", ParentID: "vault", Size: 4}
+	_, err := f.waitForPublishedObject(context.Background(), "final-cipher-name", "final-cipher-name", "vault", staged, "vault", 4, time.Millisecond)
+	if err == nil {
+		t.Fatal("waitForPublishedObject succeeded with an unpublished parent")
+	}
+	for _, want := range []string{
+		"pre_parent_expected=true", "pre_parent_staged=true", "pre_parent_vault=true",
+		"post_parent_expected=false", "post_parent_staged=false", "post_parent_vault=false",
+		"post_parent_same_as_pre=false",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	for _, privateValue := range []string{"staged-private-id", "other-private-parent", "final-cipher-name"} {
+		if strings.Contains(err.Error(), privateValue) {
+			t.Errorf("error exposes private provider value %q: %v", privateValue, err)
+		}
 	}
 }
 

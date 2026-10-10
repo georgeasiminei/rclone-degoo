@@ -107,6 +107,64 @@ func TestGraphQLRefreshesUnauthorizedEnvelopeOnce(t *testing.T) {
 	}
 }
 
+func TestItemUnmarshalJSONRFC3339Timestamps(t *testing.T) {
+	const raw = `{"CreationTime":%q,"LastModificationTime":%q}`
+	utc := time.Date(2026, time.October, 10, 12, 34, 56, 123456789, time.UTC)
+	tests := []struct {
+		name     string
+		created  string
+		modified string
+	}{
+		{
+			name:     "UTC",
+			created:  "2026-10-10T12:34:56.123456789Z",
+			modified: "2026-10-10T12:34:56.123Z",
+		},
+		{
+			name:     "timezone offsets",
+			created:  "2026-10-10T15:34:56.123456789+03:00",
+			modified: "2026-10-10T08:34:56.123-04:00",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := []byte(fmt.Sprintf(raw, test.created, test.modified))
+			var item Item
+			if err := json.Unmarshal(data, &item); err != nil {
+				t.Fatalf("unmarshal Item: %v", err)
+			}
+			wantCreated, err := time.Parse(time.RFC3339Nano, test.created)
+			if err != nil {
+				t.Fatalf("parse expected creation time: %v", err)
+			}
+			wantModified, err := time.Parse(time.RFC3339Nano, test.modified)
+			if err != nil {
+				t.Fatalf("parse expected modification time: %v", err)
+			}
+			if !item.CreationTime.Equal(wantCreated) || !item.LastModificationTime.Equal(wantModified) {
+				t.Fatalf("decoded times = %s/%s, want %s/%s", item.CreationTime, item.LastModificationTime, wantCreated, wantModified)
+			}
+			if test.name == "UTC" && !item.CreationTime.Equal(utc) {
+				t.Fatalf("creation time = %s, want %s", item.CreationTime, utc)
+			}
+		})
+	}
+}
+
+func TestParseMillisZeroAndInvalidValues(t *testing.T) {
+	for _, value := range []string{"", "null", `""`, "0", `"0"`} {
+		got, err := parseMillis(json.RawMessage(value))
+		if err != nil || !got.IsZero() {
+			t.Errorf("parseMillis(%q) = %s, %v; want zero, nil", value, got, err)
+		}
+	}
+	for _, value := range []string{`"not-a-timestamp"`, "true", "1.5"} {
+		if got, err := parseMillis(json.RawMessage(value)); err == nil {
+			t.Errorf("parseMillis(%q) = %s, nil; want error", value, got)
+		}
+	}
+}
+
 func TestGraphQLDoesNotFollowCrossHostRedirect(t *testing.T) {
 	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -186,6 +244,96 @@ func TestMutationRefreshRequiresOnlyUnauthorizedErrorsAndNoData(t *testing.T) {
 				t.Fatalf("Register refreshed token %d times, want zero", got)
 			}
 		})
+	}
+}
+
+func TestMutationAcknowledgements(t *testing.T) {
+	operations := []struct {
+		name          string
+		field         string
+		returnsString bool
+		invoke        func(*Client) (string, error)
+	}{
+		{
+			name:          "Register",
+			field:         "setUploadFile3",
+			returnsString: true,
+			invoke: func(client *Client) (string, error) {
+				return client.Register(context.Background(), "parent", "file.txt", "checksum", 1, time.Now())
+			},
+		},
+		{
+			name:          "Mkdir",
+			field:         "setUploadFile3",
+			returnsString: true,
+			invoke: func(client *Client) (string, error) {
+				return client.Mkdir(context.Background(), "parent", "folder")
+			},
+		},
+		{
+			name:  "Rename",
+			field: "setRenameFile",
+			invoke: func(client *Client) (string, error) {
+				return "", client.Rename(context.Background(), "id", "new-name")
+			},
+		},
+		{
+			name:  "Move",
+			field: "setMoveFile",
+			invoke: func(client *Client) (string, error) {
+				return "", client.Move(context.Background(), "id", "new-parent")
+			},
+		},
+		{
+			name:  "Delete",
+			field: "setDeleteFile5",
+			invoke: func(client *Client) (string, error) {
+				return "", client.Delete(context.Background(), "id", false)
+			},
+		},
+	}
+	cases := []struct {
+		name       string
+		value      any
+		omit       bool
+		wantErr    bool
+		wantString string
+	}{
+		{name: "boolean true", value: true},
+		{name: "legacy string", value: "legacy result", wantString: "legacy result"},
+		{name: "false", value: false, wantErr: true},
+		{name: "null", value: nil, wantErr: true},
+		{name: "wrong type", value: 42, wantErr: true},
+		{name: "missing", omit: true, wantErr: true},
+	}
+	for _, operation := range operations {
+		for _, test := range cases {
+			t.Run(operation.name+"/"+test.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+					data := map[string]any{}
+					if !test.omit {
+						data[operation.field] = test.value
+					}
+					writeJSON(t, writer, map[string]any{"data": data})
+				}))
+				defer server.Close()
+
+				got, err := operation.invoke(newTestClient(server, &testTokens{initial: "token"}))
+				if test.wantErr {
+					if err == nil {
+						t.Fatalf("%s unexpectedly succeeded with %v acknowledgement", operation.name, test.name)
+					}
+					return
+				}
+				wantString := test.wantString
+				if !operation.returnsString {
+					wantString = ""
+				}
+				if err != nil || got != wantString {
+					t.Fatalf("%s = %q, %v; want %q, nil", operation.name, got, err, wantString)
+				}
+			})
+		}
 	}
 }
 

@@ -39,9 +39,12 @@ const (
 	defaultRESTURL    = "https://rest-api.degoo.com"
 	defaultAPIKey     = "da2-vs6twz5vnjdavpqndtbzg3prra"
 
-	directoryMarkerPrefix = ".rclone-degoo-dir-marker-"
-	temporaryPrefix       = ".rclone-degoo-upload-"
-	backupPrefix          = ".rclone-degoo-backup-"
+	directoryMarkerPrefix  = ".rclone-degoo-dir-marker-"
+	retiredDirectoryPrefix = ".rclone-degoo-retired-dir-"
+	temporaryPrefix        = ".rclone-degoo-upload-"
+	backupPrefix           = ".rclone-degoo-backup-"
+
+	directoryPromotionTimeout = 3 * time.Minute
 
 	minPacerSleep = 100 * time.Millisecond
 	maxPacerSleep = 30 * time.Second
@@ -190,6 +193,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if !isDir {
 		return nil, errors.New("degoo: root_folder_id does not identify a directory")
 	}
+	if err := f.retireConfiguredRootPlaceholder(ctx, rootItem); err != nil {
+		return nil, fmt.Errorf("degoo: reconcile configured vault folder: %w", err)
+	}
 	if err := f.dirCache.FindRoot(ctx, false); err != nil {
 		if root == "" {
 			return nil, fmt.Errorf("degoo: resolve vault root: %w", err)
@@ -261,12 +267,15 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (string, bool, e
 	if err := validateLeaf(leaf); err != nil {
 		return "", false, err
 	}
-	item, isDir, _, err := f.lookupChild(ctx, pathID, leaf)
+	item, isDir, ghosts, err := f.lookupChild(ctx, pathID, leaf)
 	if err != nil || item == nil {
 		return "", false, err
 	}
 	if !isDir {
 		return "", false, fs.ErrorDirNotFound
+	}
+	if err := f.retirePromotedPlaceholder(ctx, pathID, *item, ghosts); err != nil {
+		return "", false, err
 	}
 	if item.Category == 6 {
 		f.rememberPlaceholder(item.ID)
@@ -279,12 +288,15 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 	if err := validateLeaf(leaf); err != nil {
 		return "", err
 	}
-	item, isDir, _, err := f.lookupChild(ctx, pathID, leaf)
+	item, isDir, ghosts, err := f.lookupChild(ctx, pathID, leaf)
 	if err != nil {
 		return "", err
 	}
 	if item != nil {
 		if isDir {
+			if err := f.retirePromotedPlaceholder(ctx, pathID, *item, ghosts); err != nil {
+				return "", err
+			}
 			return item.ID, nil
 		}
 		return "", fs.ErrorDirExists
@@ -305,7 +317,13 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 		}
 		return "", fmt.Errorf("degoo: directory placeholder may have been created but could not be resolved: %w", err)
 	}
-	if placeholder.Category != 6 {
+	if placeholder.ID == "" || placeholder.Name != leaf || placeholder.ParentID != pathID {
+		return "", errors.New("degoo: created folder metadata does not match the requested child")
+	}
+	if placeholder.Category == 0 && createErr != nil {
+		return "", errors.New("degoo: refusing to adopt a category-zero placeholder after an unconfirmed create")
+	}
+	if placeholder.Category != 0 && placeholder.Category != 6 {
 		isDir, err := f.itemIsDirectory(ctx, placeholder)
 		if err != nil {
 			return "", err
@@ -321,21 +339,21 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 
 	markerName := directoryMarkerName(placeholder.ID)
 	_, markerErr := f.api.Mkdir(ctx, placeholder.ID, markerName)
-	markerTimeout := 20 * time.Second
-	if markerErr != nil {
-		if !api.Retryable(markerErr) {
-			return "", fmt.Errorf("degoo: create directory marker: %w", markerErr)
-		}
-		markerTimeout = 2 * time.Second
+	if markerErr != nil && !api.Retryable(markerErr) {
+		return "", fmt.Errorf("degoo: create directory marker: %w", markerErr)
 	}
-	if err := f.waitForMarker(ctx, placeholder.ID, markerName, markerTimeout); err != nil {
+	directory, err := f.waitForCreatedDirectory(ctx, pathID, leaf, placeholder.ID, directoryPromotionTimeout)
+	if err != nil {
 		if markerErr != nil {
 			return "", fmt.Errorf("degoo: create directory marker failed and state could not be confirmed: %w", markerErr)
 		}
 		return "", fmt.Errorf("degoo: directory marker may have been created but could not be verified: %w", err)
 	}
+	if err := f.retirePromotedPlaceholder(ctx, pathID, directory, []api.Item{placeholder}); err != nil {
+		return "", fmt.Errorf("degoo: reconcile promoted directory: %w", err)
+	}
 	f.rememberPlaceholder(placeholder.ID)
-	return placeholder.ID, nil
+	return directory.ID, nil
 }
 
 func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout time.Duration) (api.Item, error) {
@@ -372,28 +390,54 @@ func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout tim
 	}
 }
 
-func (f *Fs) waitForMarker(ctx context.Context, directoryID, markerName string, timeout time.Duration) error {
+func (f *Fs) waitForCreatedDirectory(ctx context.Context, parentID, name, placeholderID string, timeout time.Duration) (api.Item, error) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
+	var lastErr error
 	for {
-		items, err := f.listDir(ctx, directoryID)
+		items, err := f.listDir(ctx, parentID)
 		if err == nil {
+			matches := make([]api.Item, 0, 2)
 			for _, item := range items {
-				if item.Name == markerName {
-					return nil
+				if item.Name == name && !isInternalName(item.Name) {
+					matches = append(matches, item)
 				}
 			}
+			if len(matches) != 0 {
+				directory, isDir, _, resolveErr := f.resolveNameGroup(ctx, matches)
+				if resolveErr != nil {
+					lastErr = resolveErr
+				} else if directory != nil && isDir {
+					if directory.ID == placeholderID {
+						found, markerErr := f.hasVerifiedDirectoryMarker(ctx, directory.ID, placeholderID)
+						if markerErr != nil {
+							lastErr = markerErr
+						} else if found {
+							return *directory, nil
+						}
+					} else if directory.Category == 2 {
+						found, markerErr := f.hasVerifiedDirectoryMarker(ctx, directory.ID, placeholderID)
+						if markerErr != nil {
+							lastErr = markerErr
+						} else if found {
+							return *directory, nil
+						}
+					}
+				}
+			}
+		} else {
+			lastErr = err
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return api.Item{}, ctx.Err()
 		case <-deadline.C:
-			if err != nil {
-				return err
+			if lastErr != nil {
+				return api.Item{}, lastErr
 			}
-			return errors.New("directory marker did not become visible")
+			return api.Item{}, errors.New("directory marker did not become visible")
 		case <-ticker.C:
 		}
 	}
@@ -430,8 +474,8 @@ func (f *Fs) resolveNameGroup(ctx context.Context, matches []api.Item) (*api.Ite
 		if f.isProviderDirectoryCategory(item.Category) {
 			return &item, true, nil, nil
 		}
-		if item.Category == 6 && item.Size == 0 {
-			marker, err := f.hasDirectoryMarker(ctx, item.ID)
+		if (item.Category == 0 || item.Category == 6) && item.Size == 0 {
+			marker, err := f.hasVerifiedDirectoryMarker(ctx, item.ID, item.ID)
 			if err != nil {
 				return nil, false, nil, err
 			}
@@ -453,22 +497,173 @@ func (f *Fs) resolveNameGroup(ctx context.Context, matches []api.Item) (*api.Ite
 			}
 			copy := item
 			realFolder = &copy
-		} else if item.Category == 6 && item.Size == 0 {
+		} else if (item.Category == 0 || item.Category == 6) && item.Size == 0 {
 			placeholders = append(placeholders, item)
 		}
 	}
-	if realFolder != nil && len(placeholders) == len(matches)-1 {
+	if realFolder != nil && len(matches) == 2 && len(placeholders) == 1 {
 		for _, placeholder := range placeholders {
 			marker, err := f.hasDirectoryMarker(ctx, placeholder.ID)
 			if err != nil {
 				return nil, false, nil, err
 			}
 			if marker {
-				return realFolder, true, placeholders, nil
+				f.rememberPlaceholder(placeholder.ID)
+				return realFolder, true, []api.Item{placeholder}, nil
+			}
+			marker, err = f.hasNamedDirectoryMarker(ctx, realFolder.ID, directoryMarkerName(placeholder.ID))
+			if err != nil {
+				return nil, false, nil, err
+			}
+			if marker {
+				f.rememberPlaceholder(placeholder.ID)
+				return realFolder, true, []api.Item{placeholder}, nil
 			}
 		}
 	}
 	return nil, false, nil, duplicateNameError(matches)
+}
+
+func (f *Fs) retireConfiguredRootPlaceholder(ctx context.Context, root api.Item) error {
+	if root.Category != 2 || root.ID == "" || root.ParentID == "" || root.ParentID == "0" {
+		return nil
+	}
+	siblings, err := f.listDir(ctx, root.ParentID)
+	if err != nil {
+		return err
+	}
+	matches := make([]api.Item, 0, 2)
+	for _, sibling := range siblings {
+		if sibling.Name == root.Name {
+			matches = append(matches, sibling)
+		}
+	}
+	if len(matches) != 2 {
+		return nil
+	}
+	for _, candidate := range matches {
+		if candidate.ID == root.ID || candidate.Name != root.Name || candidate.ParentID != root.ParentID || candidate.Size != 0 || (candidate.Category != 0 && candidate.Category != 6) {
+			continue
+		}
+		marker, err := f.hasVerifiedDirectoryMarker(ctx, root.ID, candidate.ID)
+		if err != nil {
+			return err
+		}
+		if !marker {
+			marker, err = f.hasVerifiedDirectoryMarker(ctx, candidate.ID, candidate.ID)
+			if err != nil {
+				return err
+			}
+		}
+		if !marker {
+			continue
+		}
+		return f.retirePromotedPlaceholder(ctx, root.ParentID, root, []api.Item{candidate})
+	}
+	return nil
+}
+
+func (f *Fs) retirePromotedPlaceholder(ctx context.Context, parentID string, directory api.Item, placeholders []api.Item) error {
+	if directory.Category != 2 || directory.ID == "" || len(placeholders) == 0 {
+		return nil
+	}
+	if len(placeholders) != 1 {
+		return errors.New("degoo: refusing to retire an ambiguous folder placeholder")
+	}
+	placeholder := placeholders[0]
+	if placeholder.ID == directory.ID {
+		return nil
+	}
+	if placeholder.ID == "" || placeholder.Name != directory.Name || placeholder.ParentID != parentID || directory.ParentID != parentID || placeholder.Size != 0 || (placeholder.Category != 0 && placeholder.Category != 6) {
+		return errors.New("degoo: refusing to retire an unverified folder placeholder")
+	}
+	markerName := directoryMarkerName(placeholder.ID)
+	deadline := time.NewTimer(directoryPromotionTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		children, err := f.listDir(ctx, placeholder.ID)
+		if err != nil {
+			return err
+		}
+		if len(children) > 1 || (len(children) == 1 && children[0].Name != markerName) {
+			return errors.New("degoo: promoted folder placeholder contains data; refusing to rename it")
+		}
+		markerInDirectory, err := f.hasVerifiedDirectoryMarker(ctx, directory.ID, placeholder.ID)
+		if err != nil {
+			return err
+		}
+		if markerInDirectory && len(children) == 0 {
+			return f.renameRetiredPlaceholder(ctx, parentID, directory, placeholder)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errors.New("degoo: folder promotion alias did not become safe to retire")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (f *Fs) renameRetiredPlaceholder(ctx context.Context, parentID string, directory, placeholder api.Item) error {
+	retiredName := retiredDirectoryName(placeholder.ID)
+	siblings, err := f.listDir(ctx, parentID)
+	if err != nil {
+		return err
+	}
+	for _, sibling := range siblings {
+		if sibling.Name == retiredName {
+			if sibling.ID == placeholder.ID && sibling.ParentID == parentID && sibling.Size == 0 && (sibling.Category == 0 || sibling.Category == 6) {
+				return f.waitForRetiredPlaceholder(ctx, parentID, directory, placeholder, retiredName, 20*time.Second)
+			}
+			return errors.New("degoo: retired folder placeholder name is already in use")
+		}
+	}
+	if err := f.renameConfirmed(ctx, placeholder.ID, parentID, retiredName); err != nil {
+		return fmt.Errorf("degoo: retire verified folder placeholder: %w", err)
+	}
+	return f.waitForRetiredPlaceholder(ctx, parentID, directory, placeholder, retiredName, 20*time.Second)
+}
+
+func (f *Fs) waitForRetiredPlaceholder(ctx context.Context, parentID string, directory, placeholder api.Item, retiredName string, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		items, err := f.listDir(ctx, parentID)
+		if err == nil {
+			retiredFound := false
+			directoryFound := false
+			oldNameCount := 0
+			for _, item := range items {
+				if item.Name == directory.Name {
+					oldNameCount++
+					if item.ID == directory.ID && item.Category == 2 {
+						directoryFound = true
+					}
+				}
+				if item.ID == placeholder.ID && item.Name == retiredName && item.ParentID == parentID && item.Size == 0 && (item.Category == 0 || item.Category == 6) {
+					retiredFound = true
+				}
+			}
+			if retiredFound && directoryFound && oldNameCount == 1 {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			if err != nil {
+				return err
+			}
+			return errors.New("degoo: retired folder placeholder did not become visible")
+		case <-ticker.C:
+		}
+	}
 }
 
 func duplicateNameError(items []api.Item) error {
@@ -476,25 +671,46 @@ func duplicateNameError(items []api.Item) error {
 }
 
 func (f *Fs) hasDirectoryMarker(ctx context.Context, directoryID string) (bool, error) {
+	return f.hasNamedDirectoryMarker(ctx, directoryID, directoryMarkerName(directoryID))
+}
+
+func (f *Fs) hasNamedDirectoryMarker(ctx context.Context, directoryID, markerName string) (bool, error) {
 	items, err := f.listDir(ctx, directoryID)
 	if err != nil {
 		return false, err
 	}
-	expectedName := directoryMarkerName(directoryID)
 	for _, item := range items {
-		if item.Name == expectedName {
+		if item.Name == markerName {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
+func (f *Fs) hasVerifiedDirectoryMarker(ctx context.Context, directoryID, placeholderID string) (bool, error) {
+	items, err := f.listDir(ctx, directoryID)
+	if err != nil {
+		return false, err
+	}
+	markerName := directoryMarkerName(placeholderID)
+	found := false
+	for _, item := range items {
+		if item.Name == markerName && item.ParentID == directoryID && item.Size == 0 && (item.Category == 0 || item.Category == 6) {
+			if found {
+				return false, errors.New("degoo: duplicate internal directory marker")
+			}
+			found = true
+		}
+	}
+	return found, nil
+}
+
 func (f *Fs) itemIsDirectory(ctx context.Context, item api.Item) (bool, error) {
 	if f.isProviderDirectoryCategory(item.Category) {
 		return true, nil
 	}
-	if item.Category == 6 && item.Size == 0 {
-		marker, err := f.hasDirectoryMarker(ctx, item.ID)
+	if (item.Category == 0 || item.Category == 6) && item.Size == 0 {
+		marker, err := f.hasVerifiedDirectoryMarker(ctx, item.ID, item.ID)
 		return marker, err
 	}
 	return false, nil
@@ -520,6 +736,10 @@ func (f *Fs) isPlaceholder(id string) bool {
 func directoryMarkerName(directoryID string) string {
 	markerID := sha256.Sum256([]byte(directoryID))
 	return directoryMarkerPrefix + hex.EncodeToString(markerID[:16])
+}
+
+func retiredDirectoryName(directoryID string) string {
+	return retiredDirectoryPrefix + strings.TrimPrefix(directoryMarkerName(directoryID), directoryMarkerPrefix)
 }
 
 func newInternalName(prefix string) (string, error) {
@@ -562,7 +782,7 @@ func backupTarget(name string) (string, bool) {
 }
 
 func isInternalName(name string) bool {
-	return strings.HasPrefix(name, directoryMarkerPrefix) || strings.HasPrefix(name, temporaryPrefix) || strings.HasPrefix(name, backupPrefix)
+	return strings.HasPrefix(name, directoryMarkerPrefix) || strings.HasPrefix(name, retiredDirectoryPrefix) || strings.HasPrefix(name, temporaryPrefix) || strings.HasPrefix(name, backupPrefix)
 }
 
 func normalizeRemote(remote string) (string, error) {
@@ -690,12 +910,15 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	slices.Sort(names)
 	entries := make(fs.DirEntries, 0, len(names))
 	for _, name := range names {
-		item, isDir, _, err := f.resolveNameGroup(ctx, groups[name])
+		item, isDir, ghosts, err := f.resolveNameGroup(ctx, groups[name])
 		if err != nil {
 			return nil, err
 		}
 		remote := path.Join(dir, name)
 		if isDir {
+			if err := f.retirePromotedPlaceholder(ctx, directoryID, *item, ghosts); err != nil {
+				return nil, err
+			}
 			f.dirCache.Put(remote, item.ID)
 			d := fs.NewDir(remote, itemModTime(*item)).SetID(item.ID).SetParentID(item.ParentID)
 			entries = append(entries, d)
@@ -823,19 +1046,37 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	for _, ghost := range ghosts {
 		ids = append(ids, ghost.ID)
 	}
+	retired, err := f.findRetiredPlaceholders(ctx, parentID, *item)
+	if err != nil {
+		return err
+	}
+	for _, placeholder := range retired {
+		ids = append(ids, placeholder.ID)
+	}
+	markerNames := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		markerNames[directoryMarkerName(id)] = struct{}{}
+	}
+	var markers []api.Item
 	for _, id := range ids {
 		children, err := f.listDir(ctx, id)
 		if err != nil && !isNotFoundError(err) {
 			return err
 		}
 		for _, child := range children {
-			if child.Name != directoryMarkerName(id) {
+			if _, isMarker := markerNames[child.Name]; !isMarker {
 				return fs.ErrorDirectoryNotEmpty
 			}
-			if err := f.api.Delete(ctx, child.ID, true); err != nil {
-				return fmt.Errorf("degoo: remove directory marker: %w", err)
-			}
+			markers = append(markers, child)
 		}
+	}
+	for _, marker := range markers {
+		if err := f.api.Delete(ctx, marker.ID, false); err != nil {
+			return fmt.Errorf("degoo: remove directory marker: %w", err)
+		}
+	}
+	if err := f.waitForIDsGoneInDirs(ctx, ids, itemIDs(markers), 20*time.Second); err != nil {
+		return fmt.Errorf("degoo: wait for directory markers to be removed: %w", err)
 	}
 	for _, id := range ids {
 		if err := f.api.Delete(ctx, id, false); err != nil && !isNotFoundError(err) {
@@ -844,6 +1085,50 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 	f.dirCache.FlushDir(dir)
 	return nil
+}
+
+func (f *Fs) findRetiredPlaceholders(ctx context.Context, parentID string, directory api.Item) ([]api.Item, error) {
+	children, err := f.listDir(ctx, directory.ID)
+	if err != nil {
+		return nil, err
+	}
+	markerSuffixes := make(map[string]struct{})
+	for _, child := range children {
+		if !strings.HasPrefix(child.Name, directoryMarkerPrefix) {
+			continue
+		}
+		suffix := strings.TrimPrefix(child.Name, directoryMarkerPrefix)
+		decoded, decodeErr := hex.DecodeString(suffix)
+		if decodeErr == nil && len(decoded) == 16 && child.ParentID == directory.ID && child.Size == 0 && (child.Category == 0 || child.Category == 6) {
+			markerSuffixes[suffix] = struct{}{}
+		}
+	}
+	if len(markerSuffixes) == 0 {
+		return nil, nil
+	}
+	siblings, err := f.listDir(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	var retired []api.Item
+	for _, sibling := range siblings {
+		if !strings.HasPrefix(sibling.Name, retiredDirectoryPrefix) {
+			continue
+		}
+		suffix := strings.TrimPrefix(sibling.Name, retiredDirectoryPrefix)
+		if _, ok := markerSuffixes[suffix]; !ok || retiredDirectoryName(sibling.ID) != sibling.Name || sibling.ParentID != parentID || sibling.Size != 0 || (sibling.Category != 0 && sibling.Category != 6) {
+			continue
+		}
+		placeholderChildren, err := f.listDir(ctx, sibling.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(placeholderChildren) != 0 {
+			return nil, errors.New("degoo: retired folder placeholder contains data; refusing to remove directory")
+		}
+		retired = append(retired, sibling)
+	}
+	return retired, nil
 }
 
 // Move moves src to remote using Degoo's move and rename mutations.
@@ -1023,10 +1308,170 @@ func (o *Object) Remove(ctx context.Context) error {
 	if o.remote == "" || o.id == o.fs.opt.RootFolderID {
 		return errors.New("degoo: refusing to remove the configured vault root")
 	}
-	if err := o.fs.api.Delete(ctx, o.id, false); err != nil {
+	_, leaf := dircache.SplitPath(o.remote)
+	if o.parentID == "" || o.parentID == "0" {
+		return errors.New("degoo: refusing to delete an object without a verified parent")
+	}
+	items, err := o.fs.listDir(ctx, o.parentID)
+	if err != nil {
+		return fmt.Errorf("degoo: inspect object before deletion: %w", err)
+	}
+	var active []api.Item
+	var backups []api.Item
+	for _, item := range items {
+		if item.Name == leaf {
+			if item.ParentID != o.parentID {
+				return errors.New("degoo: listed object has an unexpected parent")
+			}
+			active = append(active, item)
+			continue
+		}
+		if target, ok := backupTarget(item.Name); ok && target == leaf {
+			if item.ParentID != o.parentID {
+				return errors.New("degoo: listed backup has an unexpected parent")
+			}
+			backups = append(backups, item)
+		}
+	}
+	if len(active) > 1 {
+		return duplicateNameError(active)
+	}
+	var target *api.Item
+	deleteBackups := false
+	if len(active) == 1 && active[0].ID == o.id {
+		target = &active[0]
+		deleteBackups = true
+	} else {
+		var matchingBackup *api.Item
+		for i := range backups {
+			if backups[i].ID == o.id {
+				matchingBackup = &backups[i]
+				break
+			}
+		}
+		if matchingBackup == nil {
+			return fs.ErrorObjectNotFound
+		}
+		if len(backups) != 1 {
+			return duplicateNameError(backups)
+		}
+		// A stale handle may identify an older version while a replacement is active.
+		target = matchingBackup
+	}
+	if deleteBackups {
+		for _, backup := range backups {
+			if err := o.fs.api.Delete(ctx, backup.ID, false); err != nil {
+				return fmt.Errorf("degoo: remove hidden backup before deleting object: %w", err)
+			}
+		}
+		if len(backups) != 0 {
+			if err := o.fs.waitForNoBackups(ctx, o.parentID, leaf, 20*time.Second); err != nil {
+				return fmt.Errorf("degoo: hidden backup may still be recoverable; active object retained: %w", err)
+			}
+		}
+	}
+	if err := o.fs.api.Delete(ctx, target.ID, false); err != nil {
 		return fmt.Errorf("degoo: delete object: %w", err)
 	}
+	if err := o.fs.waitForIDsGone(ctx, o.parentID, []string{target.ID}, 20*time.Second); err != nil {
+		return fmt.Errorf("degoo: wait for object deletion: %w", err)
+	}
 	return nil
+}
+
+func itemIDs(items []api.Item) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+func (f *Fs) waitForNoBackups(ctx context.Context, parentID, leaf string, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		items, err := f.listDir(ctx, parentID)
+		if err != nil {
+			lastErr = err
+		} else {
+			found := false
+			for _, item := range items {
+				if target, ok := backupTarget(item.Name); ok && target == leaf {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			if lastErr != nil {
+				return lastErr
+			}
+			return errors.New("hidden backups remain visible")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (f *Fs) waitForIDsGone(ctx context.Context, parentID string, ids []string, timeout time.Duration) error {
+	return f.waitForIDsGoneInDirs(ctx, []string{parentID}, ids, timeout)
+}
+
+func (f *Fs) waitForIDsGoneInDirs(ctx context.Context, parentIDs, ids []string, timeout time.Duration) error {
+	wanted := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		wanted[id] = struct{}{}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		present := make(map[string]struct{})
+		var listingErr error
+		for _, parentID := range parentIDs {
+			items, err := f.listDir(ctx, parentID)
+			if err != nil {
+				if isNotFoundError(err) {
+					continue
+				}
+				listingErr = err
+				break
+			}
+			for _, item := range items {
+				if _, ok := wanted[item.ID]; ok {
+					present[item.ID] = struct{}{}
+				}
+			}
+		}
+		lastErr = listingErr
+		if len(present) == 0 && listingErr == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			if lastErr != nil {
+				return lastErr
+			}
+			return errors.New("deleted items remain visible")
+		case <-ticker.C:
+		}
+	}
 }
 
 // Update replaces the object only after its new encrypted bytes are uploaded and verified.
@@ -1242,7 +1687,8 @@ func (f *Fs) finishUpload(ctx context.Context, remote, leaf, parentID string, st
 	if staged.ParentID != parentID || staged.Name == "" || !strings.HasPrefix(staged.Name, temporaryPrefix) {
 		return nil, errors.New("degoo: registered upload metadata does not match the pending object")
 	}
-	if err := f.verifyUploaded(ctx, staged.ID, size, digest); err != nil {
+	verifiedItem, err := f.verifyUploaded(ctx, staged.ID, size, digest)
+	if err != nil {
 		return nil, fmt.Errorf("degoo: uploaded object verification failed; pending data retained: %w", err)
 	}
 
@@ -1269,50 +1715,95 @@ func (f *Fs) finishUpload(ctx context.Context, remote, leaf, parentID string, st
 		return nil, fmt.Errorf("degoo: publish verified upload: %w", err)
 	}
 
-	publishedObject, err := f.NewObject(ctx, remote)
+	published, err := f.waitForPublishedObject(ctx, remote, leaf, parentID, staged, verifiedItem.ParentID, size, 20*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("degoo: verified upload was published but cannot be resolved: %w", err)
-	}
-	published := publishedObject.(*Object)
-	if published.id != staged.ID || published.parentID != parentID || published.size != size {
-		return nil, errors.New("degoo: published object metadata does not match the verified upload; prior backup retained")
+		return nil, fmt.Errorf("degoo: verified upload was published but cannot be resolved; prior backup retained: %w", err)
 	}
 	if old != nil {
-		if err := f.api.Delete(ctx, old.id, true); err != nil {
+		if err := f.api.Delete(ctx, old.id, false); err != nil {
 			fs.Errorf(f, "could not remove hidden backup after replacement; new object is committed: %v", err)
 		}
 	}
 	return published, nil
 }
 
-func (f *Fs) verifyUploaded(ctx context.Context, id string, size int64, want [sha256.Size]byte) error {
+func (f *Fs) waitForPublishedObject(ctx context.Context, remote, leaf, parentID string, staged api.Item, preRenameParentID string, size int64, timeout time.Duration) (*Object, error) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		item, err := f.getItem(ctx, staged.ID)
+		if err != nil {
+			lastErr = err
+		} else if item.ID != staged.ID || item.Name != leaf || item.Size != size {
+			lastErr = fmt.Errorf("published metadata mismatch (id_match=%t name_match=%t parent_match=%t parent_empty=%t parent_is_zero=%t got_size=%d want_size=%d category=%d)",
+				item.ID == staged.ID, item.Name == leaf, item.ParentID == parentID, item.ParentID == "", item.ParentID == "0", item.Size, size, item.Category)
+		} else {
+			overlayDiagnostic := ""
+			if item.ParentID != parentID {
+				overlayDiagnostic = fmt.Sprintf("overlay parent metadata differs (pre_parent_expected=%t pre_parent_staged=%t pre_parent_vault=%t post_parent_expected=%t post_parent_staged=%t post_parent_vault=%t post_parent_same_as_pre=%t post_parent_empty=%t post_parent_is_zero=%t category=%d)",
+					preRenameParentID == parentID, preRenameParentID == staged.ParentID, preRenameParentID == f.opt.RootFolderID,
+					item.ParentID == parentID, item.ParentID == staged.ParentID, item.ParentID == f.opt.RootFolderID,
+					item.ParentID == preRenameParentID, item.ParentID == "", item.ParentID == "0", item.Category)
+			}
+			visible, listErr := f.NewObject(ctx, remote)
+			if listErr != nil {
+				lastErr = listErr
+				if overlayDiagnostic != "" {
+					lastErr = fmt.Errorf("%s; canonical listing: %w", overlayDiagnostic, listErr)
+				}
+			} else if published, ok := visible.(*Object); ok && published.id == staged.ID && published.parentID == parentID && published.size == size {
+				return published, nil
+			} else {
+				lastErr = errors.New("published listing does not match the verified upload")
+				if overlayDiagnostic != "" {
+					lastErr = fmt.Errorf("%s; canonical listing does not match the verified upload", overlayDiagnostic)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline.C:
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, errors.New("published object did not become visible")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (f *Fs) verifyUploaded(ctx context.Context, id string, size int64, want [sha256.Size]byte) (api.Item, error) {
 	item, err := f.getItem(ctx, id)
 	if err != nil {
-		return err
+		return api.Item{}, err
 	}
 	if item.Size != size || item.URL == "" {
-		return errors.New("degoo metadata size or download URL is invalid")
+		return api.Item{}, errors.New("degoo metadata size or download URL is invalid")
 	}
 	resp, err := f.api.Download(ctx, item.URL, "")
 	if err != nil {
-		return err
+		return api.Item{}, err
 	}
 	hasher := sha256.New()
 	readSize, readErr := io.Copy(hasher, resp.Body)
 	closeErr := resp.Body.Close()
 	if readErr != nil {
-		return readErr
+		return api.Item{}, readErr
 	}
 	if closeErr != nil {
-		return closeErr
+		return api.Item{}, closeErr
 	}
 	if readSize != size {
-		return fmt.Errorf("downloaded %d bytes, want %d", readSize, size)
+		return api.Item{}, fmt.Errorf("downloaded %d bytes, want %d", readSize, size)
 	}
 	if !strings.EqualFold(hex.EncodeToString(hasher.Sum(nil)), hex.EncodeToString(want[:])) {
-		return errors.New("downloaded bytes do not match the spooled upload")
+		return api.Item{}, errors.New("downloaded bytes do not match the spooled upload")
 	}
-	return nil
+	return item, nil
 }
 
 func (f *Fs) renameConfirmed(ctx context.Context, id, parentID, name string) error {
