@@ -444,7 +444,7 @@ def shell_wrapper(name: str, root: Path) -> bytes:
     elif name == "mount.sh":
         command = (
             f"exec \"$ROOT/bin/rclone\" --config \"$ROOT/config/rclone.conf\" "
-            f"--log-file \"$ROOT/logs/mount.log\" --log-level INFO degoo mount "
+            f"--log-file \"$ROOT/logs/mount.log\" --log-level NOTICE degoo mount "
             f"--settings \"$ROOT/config/mount.json\" \"$ROOT/config/vault.json\" \"$ROOT/mount\" \"$@\""
         )
     elif name == "status.sh":
@@ -464,19 +464,26 @@ def shell_wrapper(name: str, root: Path) -> bytes:
         )
     elif name == "stop.sh":
         command = (
-            "if command -v mountpoint >/dev/null 2>&1 && ! mountpoint -q \"$ROOT/mount\"; then\n"
-            "  exit 0\n"
+            "if command -v mountpoint >/dev/null 2>&1; then\n"
+            "  if mountpoint -q \"$ROOT/mount\"; then :; else\n"
+            "    mount_status=$?\n"
+            "    if [ \"$mount_status\" -eq 32 ]; then exit 0; fi\n"
+            "  fi\n"
             "fi\n"
             "if command -v fusermount3 >/dev/null 2>&1; then\n"
             "  if fusermount3 -u \"$ROOT/mount\"; then exit 0; fi\n"
             "elif command -v fusermount >/dev/null 2>&1; then\n"
             "  if fusermount -u \"$ROOT/mount\"; then exit 0; fi\n"
             "else\n"
-            "  if command -v mountpoint >/dev/null 2>&1 && ! mountpoint -q \"$ROOT/mount\"; then exit 0; fi\n"
             "  echo 'FUSE unmount helper was not found (install fuse3 or fuse).' >&2\n"
             "  exit 1\n"
             "fi\n"
-            "if command -v mountpoint >/dev/null 2>&1 && ! mountpoint -q \"$ROOT/mount\"; then exit 0; fi\n"
+            "if command -v mountpoint >/dev/null 2>&1; then\n"
+            "  if mountpoint -q \"$ROOT/mount\"; then :; else\n"
+            "    mount_status=$?\n"
+            "    if [ \"$mount_status\" -eq 32 ]; then exit 0; fi\n"
+            "  fi\n"
+            "fi\n"
             "exit 1"
         )
     else:
@@ -769,9 +776,23 @@ def _binary_source(path_arg: str) -> Path:
     return source
 
 
+def _user_service_active(root: Path) -> bool:
+    """Report whether this install's user service is active or starting."""
+    try:
+        import info
+    except ImportError:
+        return False
+    state = info.service_status(root, {})
+    return state.rsplit(";", 1)[-1].strip() in {"active", "activating", "deactivating", "reloading"}
+
+
 def _acquire_upgrade_lock(root: Path) -> int:
     if os.path.ismount(root) or os.path.ismount(root / "mount"):
-        raise InstallError("stop the contained mount before upgrading")
+        if _user_service_active(root):
+            stop_command = f"{shlex.quote(str(root / 'service.sh'))} stop"
+        else:
+            stop_command = shlex.quote(str(root / "stop.sh"))
+        raise InstallError(f"stop the contained mount before upgrading; run {stop_command}")
     cache = root / "cache"
     check_directory(cache, private=True)
     digest = hashlib.sha256(f"{REMOTE_NAME}:".encode("utf-8")).hexdigest()[:24]

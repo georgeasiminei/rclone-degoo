@@ -37,7 +37,16 @@ Cleanup leaves remote data untouched.
 
 The completion summary must appear after either the service or manual-start
 choice. It reports the configured mount path and actual kernel mount state,
-then gives commands for status, logs, login, and service control. Password
+then gives commands for status, logs, login, and service control. Command
+labels are shell comments so examples remain copyable. Upgrade prompts must
+stop the owned running service or manual mount before collecting settings;
+pending cached writes remain intact. Service startup gets a bounded wait for
+the kernel mount to appear and checks that it is connected locally. A
+disconnected stale FUSE mount may be detached only when the cache lock proves
+no writer is active and the user accepts recovery. Stop helpers distinguish
+mountpoint inspection errors from a confirmed absent mount. Default mount
+logs use NOTICE to keep routine
+cache cleanup from overwhelming actionable messages. Password
 entry uses the original terminal output preserved by the logging layer.
 `logs.sh` provides recent command logs and a follow mode; `info.sh` highlights
 rejected authentication renewal with a login command. Saved token expiry is

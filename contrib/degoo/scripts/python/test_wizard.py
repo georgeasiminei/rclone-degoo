@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import contextlib
+import errno
 import io
 import os
 import shlex
@@ -169,7 +170,7 @@ class WizardTest(unittest.TestCase):
             self.assertIn(helper, output)
         self.assertIn("/logs", output)
 
-    def test_service_enable_request_does_not_claim_mount_without_proc_evidence(self) -> None:
+    def test_service_enable_times_out_without_claiming_mount_or_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install root"
             answers = iter([""] * 9)
@@ -185,17 +186,21 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_save_settings"),
                 mock.patch.object(wizard.service, "run", return_value=0) as service_call,
                 mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard, "_wait_for_mount", return_value="not mounted") as wait_mount,
                 mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
                 contextlib.redirect_stdout(output),
             ):
                 result = wizard._run(args, input_fn=lambda _: next(answers))
 
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 2)
         service_call.assert_called_once_with(root, "enable")
+        wait_mount.assert_called_once_with(root, timeout=wizard.MOUNT_STATE_TIMEOUT)
         mountpoint = shlex.quote(str(root / "mount"))
         self.assertIn(f"Mount point: {mountpoint} — not mounted", output.getvalue())
         self.assertNotIn(f"Mount point: {mountpoint} — mounted", output.getvalue())
-        self.assertIn(f"Local status: {shlex.quote(str(root / 'info.sh'))}", output.getvalue())
+        self.assertIn("mount was not confirmed after up to 15 seconds", output.getvalue())
+        self.assertIn("Recent mount, login, setup, and status logs", output.getvalue())
+        self.assertIn(f"# Local status\n  {shlex.quote(str(root / 'info.sh'))}", output.getvalue())
         self.assertIn(f"{shlex.quote(str(root / 'logs.sh'))} --follow", output.getvalue())
 
     def test_failed_service_start_keeps_nonzero_result_and_explains_recovery(self) -> None:
@@ -225,6 +230,279 @@ class WizardTest(unittest.TestCase):
         self.assertIn("Mount point:", output.getvalue())
         self.assertIn("service.sh status", output.getvalue())
         self.assertIn("logs.sh", output.getvalue())
+
+    def test_upgrade_stops_owned_service_even_before_mount_attaches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            args = type("Args", (), {"binary": None, "folder_id": None, "folder_name": None, "vault_config": None, "upgrade": True})()
+            events: list[str] = []
+            with (
+                mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                mock.patch.object(wizard.installer, "load_manifest", return_value={"root_folder_id": "vault-id", "service_links": ["owned-link"]}),
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="enabled; activating"),
+                mock.patch.object(wizard, "_wait_for_mount_state", return_value="not mounted"),
+                mock.patch.object(wizard, "_check_runtime", side_effect=lambda **_: events.append("runtime") or (False, False)),
+                mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                mock.patch.object(wizard, "_current_vault_settings", return_value={"password": "private"}),
+                mock.patch.object(wizard, "_cache_settings", return_value=wizard.installer.DEFAULT_MOUNT_SETTINGS),
+                mock.patch.object(wizard.installer, "install", side_effect=lambda _: events.append("install") or 0),
+                mock.patch.object(wizard.login, "run", return_value=0),
+                mock.patch.object(wizard, "_save_settings"),
+                mock.patch.object(wizard.service, "run", side_effect=lambda _root, action: events.append(f"service:{action}") or 0),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = wizard._run(args, input_fn=lambda _: "")
+
+        self.assertEqual(result, 0)
+        self.assertLess(events.index("service:stop"), events.index("runtime"))
+        self.assertLess(events.index("runtime"), events.index("install"))
+
+    def test_upgrade_without_owned_service_uses_contained_stop_wrapper(self) -> None:
+        root = Path("/tmp/degoo-test-install")
+        with (
+            mock.patch.object(wizard, "_mounted_state", return_value="mounted"),
+            mock.patch.object(wizard.local_info, "service_status", return_value="not configured for this install"),
+            mock.patch.object(wizard, "_stop_owned_mount") as stop_mount,
+            mock.patch.object(wizard, "_wait_for_mount_state", return_value="not mounted") as wait_mount,
+        ):
+            wizard._prepare_upgrade_mount(root, {"service_links": []}, input_fn=lambda _: "")
+
+        stop_mount.assert_called_once_with(root)
+        wait_mount.assert_called_once_with(root / "mount", "not mounted", timeout=15.0)
+
+    def test_stop_owned_mount_uses_generated_wrapper_not_installed_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stop = root / "stop.sh"
+            installed_contents = b"#!/bin/sh\necho compromised-helper\nexit 99\n"
+            stop.write_bytes(installed_contents)
+            stop.chmod(0o700)
+            with mock.patch.object(wizard.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
+                wizard._stop_owned_mount(root)
+
+        generated_contents = wizard.installer.shell_wrapper("stop.sh", root)
+        run.assert_called_once_with(
+            ["/bin/sh"],
+            input=generated_contents,
+            stdout=wizard.subprocess.DEVNULL,
+            stderr=wizard.subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(run.call_args.kwargs["input"], installed_contents)
+
+    def test_inactive_owned_service_skips_wait_before_manual_unmount(self) -> None:
+        root = Path("/tmp/degoo-test-install")
+        with (
+            mock.patch.object(wizard, "_mounted_state", side_effect=("mounted", "mounted")),
+            mock.patch.object(wizard.local_info, "service_status", return_value="enabled; inactive"),
+            mock.patch.object(wizard.service, "run", return_value=0) as stop_service,
+            mock.patch.object(wizard, "_stop_owned_mount") as stop_mount,
+            mock.patch.object(wizard, "_wait_for_mount_state", return_value="not mounted") as wait_mount,
+        ):
+            wizard._prepare_upgrade_mount(root, {"service_links": ["owned-link"]}, input_fn=lambda _: "")
+
+        stop_service.assert_called_once_with(root, "stop")
+        stop_mount.assert_called_once_with(root)
+        wait_mount.assert_called_once_with(root / "mount", "not mounted", timeout=15.0)
+
+    def test_upgrade_refuses_unknown_mount_after_stopping_service(self) -> None:
+        root = Path("/tmp/degoo-test-install")
+        with (
+            mock.patch.object(wizard, "_mounted_state", return_value="mounted"),
+            mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
+            mock.patch.object(wizard.service, "run", return_value=0) as stop_service,
+            mock.patch.object(wizard, "_wait_for_mount_state", return_value="unknown (mount table unavailable)"),
+            mock.patch.object(wizard, "_stop_owned_mount") as stop_mount,
+            self.assertRaises(wizard.WizardError),
+        ):
+            wizard._prepare_upgrade_mount(root, {"service_links": ["owned-link"]}, input_fn=lambda _: "")
+
+        stop_service.assert_called_once_with(root, "stop")
+        stop_mount.assert_not_called()
+
+    def test_upgrade_decline_or_owned_service_stop_error_refuses_before_install(self) -> None:
+        root = Path("/tmp/degoo-test-install")
+        with (
+            mock.patch.object(wizard, "_mounted_state", return_value="mounted"),
+            mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
+            mock.patch.object(wizard.service, "run") as stop_service,
+            self.assertRaises(wizard.WizardCancelled),
+        ):
+            wizard._prepare_upgrade_mount(root, {"service_links": ["owned-link"]}, input_fn=lambda _: "n")
+        stop_service.assert_not_called()
+
+        with (
+            mock.patch.object(wizard, "_mounted_state", return_value="mounted"),
+            mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
+            mock.patch.object(wizard.service, "run", side_effect=wizard.service.ServiceError("stop refused")) as stop_service,
+            mock.patch.object(wizard, "_stop_owned_mount") as stop_mount,
+            self.assertRaises(wizard.WizardError),
+        ):
+            wizard._prepare_upgrade_mount(root, {"service_links": ["owned-link"]}, input_fn=lambda _: "")
+        stop_service.assert_called_once_with(root, "stop")
+        stop_mount.assert_not_called()
+
+    def test_upgrade_refuses_connected_busy_mount_with_safe_recovery_hints(self) -> None:
+        root = Path("/tmp/degoo-test-install")
+        with (
+            mock.patch.object(wizard, "_mounted_state", return_value="mounted"),
+            mock.patch.object(wizard.local_info, "service_status", return_value="not configured for this install"),
+            mock.patch.object(wizard, "_stop_owned_mount"),
+            mock.patch.object(wizard, "_wait_for_mount_state", return_value="mounted"),
+            mock.patch.object(wizard.os, "stat", return_value=mock.sentinel.mount_info),
+            mock.patch.object(wizard.subprocess, "run") as run,
+            self.assertRaisesRegex(wizard.WizardError, "close applications using it") as failure,
+        ):
+            wizard._prepare_upgrade_mount(root, {"service_links": []}, input_fn=lambda _: "")
+
+        self.assertIn(str(root / "logs.sh"), str(failure.exception))
+        self.assertIn(str(root / "stop.sh"), str(failure.exception))
+        run.assert_not_called()
+
+    def test_startup_wait_returns_mount_evidence_with_fake_clock(self) -> None:
+        root = Path("/tmp/degoo-test-install")
+        now = [0.0]
+        states = iter(("not mounted", "not mounted", "mounted"))
+        sleep = mock.Mock(side_effect=lambda delay: now.__setitem__(0, now[0] + delay))
+        with (
+            mock.patch.object(wizard, "_mounted_state", side_effect=lambda _: next(states)),
+            mock.patch.object(wizard.os, "stat", return_value=mock.sentinel.mount_info),
+        ):
+            state = wizard._wait_for_mount(root, timeout=15.0, monotonic=lambda: now[0], sleep=sleep)
+
+        self.assertEqual(state, "mounted")
+        self.assertGreaterEqual(sleep.call_count, 1)
+
+    def test_startup_wait_does_not_accept_disconnected_kernel_mount(self) -> None:
+        root = Path("/tmp/degoo-test-install")
+        now = [0.0]
+        sleep = mock.Mock(side_effect=lambda delay: now.__setitem__(0, now[0] + delay))
+        with (
+            mock.patch.object(wizard, "_mounted_state", return_value="mounted"),
+            mock.patch.object(wizard.os, "stat", side_effect=OSError(errno.ENOTCONN, "transport endpoint is not connected")),
+        ):
+            state = wizard._wait_for_mount(
+                root,
+                timeout=1.0,
+                interval=0.5,
+                monotonic=lambda: now[0],
+                sleep=sleep,
+            )
+
+        self.assertEqual(state, "disconnected (ENOTCONN)")
+
+    def test_disconnected_mount_lazy_recovery_requires_idle_cache_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            (root / "cache").mkdir(mode=0o700)
+            with (
+                mock.patch.object(wizard.cleanup, "_acquire_cache_lock", return_value=73) as acquire_lock,
+                mock.patch.object(wizard.os, "close") as close_lock,
+                mock.patch.object(
+                    wizard,
+                    "_observed_mount_state",
+                    side_effect=("disconnected (ENOTCONN)", "disconnected (ENOTCONN)"),
+                ),
+                mock.patch.object(wizard, "_trusted_fusermount", return_value=Path("/usr/bin/fusermount")),
+                mock.patch.object(wizard.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+                mock.patch.object(wizard, "_wait_for_mount_state", return_value="not mounted") as wait_mount,
+            ):
+                wizard._recover_disconnected_mount(root, input_fn=lambda _: "", service_configured=True)
+
+        acquire_lock.assert_called_once_with(root, wait_seconds=0)
+        close_lock.assert_called_once_with(73)
+        run.assert_called_once_with(
+            ["/usr/bin/fusermount", "-u", "-z", str(root / "mount")],
+            stdin=wizard.subprocess.DEVNULL,
+            stdout=wizard.subprocess.DEVNULL,
+            stderr=wizard.subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        wait_mount.assert_called_once_with(root / "mount", "not mounted", timeout=15.0)
+
+    def test_disconnected_mount_recovery_never_lazily_unmounts_without_safe_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            (root / "cache").mkdir(mode=0o700)
+
+            with (
+                mock.patch.object(wizard.cleanup, "_acquire_cache_lock", side_effect=wizard.cleanup.CleanupError("active")),
+                mock.patch.object(wizard, "_observed_mount_state") as observed,
+                mock.patch.object(wizard.subprocess, "run") as run,
+                self.assertRaises(wizard.WizardError),
+            ):
+                wizard._recover_disconnected_mount(root, input_fn=lambda _: "", service_configured=False)
+            observed.assert_not_called()
+            run.assert_not_called()
+
+            with (
+                mock.patch.object(wizard.cleanup, "_acquire_cache_lock", return_value=73),
+                mock.patch.object(wizard.os, "close"),
+                mock.patch.object(wizard, "_observed_mount_state", side_effect=("disconnected (ENOTCONN)", "mounted")),
+                mock.patch.object(wizard, "_trusted_fusermount", return_value=Path("/usr/bin/fusermount")),
+                mock.patch.object(wizard.subprocess, "run") as run,
+                self.assertRaisesRegex(wizard.WizardError, "close applications using it"),
+            ):
+                wizard._recover_disconnected_mount(root, input_fn=lambda _: "", service_configured=False)
+            run.assert_not_called()
+
+            with (
+                mock.patch.object(wizard.cleanup, "_acquire_cache_lock", return_value=73),
+                mock.patch.object(wizard.os, "close"),
+                mock.patch.object(wizard, "_observed_mount_state", return_value="disconnected (ENOTCONN)"),
+                mock.patch.object(wizard, "_trusted_fusermount", return_value=Path("/usr/bin/fusermount")) as trusted,
+                mock.patch.object(wizard.subprocess, "run") as run,
+                self.assertRaises(wizard.WizardCancelled),
+            ):
+                wizard._recover_disconnected_mount(root, input_fn=lambda _: "n", service_configured=False)
+            trusted.assert_not_called()
+            run.assert_not_called()
+
+    def test_startup_timeout_is_non_success_and_summary_commands_are_copyable(self) -> None:
+        root = Path("/tmp/degoo test install")
+        now = [0.0]
+        sleep = mock.Mock(side_effect=lambda delay: now.__setitem__(0, now[0] + delay))
+        with mock.patch.object(wizard, "_mounted_state", return_value="not mounted"):
+            state = wizard._wait_for_mount(root, timeout=1.0, interval=0.5, monotonic=lambda: now[0], sleep=sleep)
+        self.assertEqual(state, "not mounted")
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+            mock.patch.object(wizard.local_info, "service_status", return_value="not configured for this install"),
+            contextlib.redirect_stdout(output),
+        ):
+            wizard._completion_summary(root, mount_ready=True, systemd_available=False)
+        summary = output.getvalue()
+        self.assertIn("# Local status", summary)
+        self.assertIn(f"  {shlex.quote(str(root / 'info.sh'))}\n", summary)
+        self.assertIn("# Stop the user service before an upgrade, if configured", summary)
+        self.assertIn(f"  {shlex.quote(str(root / 'service.sh'))} stop\n", summary)
+        self.assertIn("# Unmount this install's foreground/manual mount", summary)
+        self.assertIn(f"  {shlex.quote(str(root / 'stop.sh'))}\n", summary)
+        self.assertIn(f"  {shlex.quote(str(root / 'logs.sh'))}\n", summary)
+        self.assertIn("# Log directory:", summary)
+        self.assertIn("Recent mount, login, setup, and status logs", summary)
+
+    def test_completion_summary_reports_disconnected_mount_truthfully(self) -> None:
+        root = Path("/tmp/degoo-test-install")
+        output = io.StringIO()
+        with (
+            mock.patch.object(wizard, "_mounted_state", return_value="mounted"),
+            mock.patch.object(wizard.os, "stat", side_effect=OSError(errno.ENOTCONN, "transport endpoint is not connected")),
+            mock.patch.object(wizard.local_info, "service_status", return_value="enabled; inactive"),
+            contextlib.redirect_stdout(output),
+        ):
+            state = wizard._completion_summary(root, mount_ready=True, systemd_available=True)
+
+        self.assertEqual(state, "disconnected (ENOTCONN)")
+        self.assertIn("Mount point: /tmp/degoo-test-install/mount — disconnected (ENOTCONN)", output.getvalue())
 
     def test_default_wizard_flow_installs_real_staged_vault_under_first_device(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -82,6 +82,15 @@ installer.
 ~/.local/share/rclone-degoo/logs.sh --follow
 ```
 
+Press Ctrl+C to stop following logs. `logs.sh` is the viewer; `logs/` is a
+directory. New mounts log notices and errors by default. The upgrade wizard
+offers to stop the contained mount and waits briefly for it to start again.
+To stop the user service manually:
+
+```sh
+~/.local/share/rclone-degoo/service.sh stop
+```
+
 `logs.sh` shows recent mount, login, setup, and status logs, and `--follow`
 watches new lines.
 If authentication cannot be renewed, `info.sh` shows a login-required warning.

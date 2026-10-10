@@ -174,8 +174,10 @@ disabled.
 
 The wizard finishes with a summary of the install directory, mount location,
 current mount state, helper commands, and log paths. A service start request
-does not establish that the mount is ready: the summary checks the kernel's
-mount table. The default mount path is
+does not establish that the mount is ready: the wizard waits briefly for the
+kernel's mount table to show the mount. If startup is still incomplete, it
+reports that state and gives commands to inspect status and logs. The default
+mount path is
 `~/.local/share/rclone-degoo/mount`. Open that directory in a file manager or
 use it like any other directory while mounted. Installed helper scripts are
 in `~/.local/share/rclone-degoo/`, rather than the extracted package folder.
@@ -221,12 +223,24 @@ installed. The service restarts after process failures, but an authentication
 failure during ordinary operations can leave an active mount unable to read
 Degoo until login succeeds. Keep only one mount process using this cache.
 
-Before replacing the binary, stop the service or manual mount and upgrade from
-the repository:
+The upgrade wizard offers to stop the contained service or mount before
+collecting settings. Stopping preserves cached pending writes. If you cancel
+after stopping, run `~/.local/share/rclone-degoo/service.sh start` to restore
+the service, or `mount.sh` for a manual session. If a stopped service leaves a
+disconnected FUSE mount, the wizard can offer to detach that stale mount after
+confirming the cache has no active writer. It keeps all cached data. A busy
+connected mount must be closed and unmounted normally. For a noninteractive
+upgrade,
+stop the service first and upgrade from the repository:
 
 ```sh
+~/.local/share/rclone-degoo/service.sh stop
 ./contrib/degoo/install.sh --binary /path/to/rclone --upgrade --no-wizard
+~/.local/share/rclone-degoo/service.sh start
 ```
+
+For a manual foreground mount, use
+`~/.local/share/rclone-degoo/stop.sh` to unmount. Helper names include `.sh`.
 
 Upgrade preserves the vault secret, account tokens, email, remote settings,
 mount settings, and cache; it refuses a change to the folder ID.
@@ -254,7 +268,16 @@ Show recent mount, login, setup, and status log messages, or watch new messages:
 ~/.local/share/rclone-degoo/logs.sh --follow
 ```
 
-Logs live in `~/.local/share/rclone-degoo/logs/`. The helper hides recognized
+Press Ctrl+C to leave follow mode. `logs.sh` is the executable viewer;
+`~/.local/share/rclone-degoo/logs/` is a directory of files. New mounts log
+notices and errors by default, suppressing routine cache-cleanup messages.
+Existing log contents remain available. For a more detailed foreground session:
+
+```sh
+~/.local/share/rclone-degoo/mount.sh --log-level INFO
+```
+
+Stop the service first before starting a foreground mount. The helper hides recognized
 credential fields and signed URLs from displayed lines. For service startup
 and process exit messages, also inspect the user journal:
 
