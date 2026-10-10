@@ -184,6 +184,31 @@ cache use, identity changes, and dirty-cache recovery after graceful restart
 and abrupt subprocess exit. Chunker regressions cover failed manifest
 publication and rejection of manifests whose transaction chunks are missing.
 
+## Account trash
+
+The account-trash commands and source wrapper are not live-validated. No live
+Degoo API request or destructive mutation was run for this work. Required
+release checks are:
+
+- Offline command tests must cover pagination, the all-items default for
+  `--limit 0`, positive limits, JSON output, and empty trash listings.
+- `empty-trash --dry-run` must list all items and make no mutation request.
+  The mutating path must send every listed ID in a bulk `SetDeleteFile5`
+  request with `IsInRecycleBin=true`, and must prompt exactly twice without
+  `--yes`; `--yes` must bypass both prompts.
+- The generic rclone cleanup feature and remote-path syntax must remain
+  unavailable. No restore operation is provided.
+- The wrapper must reject unsupported flag combinations, map `list`/`empty`
+  to `trash`/`empty-trash`, choose or accept a safe rclone executable, and
+  never read or print auth-file contents.
+- Any live `empty-trash` acceptance must use a disposable test account
+  containing only generated trash. Because trash is account-wide, it must not
+  be run against an account with personal or unrelated trash items.
+
+Local wrapper checks for this branch are recorded in the local validation
+section below; they do not substitute for mocked command tests or the isolated
+live acceptance gate.
+
 ## Reproduce the opt-in checks
 
 ```sh
