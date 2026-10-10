@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import secrets
+import shlex
 import stat
 import subprocess
 import sys
@@ -15,6 +16,11 @@ from pathlib import Path
 
 class LoginError(Exception):
     """A safe error message for the contained account login helper."""
+
+
+def _degoo_rc(root: Path, *arguments: str) -> str:
+    """Return a copyable command through the contained user-facing CLI."""
+    return " ".join(shlex.quote(value) for value in (str(root / "degoo-rc"), *arguments))
 
 
 def _check_components(path: Path) -> None:
@@ -198,7 +204,10 @@ def run(root: Path, *, clear_email: bool) -> int:
     except OSError:
         raise LoginError("the contained Degoo login command could not be started") from None
     if result.returncode != 0:
-        print(f"Degoo login did not complete. Review {root / 'logs/login.log'} and try login.sh again.", file=sys.stderr)
+        print(
+            f"Degoo login did not complete. Review {root / 'logs/login.log'} and try {_degoo_rc(root, 'login')} again.",
+            file=sys.stderr,
+        )
     return result.returncode
 
 

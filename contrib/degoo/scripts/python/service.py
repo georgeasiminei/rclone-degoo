@@ -23,6 +23,11 @@ class ServiceError(Exception):
     """A safe, user-facing service management refusal."""
 
 
+def _degoo_rc(root: Path, *arguments: str) -> str:
+    """Return a copyable command through the contained user-facing CLI."""
+    return " ".join(shlex.quote(value) for value in (str(root / "degoo-rc"), *arguments))
+
+
 def _root(value: str) -> Path:
     try:
         root = Path(os.path.expanduser(value))
@@ -33,7 +38,10 @@ def _root(value: str) -> Path:
         installer.check_directory(root / "config", private=True)
         manifest = installer.load_manifest(root)
         if not manifest.get("root_folder_id"):
-            raise ServiceError("configure a dedicated vault folder with setup.sh before enabling its service")
+            raise ServiceError(
+                "configure a dedicated vault folder with "
+                f"{_degoo_rc(root, 'setup', 'help')} before enabling its service"
+            )
         if installer.read_private_file(root / "config/vault.json", missing_ok=True) is None:
             raise ServiceError("the vault configuration is missing")
         if installer.read_private_file(root / "config/rclone.conf", missing_ok=True) is None:
@@ -195,7 +203,7 @@ def _systemctl(root: Path, *arguments: str, capture: bool = True) -> subprocess.
 def _require_loaded_unit(root: Path, manifest: dict[str, Any]) -> None:
     result = _systemctl(root, "show", "--property=FragmentPath", "--value", UNIT_NAME)
     if result.returncode != 0:
-        raise ServiceError("the Degoo user service is not loaded; run service.sh enable first")
+        raise ServiceError(f"the Degoo user service is not loaded; run {_degoo_rc(root, 'service', 'enable')} first")
     try:
         fragment = Path(result.stdout.decode("utf-8").strip())
     except UnicodeDecodeError:
@@ -244,7 +252,8 @@ def enable(root: Path) -> int:
     _store_links(root, manifest, present=True)
     if result.returncode != 0:
         raise ServiceError(
-            "the service is linked, but could not start; run login.sh, then service.sh status and inspect the user journal"
+            "the service is linked, but could not start; run "
+            f"{_degoo_rc(root, 'login')}, then {_degoo_rc(root, 'service', 'status')} and inspect the user journal"
         )
     print("The Degoo user service is enabled and has been asked to start.")
     return 0
@@ -263,7 +272,7 @@ def disable(root: Path) -> int:
     if reload_result.returncode != 0:
         raise ServiceError("systemd could not reload after disabling the Degoo user service")
     _store_links(root, manifest, present=False)
-    print("The Degoo user service is stopped and disabled. Run service.sh enable to link it again.")
+    print(f"The Degoo user service is stopped and disabled. Run {_degoo_rc(root, 'service', 'enable')} to link it again.")
     return 0
 
 
@@ -271,7 +280,7 @@ def status(root: Path) -> int:
     manifest = _load_manifest(root)
     direct, _ = _owned_paths(root, manifest)
     if str(direct) not in manifest.get("service_links", []) or not _validate_owned_link(direct, _unit_path(root)):
-        raise ServiceError("the Degoo user service has not been linked; run service.sh enable")
+        raise ServiceError(f"the Degoo user service has not been linked; run {_degoo_rc(root, 'service', 'enable')}")
     _require_loaded_unit(root, manifest)
     result = _systemctl(root, "status", UNIT_NAME, capture=False)
     return result.returncode
@@ -281,7 +290,7 @@ def service_action(root: Path, action: str) -> int:
     manifest = _load_manifest(root)
     direct, _ = _owned_paths(root, manifest)
     if str(direct) not in manifest.get("service_links", []) or not _validate_owned_link(direct, _unit_path(root)):
-        raise ServiceError("the Degoo user service is not linked; run service.sh enable first")
+        raise ServiceError(f"the Degoo user service is not linked; run {_degoo_rc(root, 'service', 'enable')} first")
     _require_loaded_unit(root, manifest)
     result = _systemctl(root, action, UNIT_NAME)
     if result.returncode != 0:
@@ -305,7 +314,7 @@ def run(root: Path, action: str) -> int:
         return status(root)
     if action in {"start", "stop", "restart"}:
         return service_action(root, action)
-    raise ServiceError("choose enable, disable, or status")
+    raise ServiceError(f"choose a service action; run {_degoo_rc(root, 'service', 'help')} for usage")
 
 
 def build_parser() -> argparse.ArgumentParser:

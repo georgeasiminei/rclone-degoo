@@ -22,7 +22,7 @@ git clone --branch staging https://github.com/georgeasiminei/rclone-degoo.git
 cd rclone-degoo
 mkdir -p build
 go build -o build/rclone .
-./contrib/degoo/install.sh --wizard --binary ./build/rclone
+./contrib/degoo/degoo-rc install
 ```
 
 If you have the matching prebuilt Linux amd64 archive, place
@@ -34,17 +34,17 @@ directory, then run the packaged launcher:
 extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
 tar -xzf "$HOME/Downloads/rclone-degoo-linux-amd64.tar.gz" -C "$extract_dir"
 cd "$extract_dir/rclone-degoo"
-./install.sh
+./degoo-rc install
 ```
 
 The archive can be shared with other Linux amd64 users; it includes the
 prebuilt client and installer files but no account credentials or vault secret.
-The prebuilt path does not require Go. With no arguments in a terminal, either
-launcher opens the wizard. For a staged install, use the noninteractive
+The prebuilt path does not require Go. Running `degoo-rc install` opens the
+wizard. For a staged install, use the noninteractive
 `--binary` option and add `--no-wizard`:
 
 ```sh
-./contrib/degoo/install.sh --binary ./build/rclone --no-wizard
+./contrib/degoo/degoo-rc install --binary ./build/rclone --no-wizard
 ```
 
 The private install defaults to `~/.local/share/rclone-degoo`. The wizard
@@ -59,42 +59,54 @@ The first mount can be enabled as a systemd user service when a user manager is
 available:
 
 ```sh
-~/.local/share/rclone-degoo/service.sh enable
-~/.local/share/rclone-degoo/info.sh
+degoo-rc service enable
+degoo-rc info
 ```
 
-For manual foreground mounting, run `mount.sh`. The service starts at login.
+For manual foreground mounting, run `degoo-rc mount`. The service starts at login.
 Enable account lingering separately if you need it to start before login and
 remain active after logout; the installer does not change lingering.
+
+The installer places the command at `~/.local/share/rclone-degoo/degoo-rc` and
+links it from `~/.local/bin/degoo-rc`. It does not edit shell profiles. If
+`~/.local/bin` is not on `PATH`, it prints an export command. Run
+`degoo-rc help` to list commands or `degoo-rc COMMAND help` for detailed
+options. Commands include `install`, `uninstall`, `login`, `setup`, `mount`,
+`stop`, `status`, `location`, `folders`, `service`, `info`, `logs`, `trash`,
+and `empty-trash`. `service` accepts `enable`, `disable`, `start`, `stop`,
+`restart`, and `status`. Existing command options remain available. Uninstall
+removes the PATH link only when it still points to this installation.
+A fresh installed root has `degoo-rc` as its only root-level command. Upgrades
+retain existing root-level `.sh` shims, and source or archive roots may include
+the legacy install, uninstall, and trash shims.
 
 ## Mount and use
 
 The wizard ends with the install directory, mount path, actual mount state,
 and commands for status, logs, login, and service control. The default mount
 is `~/.local/share/rclone-degoo/mount`; open that folder in your file manager
-or use it as an ordinary directory while mounted. All helper scripts are
-under `~/.local/share/rclone-degoo/`, regardless of where you extracted the
-installer.
+or use it as an ordinary directory while mounted. The installed command is
+available on `PATH` regardless of where you extracted the installer.
 
 ```sh
-~/.local/share/rclone-degoo/info.sh
-~/.local/share/rclone-degoo/logs.sh
-~/.local/share/rclone-degoo/logs.sh --follow
+degoo-rc info
+degoo-rc logs
+degoo-rc logs --follow
 ```
 
-Press Ctrl+C to stop following logs. `logs.sh` is the viewer; `logs/` is a
+Press Ctrl+C to stop following logs. `degoo-rc logs` is the viewer; `logs/` is a
 directory. New mounts log notices and errors by default. The upgrade wizard
 offers to stop the contained mount and waits briefly for it to start again.
 To stop the user service manually:
 
 ```sh
-~/.local/share/rclone-degoo/service.sh stop
+degoo-rc service stop
 ```
 
-`logs.sh` shows recent mount, login, setup, and status logs, and `--follow`
+`degoo-rc logs` shows recent mount, login, setup, and status logs, and `--follow`
 watches new lines.
-If authentication cannot be renewed, `info.sh` shows a login-required warning.
-Run `~/.local/share/rclone-degoo/login.sh` again; the mount can reload the
+If authentication cannot be renewed, `degoo-rc info` shows a login-required warning.
+Run `degoo-rc login` again; the mount can reload the
 saved credentials. Keep pending files and their matching vault configuration
 until remote uploads complete.
 
@@ -108,16 +120,16 @@ commands below take the account-auth file directly and never appear as a normal
 remote path:
 
 ```sh
-./rclone degoo trash ~/.config/rclone-degoo/auth.json
-./rclone degoo empty-trash ~/.config/rclone-degoo/auth.json --dry-run
-./rclone degoo empty-trash ~/.config/rclone-degoo/auth.json --yes
+degoo-rc trash --auth ~/.config/rclone-degoo/auth.json
+degoo-rc empty-trash --auth ~/.config/rclone-degoo/auth.json --dry-run
+degoo-rc empty-trash --auth ~/.config/rclone-degoo/auth.json --yes
 ```
 
-`trash` lists all recycled items, `--dry-run` previews what emptying would
-delete, and `empty-trash` permanently removes them after two confirmations
-unless `--yes` is supplied. There is no restore operation.
+`trash` lists all recycled items. `empty-trash` previews account-wide deletion
+with `--dry-run` or permanently removes items after two confirmations unless
+`--yes` is supplied. There is no restore operation.
 
-See [usage](docs/degoo/USAGE.md) and the packaged `trash.sh` helper for details.
+See [usage](docs/degoo/USAGE.md) for details.
 
 ## Cache and verification
 
@@ -129,7 +141,7 @@ meet cache targets.
 
 Upload verification is enabled by default. It downloads each encrypted upload
 and compares the size and SHA-256 before publication. Set `verify_upload` to
-`false`, or pass `--verify-upload=false` to `mount.sh`, to skip the payload
+`false`, or pass `--verify-upload=false` to `degoo-rc mount`, to skip the payload
 readback. Metadata and publication checks remain enabled. Disabling verification
 saves time and bandwidth but leaves corrupted upload contents undetected until
 read.
@@ -137,7 +149,7 @@ read.
 A newly written file is staged in full locally before upload. A 10 TB
 collection can fit in the cloud when each file and the pending local writes fit
 the cache; one 10 TB write cannot fit in a 20 GiB cache. Keep the cache until
-`status.sh` reports zero pending uploads, or retain both cache and matching
+`degoo-rc status` reports zero pending uploads, or retain both cache and matching
 configuration when making a private recovery copy during uninstall.
 
 ## Uninstall
@@ -145,10 +157,10 @@ configuration when making a private recovery copy during uninstall.
 Inspect local install state without changing it:
 
 ```sh
-~/.local/share/rclone-degoo/uninstall.sh --inventory
+degoo-rc uninstall --inventory
 ```
 
-In a terminal, running `uninstall.sh` with no arguments or with `--wizard`
+In a terminal, running `degoo-rc uninstall` with no arguments or with `--wizard`
 starts guided cleanup. The wizard offers to retain configuration, cache, and
 logs in a private external backup directory; each choice defaults to No. It
 refuses to discard a cache containing pending uploads unless it preserves the
@@ -158,8 +170,9 @@ untouched.
 
 ## Share the software; preserve the vault secret
 
-The prebuilt archive contains the Linux binary, shell launchers, Python helper
-sources, license, and documentation. Go is not needed to install or use it.
+The prebuilt archive contains the Linux binary, `degoo-rc` entrypoint, internal
+shell and Python helpers, license, and documentation. Go is not needed to
+install or use it.
 There is no separate published Degoo release artifact at present. Each user
 should create or import their own dedicated vault and log in with their own
 Degoo account.

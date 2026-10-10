@@ -128,6 +128,83 @@ class UninstallTest(unittest.TestCase):
         self.assertEqual(code, 0, stderr.getvalue())
         self.assertEqual(json.loads(stdout.getvalue())["root"], str(self.root))
 
+    def test_inventory_reports_recorded_path_link_ownership(self) -> None:
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        bin_dir.chmod(0o700)
+        link = bin_dir / "degoo-rc"
+        (self.root / "degoo-rc").write_text("#!/bin/sh\n", encoding="ascii")
+        (self.root / "degoo-rc").chmod(0o700)
+        link.symlink_to(self.root / "degoo-rc")
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["path_link"] = str(link)
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+
+        code, stdout, stderr = self.invoke()
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["path_link"], {
+            "path": str(link),
+            "owned": True,
+            "present": True,
+            "type": "symlink",
+        })
+
+    def test_uninstall_removes_only_the_recorded_path_link(self) -> None:
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        bin_dir.chmod(0o700)
+        link = bin_dir / "degoo-rc"
+        (self.root / "degoo-rc").write_text("#!/bin/sh\n", encoding="ascii")
+        (self.root / "degoo-rc").chmod(0o700)
+        link.symlink_to(self.root / "degoo-rc")
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["path_link"] = str(link)
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+
+        code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("owned ~/.local/bin/degoo-rc command link was removed", stdout)
+        self.assertFalse(link.exists())
+        self.assertFalse(os.path.lexists(link))
+        self.assertFalse(self.root.exists())
+
+    def test_uninstall_preserves_changed_recorded_path_link_and_install(self) -> None:
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        bin_dir.chmod(0o700)
+        link = bin_dir / "degoo-rc"
+        unrelated = self.base / "unrelated-degoo-rc"
+        unrelated.write_text("keep\n", encoding="ascii")
+        link.symlink_to(unrelated)
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["path_link"] = str(link)
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+
+        code, _, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 2)
+        self.assertIn("recorded PATH command link changed before cleanup", stderr)
+        self.assertEqual(os.readlink(link), str(unrelated))
+        self.assertTrue(self.root.exists())
+        self.assertTrue((self.root / "mount").is_dir())
+        self.assertTrue((self.root / "config/vault.json").is_file())
+
+    def test_uninstall_leaves_unowned_path_destination_untouched(self) -> None:
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        bin_dir.chmod(0o700)
+        destination = bin_dir / "degoo-rc"
+        destination.write_text("unrelated command\n", encoding="ascii")
+        destination.chmod(0o700)
+
+        code, _, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(destination.read_text(encoding="ascii"), "unrelated command\n")
+        self.assertTrue(destination.exists())
+
     def test_inventory_flag_forces_read_only_mode_on_a_terminal(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()

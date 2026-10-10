@@ -17,10 +17,26 @@ folder is now available and has been used for limited provider probes. The
 original sequence below remains the release acceptance guide; live gates
 cannot be inferred from mock results or from the partial live probes.
 
-The contained install and cleanup experience is part of the user handoff.
-`install.sh` starts the setup wizard for a terminal invocation without options
-or with `--wizard`; `--binary` retains the noninteractive install path, and
-`--no-wizard` supports staging before login. The wizard checks Python 3.10 or
+The contained install and cleanup experience is part of the user handoff. The
+unified `degoo-rc` entrypoint provides `install`, `uninstall`, `login`, `setup`,
+`mount`, `stop`, `status`, `location`, `folders`, `service`, `info`, `logs`,
+`trash`, and `empty-trash`. Source checkouts use
+`./contrib/degoo/degoo-rc install`; archive users run
+`./degoo-rc install`; an installed user starts with `degoo-rc help`. Existing
+installer and helper options remain available, with `degoo-rc COMMAND help`
+documenting the detailed parameters. The command dispatches to shell helpers in
+`scripts/` and Python implementations in `scripts/python/`. The installer
+places `degoo-rc` in the private install root and creates
+`~/.local/bin/degoo-rc` as a link, without editing shell profiles. It prints a
+`PATH` export when that directory is not available; uninstall removes the link
+only when it still points to that installation. Fresh installed roots have
+`degoo-rc` as their only root-level command; upgrades retain any existing root
+`.sh` shims. Source and archive roots may include the legacy install, uninstall,
+and trash shims.
+
+`degoo-rc install` starts the setup wizard in a terminal; `--binary` retains
+the noninteractive install path, and `--no-wizard` supports staging before
+login. The wizard checks Python 3.10 or
 newer, a FUSE helper, writable `/dev/fuse`, and `mountpoint`. It can offer to
 install `fuse3` and `util-linux` with a detected `apt-get`, `dnf`, `pacman`, or
 `zypper`; when mount dependencies remain unavailable, it can still configure
@@ -51,8 +67,9 @@ mountpoint inspection errors from a confirmed absent mount. Default mount
 logs use NOTICE to keep routine
 cache cleanup from overwhelming actionable messages. Password
 entry uses the original terminal output preserved by the logging layer.
-`logs.sh` provides recent command logs and a follow mode; `info.sh` highlights
-rejected authentication renewal with a login command. Saved token expiry is
+`degoo-rc logs` provides recent command logs and a follow mode; `degoo-rc info`
+highlights rejected authentication renewal with a login command. Saved token
+expiry is
 an advisory hint, and automatic renewal may still succeed. Recent failures
 from before an updated account-token file must not keep reporting a stale
 login-required warning.
@@ -65,9 +82,9 @@ It prompts twice unless `--yes` is supplied, and `--dry-run` lists without
 mutating. This is deliberately not exposed through generic rclone cleanup or
 remote paths because the operation is account-wide and crypt/chunker would
 otherwise propagate a dangerous folder-shaped feature. No restore operation is
-provided. `contrib/degoo/trash.sh` wraps only these explicit commands and
-passes the private auth path without reading it. The wrapper is included in
-the distributable package and exercised by the packaging self-check.
+provided. The unified `degoo-rc trash` command lists trash and `degoo-rc
+empty-trash` invokes deletion. Both pass the private auth path without reading
+it; the legacy `trash.sh` wrapper remains for compatibility.
 
 1. Implement the provider request contracts from the pinned Python reference
    in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and

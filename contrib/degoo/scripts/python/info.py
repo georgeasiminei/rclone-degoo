@@ -253,7 +253,8 @@ def _expiry_claim(token: str) -> tuple[str, float | None]:
 
 
 def _login_command(auth_path: Path) -> str:
-    return shlex.quote(str(auth_path.parent.parent / "login.sh"))
+    root = auth_path.parent.parent
+    return " ".join(shlex.quote(value) for value in (str(root / "degoo-rc"), "login"))
 
 
 def authentication_error(
@@ -333,13 +334,14 @@ def authentication_status(auth_path: Path, *, now: float | None = None, logs_dir
 
 
 def pending_uploads(root: Path, timeout: float = 5.0) -> tuple[int, int] | None:
-    """Read only the expected local pending-count line from status.sh."""
-    if not _owned_executable(root / "status.sh"):
+    """Read only the expected local pending-count line from the packaged helper."""
+    helper = root / "scripts" / "status.sh"
+    if not _owned_executable(helper):
         return None
     try:
         with tempfile.TemporaryFile(dir=root / "tmp") as output:
             result = subprocess.run(
-                [str(root / "status.sh")],
+                [str(helper)],
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=subprocess.DEVNULL,
@@ -636,12 +638,16 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
     config_paths = (
         ("Vault config", root / "config" / "vault.json", "vault password and encryption settings"),
         ("Account auth", root / "config" / "auth.json", "account tokens; contents are never displayed"),
-        ("Login email", root / "config" / "login.json", "remembered email only; login.sh --clear-email forgets it"),
+        (
+            "Login email",
+            root / "config" / "login.json",
+            f"remembered email only; {_login_command(root / 'config' / 'auth.json')} --clear-email forgets it",
+        ),
         ("Mount settings", root / "config" / "mount.json", "cache and upload behavior"),
         ("Rclone config", root / "config" / "rclone.conf", "contained remote and auth-file path"),
         ("Install manifest", root / "install.json", "local vault identity and owned systemd-link records"),
         ("User service unit", root / service_manager.UNIT_NAME, "mount startup, restart policy, and stop command"),
-        ("Service wrapper", root / "service.sh", "enable, disable, start, stop, and inspect the user service"),
+        ("Service command", root / "degoo-rc", "service enable, disable, start, stop, and inspect the user service"),
         ("Cache", root / "cache", "local cached file data and pending writes"),
         ("Logs", root / "logs", "contained command logs"),
     )
@@ -711,7 +717,10 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
                     f"AUTHENTICATION ERROR: Degoo rejected the current account authentication. Run {command} to sign in again.",
                 )
     else:
-        lines.append("Remote ancestry is cached local metadata; use --check-remote to query Degoo.")
+        lines.append(
+            "Remote ancestry is cached local metadata; use "
+            f"{shlex.quote(str(root / 'degoo-rc'))} info --check-remote to query Degoo."
+        )
     return "\n".join(lines) + "\n"
 
 

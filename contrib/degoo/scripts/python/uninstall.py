@@ -54,6 +54,11 @@ def expected_root() -> Path:
     return home_directory() / ".local" / "share" / ROOT_NAME
 
 
+def expected_path_link() -> Path:
+    """Return the only supported user-level command link location."""
+    return home_directory() / ".local" / "bin" / "degoo-rc"
+
+
 def _check_components(path: Path, *, missing_ok: bool = False) -> None:
     """Reject symlink components and non-directory path ancestors."""
     current = Path(path.anchor)
@@ -164,6 +169,9 @@ def _validate_manifest(root: Path) -> dict[str, Any]:
         raise CleanupError("the install manifest is incomplete")
     service_config_home = manifest.get("service_config_home", "")
     service_links = manifest.get("service_links", [])
+    path_link = manifest.get("path_link", "")
+    if not isinstance(path_link, str) or (path_link and path_link != str(expected_path_link())):
+        raise CleanupError("the install manifest contains an unexpected PATH link")
     if not isinstance(service_config_home, str) or not isinstance(service_links, list):
         raise CleanupError("the install manifest has an invalid service ownership record")
     if service_config_home:
@@ -638,6 +646,78 @@ def _service_link_target(path: Path, unit: Path) -> bool:
     return Path(os.path.normpath(str(target))) == unit
 
 
+def _path_link_target(path: Path, root: Path) -> bool:
+    """Report whether a safe user-owned command link points to this install."""
+    if not os.path.lexists(path):
+        return False
+    _check_directory(path.parent)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise CleanupError("the PATH command link could not be inspected safely") from None
+    if not stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        return False
+    try:
+        target_text = os.readlink(path)
+    except OSError:
+        raise CleanupError("the PATH command link could not be read safely") from None
+    target = Path(target_text)
+    if not target.is_absolute():
+        target = path.parent / target
+    return Path(os.path.normpath(str(target))) == root / "degoo-rc"
+
+
+def _remove_owned_path_link(root: Path, manifest: dict[str, Any]) -> bool:
+    """Remove only the recorded command link while it still points into this install."""
+    link = expected_path_link()
+    if manifest.get("path_link") != str(link) or not os.path.lexists(link):
+        return False
+    if not _path_link_target(link, root):
+        raise CleanupError("the recorded PATH command link changed before cleanup")
+    parent_fd = -1
+    try:
+        parent_fd = os.open(
+            link.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        before = os.stat(link.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISLNK(before.st_mode) or before.st_uid != os.getuid():
+            raise CleanupError("the recorded PATH command link changed before cleanup")
+        target_text = os.readlink(link.name, dir_fd=parent_fd)
+        target = Path(target_text)
+        if not target.is_absolute():
+            target = link.parent / target
+        if Path(os.path.normpath(str(target))) != root / "degoo-rc":
+            raise CleanupError("the recorded PATH command link changed before cleanup")
+        current = os.stat(link.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            raise CleanupError("the PATH command link changed during cleanup")
+        os.unlink(link.name, dir_fd=parent_fd)
+        try:
+            os.stat(link.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            raise CleanupError("the owned PATH command link could not be verified after cleanup") from None
+        raise CleanupError("the owned PATH command link remains after cleanup")
+    except CleanupError:
+        raise
+    except OSError:
+        raise CleanupError("the owned PATH command link could not be removed safely") from None
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _validate_recorded_path_link(root: Path, manifest: dict[str, Any]) -> None:
+    """Reject a changed recorded link before service or mount cleanup starts."""
+    link = expected_path_link()
+    if manifest.get("path_link") == str(link) and os.path.lexists(link) and not _path_link_target(link, root):
+        raise CleanupError("the recorded PATH command link changed before cleanup")
+
+
 def _owned_service_links(root: Path, manifest: dict[str, Any]) -> tuple[list[Path], set[str]]:
     direct, wanted = _service_paths(root, manifest)
     unit = root / "rclone-degoo.service"
@@ -1025,6 +1105,31 @@ def _service_inventory(root: Path, manifest: dict[str, Any]) -> list[dict[str, A
     return result
 
 
+def _path_link_inventory(root: Path, manifest: dict[str, Any]) -> dict[str, Any] | None:
+    path = expected_path_link()
+    recorded = manifest.get("path_link", "")
+    present = os.path.lexists(path)
+    if not present and not recorded:
+        return None
+    if not present:
+        kind = "missing"
+        matches = False
+    else:
+        _check_directory(path.parent)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise CleanupError("the PATH command link could not be inspected safely") from None
+        kind = "symlink" if stat.S_ISLNK(info.st_mode) else "other"
+        matches = _path_link_target(path, root) if kind == "symlink" else False
+    return {
+        "path": str(path),
+        "owned": recorded == str(path) and matches,
+        "present": present,
+        "type": kind,
+    }
+
+
 def _inventory(root: Path, manifest: dict[str, Any], entries: list[dict[str, str]], mounted: bool) -> None:
     result = {
         "mode": "inventory",
@@ -1032,6 +1137,7 @@ def _inventory(root: Path, manifest: dict[str, Any], entries: list[dict[str, str
         "mounted": mounted,
         "files": entries,
         "service_links": _service_inventory(root, manifest),
+        "path_link": _path_link_inventory(root, manifest),
         "remote_data": "left untouched",
     }
     json.dump(result, sys.stdout, ensure_ascii=True, sort_keys=True)
@@ -1128,6 +1234,8 @@ def uninstall(args: argparse.Namespace) -> int:
         _inventory(root, layout["manifest"], entries, mounted)
         return 0
 
+    _validate_recorded_path_link(root, layout["manifest"])
+
     keep_config = args.keep_config
     keep_cache = args.keep_cache
     keep_logs = args.keep_logs
@@ -1199,6 +1307,7 @@ def uninstall(args: argparse.Namespace) -> int:
             )
         # Reload and verify systemd while the install layout is still retryable.
         service_cleanup = _remove_owned_service_links(root, latest["manifest"], previously_owned_service)
+        path_link_cleanup = _remove_owned_path_link(root, latest["manifest"])
         # Removing the empty mountpoint first makes a concurrent re-mount fail
         # before recursive deletion can traverse a mounted filesystem.
         try:
@@ -1216,7 +1325,7 @@ def uninstall(args: argparse.Namespace) -> int:
             "Removed the isolated local Degoo install. Pending local uploads "
             f"({pending_files} files, {pending_bytes} bytes) were preserved in {retention_directory}. "
             f"To resume them, restore that directory's contents to {expected_root()}, then run "
-            "`./contrib/degoo/install.sh --binary "
+            "`./contrib/degoo/degoo-rc install --binary "
             f"{expected_root()}/bin/rclone --upgrade` from the rclone-degoo project checkout. "
             "Degoo remote data was left untouched."
         )
@@ -1243,6 +1352,10 @@ def uninstall(args: argparse.Namespace) -> int:
         print("The owned user service is confirmed inactive; its links were removed and systemd was reloaded.")
     else:
         print("No owned user service links were configured.")
+    if path_link_cleanup:
+        print("The owned ~/.local/bin/degoo-rc command link was removed.")
+    else:
+        print("No owned ~/.local/bin/degoo-rc command link was configured.")
     return 0
 
 

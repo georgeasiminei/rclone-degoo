@@ -36,7 +36,7 @@ git clone --branch staging https://github.com/georgeasiminei/rclone-degoo.git
 cd rclone-degoo
 mkdir -p build
 go build -o build/rclone .
-./contrib/degoo/install.sh --wizard --binary ./build/rclone
+./contrib/degoo/degoo-rc install
 ```
 
 Go 1.26 or newer is needed to build from source. The wizard then installs the
@@ -56,7 +56,7 @@ sha256sum -c rclone-degoo-linux-amd64.tar.gz.sha256
 extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
 tar -xzf "$HOME/Downloads/rclone-degoo-linux-amd64.tar.gz" -C "$extract_dir"
 cd "$extract_dir/rclone-degoo"
-./install.sh
+./degoo-rc install
 ```
 
 The prebuilt archive does not need Go. Both install paths need Python 3.10 or
@@ -66,33 +66,42 @@ newer for the installer. Mounting also needs FUSE 3 or a compatible
 packages using a detected package manager. A systemd user manager is optional;
 without it, mount in the foreground.
 
+The installer puts `degoo-rc` at `~/.local/share/rclone-degoo/degoo-rc` and
+links `~/.local/bin/degoo-rc` to it. It does not edit shell profiles; if that
+directory is missing from `PATH`, it prints an export command. Use
+`degoo-rc help` for the command list and `degoo-rc COMMAND help` for detailed
+options. A fresh install has `degoo-rc` as its only root-level command;
+upgrades retain existing root-level `.sh` shims, and source/archive roots may
+include the legacy install, uninstall, and trash shims. New examples use
+`degoo-rc`.
+
 ### Use the installed vault
 
 The wizard finishes with the install directory, mount location, current mount
 state, helper commands, and log locations. The default mount is
 `~/.local/share/rclone-degoo/mount`. Open that folder in your file manager
 while it is mounted, or use it like any other directory from the terminal.
-The installed helpers live in `~/.local/share/rclone-degoo/`:
+Use the installed command, available on `PATH`:
 
 ```sh
-~/.local/share/rclone-degoo/info.sh
-~/.local/share/rclone-degoo/logs.sh
-~/.local/share/rclone-degoo/logs.sh --follow
+degoo-rc info
+degoo-rc logs
+degoo-rc logs --follow
 ```
 
-Press Ctrl+C to stop following logs. `logs.sh` is the viewer; `logs/` is a
+Press Ctrl+C to stop following logs. `degoo-rc logs` is the viewer; `logs/` is a
 directory. New mounts log notices and errors by default. The upgrade wizard
 offers to stop the contained mount and waits briefly for it to start again.
 To stop the user service manually:
 
 ```sh
-~/.local/share/rclone-degoo/service.sh stop
+degoo-rc service stop
 ```
 
-`info.sh` shows mount/service state and authentication warnings. `logs.sh`
-shows recent mount, login, setup, and status logs; `--follow` watches new
-messages. If a token cannot be renewed, run
-`~/.local/share/rclone-degoo/login.sh` again. Keep the cache and vault
+`degoo-rc info` shows mount/service state and authentication warnings.
+`degoo-rc logs` shows recent mount, login, setup, and status logs; `--follow`
+watches new messages. If a token cannot be renewed, run `degoo-rc login` again.
+Keep the cache and vault
 configuration while uploads are pending.
 
 For a fresh reinstall, run the uninstall wizard from outside the install

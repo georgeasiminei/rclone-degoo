@@ -8,6 +8,24 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Unified `degoo-rc` entrypoint follow-up
+
+The current frontend and packaging checks for the unified command passed:
+
+- All 5 actual CLI tests passed.
+- The full Python helper suite passed all 128 tests: 67 install/uninstall,
+  56 info/wizard/logs, and 5 CLI tests. Coverage includes actual PATH lookup,
+  paths with spaces, and fresh installs without root-level shell wrappers.
+- The package self-check passed, including help output for every packaged
+  command.
+- Building the archive with `build/rclone` and checking it from isolated homes
+  passed, including native CLI help for every command.
+- `sh -n` passed for all entrypoints and helper scripts.
+
+These checks do not change the live Degoo acceptance gates below. Larger live
+files, long-term token renewal, pagination beyond 1,000 entries, and interrupted
+multi-chunk recovery remain unverified.
+
 ## Installer and cleanup wizards
 
 The wizard changes were checked offline on 2026-10-10:

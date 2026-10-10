@@ -1,0 +1,25 @@
+#!/bin/sh
+# Resolve the installed PATH link before finding the contained helpers.
+set -eu
+LAUNCHER=$0
+if [ "${LAUNCHER#*/}" = "$LAUNCHER" ]; then
+    LAUNCHER=$(command -v "$LAUNCHER")
+fi
+while [ -L "$LAUNCHER" ]; do
+    DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$LAUNCHER")" && pwd)
+    TARGET=$(readlink -- "$LAUNCHER")
+    case "$TARGET" in
+        /*) LAUNCHER=$TARGET ;;
+        *) LAUNCHER=$DIRECTORY/$TARGET ;;
+    esac
+done
+BASE=$(CDPATH= cd -- "$(dirname -- "$LAUNCHER")" && pwd)
+export PYTHONDONTWRITEBYTECODE=1
+if [ "${1:-}" = install ]; then
+    shift
+    case "${1:-}" in
+        help|--help|-h) set -- install --help ;;
+        *) exec "$BASE/scripts/install.sh" "$@" ;;
+    esac
+fi
+exec python3 "$BASE/scripts/python/cli.py" "$@"

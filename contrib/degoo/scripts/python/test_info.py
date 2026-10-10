@@ -35,7 +35,7 @@ class InfoTest(unittest.TestCase):
         self.root.mkdir(parents=True, mode=0o700)
         (self.home / ".local").chmod(0o700)
         (self.home / ".local/share").chmod(0o700)
-        for name in ("bin", "config", "cache", "mount", "tools", "tmp", "logs"):
+        for name in ("bin", "config", "cache", "mount", "tools", "tmp", "logs", "scripts"):
             (self.root / name).mkdir(mode=0o700)
         self.manifest = {
             "version": 1,
@@ -73,7 +73,7 @@ class InfoTest(unittest.TestCase):
         path.chmod(0o600)
 
     def status_script(self, output: str, code: int = 0) -> None:
-        script = self.root / "status.sh"
+        script = self.root / "scripts/status.sh"
         script.write_text(f"#!/bin/sh\nprintf '%s' {shlex.quote(output)}\nexit {code}\n", encoding="utf-8")
         script.chmod(0o700)
 
@@ -114,7 +114,7 @@ class InfoTest(unittest.TestCase):
             report = info.report(self.root, self.manifest)
         lines = report.splitlines()
         self.assertTrue(lines[2].startswith("AUTHENTICATION ERROR: No saved account token;"))
-        self.assertIn("login.sh", lines[2])
+        self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", lines[2])
         self.assertIn("log in before cloud operations", lines[2])
 
     def test_report_promotes_expired_access_token_without_refresh(self) -> None:
@@ -128,7 +128,7 @@ class InfoTest(unittest.TestCase):
             report = info.report(self.root, self.manifest)
         error_line = report.splitlines()[2]
         self.assertTrue(error_line.startswith("AUTHENTICATION ERROR: The saved access token has expired"))
-        self.assertIn("login.sh", error_line)
+        self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", error_line)
 
     def test_remote_rejection_is_prominent_even_when_saved_jwt_looks_current(self) -> None:
         self.write_private(
@@ -143,7 +143,7 @@ class InfoTest(unittest.TestCase):
         ):
             report = info.report(self.root, self.manifest, check_remote=True)
         self.assertTrue(report.splitlines()[2].startswith("AUTHENTICATION ERROR: Degoo rejected the current account authentication."))
-        self.assertIn("login.sh", report.splitlines()[2])
+        self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", report.splitlines()[2])
 
     def test_auth_status_only_requires_login_for_a_recent_post_auth_sentinel(self) -> None:
         auth_path = self.root / "config/auth.json"
@@ -159,7 +159,7 @@ class InfoTest(unittest.TestCase):
 
         status = info.authentication_status(auth_path, now=now, logs_dir=logs_dir)
         self.assertIn("rejected", status)
-        self.assertIn("login.sh", status)
+        self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", status)
         self.assertNotIn("keep-private", status)
 
         os.utime(auth_path, (now - 30, now - 30))
@@ -315,18 +315,20 @@ class InfoTest(unittest.TestCase):
         installed = self.root / "scripts/python/info.py"
         self.assertTrue(installed.is_file())
         self.assertTrue((self.root / "scripts/python/logs.py").is_file())
-        wrapper = (self.root / "info.sh").read_text(encoding="utf-8")
+        self.assertFalse((self.root / "info.sh").exists())
+        self.assertFalse((self.root / "logs.sh").exists())
+        wrapper = (self.root / "scripts/info.sh").read_text(encoding="utf-8")
         self.assertIn("exec python3", wrapper)
         self.assertIn("$@", wrapper)
         self.assertNotIn("XDG_CONFIG_HOME", wrapper)
         self.assertNotIn('HOME=', wrapper)
-        self.assertEqual(stat.S_IMODE((self.root / "info.sh").stat().st_mode), 0o700)
-        logs_wrapper = (self.root / "logs.sh").read_text(encoding="utf-8")
+        self.assertEqual(stat.S_IMODE((self.root / "scripts/info.sh").stat().st_mode), 0o700)
+        logs_wrapper = (self.root / "scripts/logs.sh").read_text(encoding="utf-8")
         self.assertIn("scripts/python/logs.py", logs_wrapper)
         self.assertIn("--root", logs_wrapper)
-        self.assertEqual(stat.S_IMODE((self.root / "logs.sh").stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.root / "scripts/logs.sh").stat().st_mode), 0o700)
         help_result = subprocess.run(
-            [str(self.root / "logs.sh"), "--help"],
+            [str(self.root / "scripts/logs.sh"), "--help"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

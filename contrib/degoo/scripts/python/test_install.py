@@ -74,22 +74,62 @@ class InstallTest(unittest.TestCase):
         config = (self.root / "config/rclone.conf").read_text(encoding="utf-8")
         self.assertIn("root_folder_id = dedicated-folder-123", config)
         self.assertIn(f"auth_file = {self.root / 'config/auth.json'}", config)
-        for path in (self.root, self.root / "config", self.root / "cache", self.root / "bin/rclone", self.root / "mount.sh"):
+        for path in (self.root, self.root / "config", self.root / "cache", self.root / "bin/rclone", self.root / "scripts/mount.sh", self.root / "degoo-rc"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0)
-        mount_wrapper = (self.root / "mount.sh").read_text(encoding="utf-8")
+        mount_wrapper = (self.root / "scripts/mount.sh").read_text(encoding="utf-8")
         self.assertIn("--settings", mount_wrapper)
         self.assertIn(f"ROOT={shlex.quote(str(self.root))}", mount_wrapper)
         self.assertIn("$ROOT/tools:/usr/bin:/bin", mount_wrapper)
         self.assertTrue((self.root / "scripts/python/install.py").is_file())
+        self.assertTrue((self.root / "scripts/python/cli.py").is_file())
+        self.assertTrue((self.root / "scripts/install.sh").is_file())
+        self.assertTrue((self.root / "scripts/trash.sh").is_file())
+        self.assertEqual(os.readlink(self.home / ".local/bin/degoo-rc"), str(self.root / "degoo-rc"))
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["path_link"], str(self.home / ".local/bin/degoo-rc"))
         self.assertFalse((self.root / "install.py").exists())
-        self.assertIn("scripts/python/login.py", (self.root / "login.sh").read_text())
-        for wrapper in self.root.glob("*.sh"):
+        self.assertEqual(list(self.root.glob("*.sh")), [])
+        self.assertIn("scripts/python/login.py", (self.root / "scripts/login.sh").read_text())
+        for wrapper in (self.root / "scripts").glob("*.sh"):
             result = subprocess.run(["/bin/sh", "-n", str(wrapper)], check=False, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, f"{wrapper.name}: {result.stderr}")
         unit = (self.root / "rclone-degoo.service").read_text(encoding="utf-8")
         self.assertIn("StartLimitIntervalSec=0", unit.split("[Service]", 1)[0])
+        self.assertIn(f"ExecStart={install.unit_quote(str(self.root / 'scripts/mount.sh'))}", unit)
         self.assertIn("RestartSec=30s", unit)
         self.assertIn("WantedBy=default.target", unit)
+
+    def test_install_refuses_unrelated_command_at_path_destination(self) -> None:
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        (self.home / ".local").chmod(0o700)
+        bin_dir.chmod(0o700)
+        destination = bin_dir / "degoo-rc"
+        destination.write_text("keep this command\n", encoding="utf-8")
+        destination.chmod(0o700)
+
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+
+        self.assertEqual(code, 2)
+        self.assertIn("already exists and is not owned by this install", stderr)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "keep this command\n")
+        self.assertFalse(self.root.exists())
+
+    def test_install_prints_copyable_path_export_without_editing_profiles(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            code, stdout, stderr = self.invoke()
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', stdout)
+        self.assertFalse((self.home / ".profile").exists())
+
+    def test_install_omits_path_export_when_local_bin_is_already_in_path(self) -> None:
+        local_bin = self.home / ".local/bin"
+        with mock.patch.dict(os.environ, {"PATH": f"/usr/bin:{local_bin}:/bin"}):
+            code, stdout, stderr = self.invoke()
+
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn('export PATH="$HOME/.local/bin:$PATH"', stdout)
 
     def test_mount_wrapper_defaults_to_notice_and_allows_later_info_override(self) -> None:
         code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
@@ -103,14 +143,14 @@ class InstallTest(unittest.TestCase):
         fake_binary.chmod(0o700)
         env = {**os.environ, "CAPTURE_ARGS": str(capture)}
 
-        result = subprocess.run([str(self.root / "mount.sh")], env=env, capture_output=True, check=False)
+        result = subprocess.run([str(self.root / "scripts/mount.sh")], env=env, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         args = capture.read_text(encoding="utf-8").splitlines()
         levels = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--log-level"]
         self.assertEqual(levels, ["NOTICE"])
 
         result = subprocess.run(
-            [str(self.root / "mount.sh"), "--log-level", "INFO"],
+            [str(self.root / "scripts/mount.sh"), "--log-level", "INFO"],
             env=env,
             capture_output=True,
             check=False,
@@ -177,7 +217,7 @@ class InstallTest(unittest.TestCase):
                     "UNMOUNT_EXIT": unmount_exit,
                 }
                 result = subprocess.run(
-                    [str(self.root / "stop.sh")], env=env, capture_output=True, check=False
+                    [str(self.root / "scripts/stop.sh")], env=env, capture_output=True, check=False
                 )
                 self.assertEqual(result.returncode, expected_code, result.stderr.decode(errors="replace"))
                 self.assertEqual(calls.read_text(encoding="ascii").splitlines(), expected_calls)
@@ -189,7 +229,8 @@ class InstallTest(unittest.TestCase):
         root = self.base / "systemd path with spaces %"
         root.mkdir(mode=0o700)
         for name in ("mount.sh", "stop.sh"):
-            path = root / name
+            path = root / "scripts" / name
+            path.parent.mkdir(exist_ok=True)
             path.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
             path.chmod(0o700)
         unit = root / "rclone-degoo.service"
@@ -231,8 +272,8 @@ class InstallTest(unittest.TestCase):
         self.assertIn("no vault folder is configured yet", stdout)
         self.assertFalse((self.root / "config/vault.json").exists())
         self.assertFalse((self.root / "config/rclone.conf").exists())
-        self.assertTrue((self.root / "login.sh").exists())
-        self.assertTrue((self.root / "setup.sh").exists())
+        self.assertTrue((self.root / "scripts/login.sh").exists())
+        self.assertTrue((self.root / "scripts/setup.sh").exists())
 
     def test_setup_creates_remote_identity_and_finishes_staged_install(self) -> None:
         code, _, stderr = self.invoke()
@@ -281,6 +322,9 @@ class InstallTest(unittest.TestCase):
         legacy_helper = self.root / "install.py"
         legacy_helper.write_text("# old installer layout\n", encoding="utf-8")
         legacy_helper.chmod(0o700)
+        legacy_mount = self.root / "mount.sh"
+        legacy_mount.write_bytes(install.shell_wrapper("mount.sh", self.root))
+        legacy_mount.chmod(0o700)
 
         code, _, stderr = self.invoke("--upgrade")
         self.assertEqual(code, 0, stderr)
@@ -293,6 +337,9 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(cache_file.read_bytes(), cache_before)
         self.assertEqual((self.root / "config/login.json").read_text(encoding="utf-8"), '{"email":"owner@example.test"}\n')
         self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["verify_upload"], False)
+        self.assertIn('exec "$BASE/scripts/mount.sh" "$@"', legacy_mount.read_text(encoding="utf-8"))
+        self.assertEqual(os.readlink(self.home / ".local/bin/degoo-rc"), str(self.root / "degoo-rc"))
+        self.assertEqual(json.loads((self.root / "install.json").read_text(encoding="utf-8"))["path_link"], str(self.home / ".local/bin/degoo-rc"))
 
     def test_upgrade_privateizes_legacy_logs_without_changing_contents(self) -> None:
         code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
@@ -396,7 +443,7 @@ class InstallTest(unittest.TestCase):
 
             self.assertEqual(code, 2)
             self.assertIn("stop the contained mount before upgrading", stderr)
-            command = shlex.quote(str(self.root / wrapper))
+            command = shlex.quote(str(self.root / "scripts" / wrapper))
             if wrapper == "service.sh":
                 command += " stop"
             self.assertIn(command, stderr)

@@ -23,7 +23,11 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py")
+SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py")
+SOURCE_SHELL_FILES = ("install.sh", "trash.sh", "uninstall.sh")
+GENERATED_SHELL_FILES = ("info.sh", "logs.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh")
+COMPATIBILITY_SHELL_FILES = (*SOURCE_SHELL_FILES, *GENERATED_SHELL_FILES)
+LEGACY_GENERATED_SHELL_FILES = COMPATIBILITY_SHELL_FILES
 MAX_CONFIG_SIZE = 1024 * 1024
 DEFAULT_MOUNT_SETTINGS = {
     "cache_max_size": "20G",
@@ -49,6 +53,89 @@ def home_directory() -> Path:
 
 def expected_root() -> Path:
     return home_directory() / ROOT_REL
+
+
+def expected_path_link() -> Path:
+    """Return the user-level command link for this contained install."""
+    return home_directory() / ".local" / "bin" / "degoo-rc"
+
+
+def _path_link_matches(link: Path, root: Path) -> bool:
+    """Report whether a safe user-owned link points to this install entrypoint."""
+    if not os.path.lexists(link):
+        return False
+    check_directory(link.parent)
+    try:
+        info = os.lstat(link)
+    except OSError:
+        raise InstallError("the PATH command link could not be inspected safely") from None
+    if not stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        return False
+    try:
+        target_text = os.readlink(link)
+    except OSError:
+        raise InstallError("the PATH command link could not be read safely") from None
+    target = Path(target_text)
+    if not target.is_absolute():
+        target = link.parent / target
+    return Path(os.path.normpath(str(target))) == root / "degoo-rc"
+
+
+def _ensure_path_link_directory() -> Path:
+    """Create and validate ~/.local/bin without following symlinked paths."""
+    local = home_directory() / ".local"
+    check_directory(local)
+    directory = local / "bin"
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        raise InstallError("the command directory ~/.local/bin could not be created safely") from None
+    check_directory(directory)
+    return directory
+
+
+def _preflight_path_link(root: Path) -> Path:
+    """Refuse an unrelated command before creating or upgrading the install."""
+    directory = _ensure_path_link_directory()
+    link = directory / "degoo-rc"
+    if os.path.lexists(link) and not _path_link_matches(link, root):
+        raise InstallError("~/.local/bin/degoo-rc already exists and is not owned by this install")
+    return link
+
+
+def _path_contains_local_bin() -> bool:
+    """Report whether ~/.local/bin is already present in the current PATH."""
+    expected = home_directory() / ".local" / "bin"
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        expanded = os.path.expandvars(os.path.expanduser(entry))
+        candidate = Path(os.path.abspath(expanded or os.curdir))
+        if candidate == expected:
+            return True
+    return False
+
+
+def _install_path_link(root: Path, manifest: dict[str, Any]) -> bool:
+    """Create or verify the command link and record its ownership."""
+    link = _preflight_path_link(root)
+    created = False
+    if not os.path.lexists(link):
+        try:
+            os.symlink(str(root / "degoo-rc"), link)
+        except OSError:
+            raise InstallError("the unified Degoo command could not be linked into ~/.local/bin") from None
+        created = True
+    if not _path_link_matches(link, root):
+        raise InstallError("~/.local/bin/degoo-rc is not a verified link to this install")
+    manifest["path_link"] = str(link)
+    return created
+
+
+def _print_path_hint() -> None:
+    if not _path_contains_local_bin():
+        print('Add the unified command to PATH in this shell with:')
+        print('  export PATH="$HOME/.local/bin:$PATH"')
 
 
 def check_components(path: Path, *, missing_ok: bool = False) -> None:
@@ -305,6 +392,9 @@ def load_manifest(root: Path) -> dict[str, Any]:
         raise InstallError("the existing install manifest is unsupported")
     if manifest.get("mountpoint") != "mount" or manifest.get("cache_dir") != "cache":
         raise InstallError("the existing install manifest contains unexpected paths")
+    linked_path = manifest.get("path_link", "")
+    if not isinstance(linked_path, str) or (linked_path and linked_path != str(expected_path_link())):
+        raise InstallError("the existing install manifest contains an unexpected PATH link")
     folder_id = manifest.get("root_folder_id")
     if not isinstance(folder_id, str) or folder_id == "0":
         raise InstallError("the existing install manifest has an unsafe folder ID")
@@ -493,6 +583,18 @@ def shell_wrapper(name: str, root: Path) -> bytes:
     return content.encode("utf-8")
 
 
+def compatibility_wrapper(name: str) -> bytes:
+    """Keep an old root-level helper name forwarding to the scripts directory."""
+    if name not in COMPATIBILITY_SHELL_FILES:
+        raise InstallError("an internal compatibility wrapper name was invalid")
+    content = (
+        "#!/bin/sh\nset -eu\n"
+        'BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
+        f'exec "$BASE/scripts/{name}" "$@"\n'
+    )
+    return content.encode("utf-8")
+
+
 def unit_quote(value: str) -> str:
     if "\x00" in value or "\n" in value or "\r" in value:
         raise InstallError("the install path cannot be represented in a user service")
@@ -509,8 +611,8 @@ def service_unit(root: Path) -> bytes:
         "StartLimitIntervalSec=0\n\n"
         "[Service]\n"
         "Type=simple\n"
-        f"ExecStart={unit_quote(str(root / 'mount.sh'))}\n"
-        f"ExecStop={unit_quote(str(root / 'stop.sh'))}\n"
+        f"ExecStart={unit_quote(str(root / 'scripts/mount.sh'))}\n"
+        f"ExecStop={unit_quote(str(root / 'scripts/stop.sh'))}\n"
         "Restart=on-failure\n"
         "RestartSec=30s\n"
         "TimeoutStopSec=60s\n\n"
@@ -622,18 +724,26 @@ def validate_binary(binary: Path) -> None:
 def _install(args: argparse.Namespace) -> int:
     root = expected_root()
     ensure_parent_directories(root)
+    _preflight_path_link(root)
     root_exists = os.path.lexists(root)
     if args.upgrade:
         if not root_exists:
             raise InstallError("--upgrade requires an existing contained install")
         check_directory(root, private=True)
         manifest = load_manifest(root)
+        legacy_wrappers = tuple(
+            name
+            for name in LEGACY_GENERATED_SHELL_FILES
+            if os.path.lexists(root / name)
+            and read_private_file(root / name, 64 * 1024) is not None
+        )
     else:
         if root_exists:
             raise InstallError("the contained install already exists; use --upgrade to preserve it")
         os.mkdir(root, 0o700)
         check_directory(root, private=True)
         manifest = None
+        legacy_wrappers = ()
 
     initial_folder_id = manifest.get("root_folder_id", "") if manifest else ""
     supplied_folder_id = validate_folder_id(args.folder_id) if args.folder_id else ""
@@ -710,13 +820,38 @@ def _install(args: argparse.Namespace) -> int:
         normalize_legacy_logs(root / "logs")
     copy_binary(args.binary, root / "bin/rclone")
     validate_binary(root / "bin/rclone")
+    source_root = Path(__file__).absolute().parent.parent.parent
     for source_name in SOURCE_FILES:
         source = Path(__file__).absolute().parent / source_name
-        if not source.is_file() or source.is_symlink():
+        try:
+            source_info = os.lstat(source)
+        except OSError:
+            raise InstallError("the contained installer source files are incomplete") from None
+        if not stat.S_ISREG(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
             raise InstallError("the contained installer source files are incomplete")
         destination = root / "scripts/python" / source_name
         data = source.read_bytes()
         write_private_file(destination, data, replace=os.path.lexists(destination), mode=0o700)
+
+    entrypoint_source = source_root / "degoo-rc"
+    try:
+        entrypoint_info = os.lstat(entrypoint_source)
+    except OSError:
+        raise InstallError("the unified Degoo command source is missing") from None
+    if not stat.S_ISREG(entrypoint_info.st_mode) or stat.S_ISLNK(entrypoint_info.st_mode):
+        raise InstallError("the unified Degoo command source is unsafe")
+    write_private_file(root / "degoo-rc", entrypoint_source.read_bytes(), replace=os.path.lexists(root / "degoo-rc"), mode=0o700)
+
+    for source_name in SOURCE_SHELL_FILES:
+        source = source_root / "scripts" / source_name
+        try:
+            source_info = os.lstat(source)
+        except OSError:
+            raise InstallError("the contained shell helper source files are incomplete") from None
+        if not stat.S_ISREG(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+            raise InstallError("the contained shell helper source files are unsafe")
+        destination = root / "scripts" / source_name
+        write_private_file(destination, source.read_bytes(), replace=os.path.lexists(destination), mode=0o700)
 
     if existing_vault is None and vault_bytes is not None:
         write_private_file(root / "config/vault.json", vault_bytes)
@@ -728,8 +863,12 @@ def _install(args: argparse.Namespace) -> int:
         else:
             validate_rclone_config(existing_rclone_config, root, folder_id)
 
-    for wrapper in ("install.sh", "uninstall.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh", "info.sh", "logs.sh"):
-        write_private_file(root / wrapper, shell_wrapper(wrapper, root), replace=os.path.lexists(root / wrapper), mode=0o700)
+    for wrapper in GENERATED_SHELL_FILES:
+        destination = root / "scripts" / wrapper
+        write_private_file(destination, shell_wrapper(wrapper, root), replace=os.path.lexists(destination), mode=0o700)
+    for wrapper in legacy_wrappers:
+        destination = root / wrapper
+        write_private_file(destination, compatibility_wrapper(wrapper), replace=os.path.lexists(destination), mode=0o700)
     if args.upgrade:
         for source_name in SOURCE_FILES:
             legacy = root / source_name
@@ -745,19 +884,29 @@ def _install(args: argparse.Namespace) -> int:
     if args.folder_created_by_setup:
         manifest["remote_created_by_setup"] = True
     manifest.setdefault("service_links", [])
+    path_link_created = _install_path_link(root, manifest)
     manifest_data = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    write_private_file(root / "install.json", manifest_data, replace=True)
+    try:
+        write_private_file(root / "install.json", manifest_data, replace=True)
+    except (InstallError, OSError):
+        if path_link_created and _path_link_matches(expected_path_link(), root):
+            expected_path_link().unlink()
+        raise
+
+    _print_path_hint()
 
     if folder_id:
         print(f"Installed the contained Degoo vault at {root}.")
-        print(f"Account login: {root / 'login.sh'}")
-        print(f"Mount: {root / 'mount.sh'}")
-        print(f"Logs: {root / 'logs.sh'}")
-        print(f"User service: {root / 'service.sh'} enable")
+        print("Unified command: degoo-rc")
+        print("Account login: degoo-rc login")
+        print("Mount: degoo-rc mount")
+        print("Logs: degoo-rc logs")
+        print("User service: degoo-rc service enable")
     else:
         print(f"Installed the contained Degoo client at {root}; no vault folder is configured yet.")
-        print(f"Log in with {root / 'login.sh'}, then run {root / 'setup.sh'} --parent-id DEVICE_ID --name VAULT_NAME.")
-        print(f"Logs: {root / 'logs.sh'}")
+        print("Unified command: degoo-rc")
+        print("Log in with degoo-rc login, then run degoo-rc setup --parent-id DEVICE_ID --name VAULT_NAME.")
+        print("Logs: degoo-rc logs")
     return 0
 
 
@@ -789,9 +938,9 @@ def _user_service_active(root: Path) -> bool:
 def _acquire_upgrade_lock(root: Path) -> int:
     if os.path.ismount(root) or os.path.ismount(root / "mount"):
         if _user_service_active(root):
-            stop_command = f"{shlex.quote(str(root / 'service.sh'))} stop"
+            stop_command = f"{shlex.quote(str(root / 'scripts/service.sh'))} stop"
         else:
-            stop_command = shlex.quote(str(root / "stop.sh"))
+            stop_command = shlex.quote(str(root / "scripts/stop.sh"))
         raise InstallError(f"stop the contained mount before upgrading; run {stop_command}")
     cache = root / "cache"
     check_directory(cache, private=True)
