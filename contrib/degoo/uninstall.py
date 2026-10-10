@@ -34,7 +34,7 @@ EXPECTED_MANIFEST_PATHS = {
     "mountpoint": "mount",
     "pidfile": "mount.pid",
 }
-FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount3"}
+FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount2.9", "fusermount3"}
 
 
 class CleanupError(Exception):
@@ -162,17 +162,43 @@ def _validate_manifest(root: Path) -> dict[str, Any]:
             raise CleanupError("the install manifest contains an unexpected local path")
     if created and not folder_name.strip():
         raise CleanupError("the install manifest is incomplete")
+    service_config_home = manifest.get("service_config_home", "")
+    service_links = manifest.get("service_links", [])
+    if not isinstance(service_config_home, str) or not isinstance(service_links, list):
+        raise CleanupError("the install manifest has an invalid service ownership record")
+    if service_config_home:
+        config_home = Path(service_config_home)
+        if not config_home.is_absolute() or ".." in config_home.parts:
+            raise CleanupError("the install manifest has an unsafe service config path")
+        config_home = Path(os.path.normpath(str(config_home)))
+        try:
+            if os.path.commonpath((str(root), str(config_home))) == str(root):
+                raise CleanupError("the service config path must be outside the install")
+        except ValueError:
+            raise CleanupError("the install manifest has an unsafe service config path") from None
+    else:
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME", str(home_directory() / ".config")))
+        if not config_home.is_absolute():
+            raise CleanupError("the user service config path is invalid")
+        config_home = Path(os.path.normpath(str(config_home)))
+    unit_dir = config_home / "systemd" / "user"
+    allowed_service_links = {
+        str(unit_dir / "rclone-degoo.service"),
+        str(unit_dir / "default.target.wants/rclone-degoo.service"),
+    }
+    if any(not isinstance(item, str) or item not in allowed_service_links for item in service_links) or len(set(service_links)) != len(service_links):
+        raise CleanupError("the install manifest contains an unexpected service link path")
     return manifest
 
 
 def _validate_layout(root: Path) -> dict[str, Any]:
     """Check the fixed install layout, private configs, and manifest."""
     _check_directory(root, private=True)
-    for name in ("bin", "config", "cache", "mount", "tools", "logs"):
+    for name in ("bin", "config", "cache", "mount", "tools", "tmp", "logs"):
         _check_directory(root / name)
 
     manifest = _validate_manifest(root)
-    for rel, maximum in (("config/vault.json", MAX_VAULT_SIZE), ("config/auth.json", MAX_MANIFEST_SIZE), ("config/rclone.conf", MAX_MANIFEST_SIZE)):
+    for rel, maximum in (("config/vault.json", MAX_VAULT_SIZE), ("config/auth.json", MAX_MANIFEST_SIZE), ("config/rclone.conf", MAX_MANIFEST_SIZE), ("config/mount.json", MAX_MANIFEST_SIZE), ("config/login.json", MAX_MANIFEST_SIZE)):
         path = root / rel
         try:
             _read_private_file(path, maximum, missing_ok=True)
@@ -183,6 +209,8 @@ def _validate_layout(root: Path) -> dict[str, Any]:
                 continue
             # Login state may be absent after logout.
             if rel == "config/auth.json":
+                continue
+            if rel in ("config/mount.json", "config/login.json"):
                 continue
             raise
 
@@ -199,6 +227,18 @@ def _validate_layout(root: Path) -> dict[str, Any]:
             raise CleanupError("the vault configuration is incomplete")
         if vault.get("cache_dir") != str(root / "cache"):
             raise CleanupError("the vault configuration points outside the isolated cache")
+
+    try:
+        mount_settings_bytes = _read_private_file(root / "config/mount.json", MAX_MANIFEST_SIZE, missing_ok=True)
+    except FileNotFoundError:
+        mount_settings_bytes = None
+    if mount_settings_bytes is not None:
+        mount_settings = _decode_json(mount_settings_bytes)
+        expected_settings = {"cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval", "verify_upload"}
+        if set(mount_settings) != expected_settings or type(mount_settings.get("verify_upload")) is not bool:
+            raise CleanupError("the mount settings are invalid")
+        if any(not isinstance(mount_settings.get(field), str) or not mount_settings[field] for field in expected_settings - {"verify_upload"}):
+            raise CleanupError("the mount settings are invalid")
 
     rclone_config = root / "config/rclone.conf"
     try:
@@ -284,6 +324,132 @@ def _mount_state(root: Path, points: set[str]) -> bool:
         if point.startswith(prefix) and point != mount_text:
             raise CleanupError("refusing cleanup while an unexpected mount exists inside the install")
     return active
+
+
+def _service_paths(root: Path, manifest: dict[str, Any]) -> tuple[Path, Path]:
+    config_text = manifest.get("service_config_home") or os.environ.get("XDG_CONFIG_HOME") or str(home_directory() / ".config")
+    config_home = Path(config_text)
+    if not config_home.is_absolute() or ".." in config_home.parts:
+        raise CleanupError("the user service config path is invalid")
+    directory = Path(os.path.normpath(str(config_home))) / "systemd/user"
+    return directory / "rclone-degoo.service", directory / "default.target.wants/rclone-degoo.service"
+
+
+def _service_link_target(path: Path, unit: Path) -> bool:
+    current = Path(path.anchor)
+    components = path.parts[1:]
+    for index, part in enumerate(components[:-1]):
+        current /= part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise CleanupError("a user service directory could not be inspected safely") from None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise CleanupError("symlink or non-directory components in the user service path are not allowed")
+        final_directory = index == len(components) - 2
+        if final_directory:
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise CleanupError("the user service directory has unsafe ownership or permissions")
+        else:
+            system_shared = info.st_uid == 0 and not (info.st_mode & 0o022)
+            sticky_temp = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+            if not (info.st_uid == os.getuid() or system_shared or sticky_temp) or (info.st_mode & 0o022 and not sticky_temp):
+                raise CleanupError("a user service path ancestor has unsafe ownership or permissions")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise CleanupError("a user service link could not be inspected safely") from None
+    if not stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        raise CleanupError("an expected user service path is occupied by an unowned file")
+    try:
+        target = Path(os.readlink(path))
+    except OSError:
+        raise CleanupError("a user service link could not be read") from None
+    if not target.is_absolute():
+        target = path.parent / target
+    return Path(os.path.normpath(str(target))) == unit
+
+
+def _validate_service_links(root: Path, manifest: dict[str, Any]) -> list[Path]:
+    direct, wanted = _service_paths(root, manifest)
+    unit = root / "rclone-degoo.service"
+    recorded = set(manifest.get("service_links", []))
+    links: list[Path] = []
+    for path in (direct, wanted):
+        if str(path) not in recorded:
+            continue
+        if _service_link_target(path, unit):
+            links.append(path)
+    return links
+
+
+def _systemctl_user(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LANG", "LC_ALL"}
+    }
+    env.setdefault("HOME", str(home_directory()))
+    env["PATH"] = "/usr/bin:/bin"
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=45,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise CleanupError("the owned user service could not be stopped safely") from None
+
+
+def _stop_owned_service(root: Path, manifest: dict[str, Any]) -> bool:
+    links = _validate_service_links(root, manifest)
+    if not links:
+        return False
+    unit = root / "rclone-degoo.service"
+    result = _systemctl_user("show", "--property=FragmentPath", "--value", "rclone-degoo.service")
+    if result.returncode != 0:
+        raise CleanupError("the owned user service could not be identified safely")
+    try:
+        fragment = Path(result.stdout.decode("utf-8").strip())
+    except UnicodeDecodeError:
+        raise CleanupError("systemd returned an invalid service path") from None
+    allowed_fragments = {str(unit)}
+    for path in links:
+        allowed_fragments.add(str(path))
+    if not fragment.is_absolute() or os.path.normpath(str(fragment)) not in allowed_fragments:
+        raise CleanupError("systemd resolved the service name to another unit")
+    result = _systemctl_user("disable", "--now", "rclone-degoo.service")
+    if result.returncode != 0:
+        raise CleanupError("the owned user service could not be stopped and disabled")
+    result = _systemctl_user("daemon-reload")
+    if result.returncode != 0:
+        raise CleanupError("systemd could not reload after disabling the owned service")
+    return True
+
+
+def _remove_owned_service_links(root: Path, manifest: dict[str, Any]) -> None:
+    direct, wanted = _service_paths(root, manifest)
+    unit = root / "rclone-degoo.service"
+    recorded = set(manifest.get("service_links", []))
+    for path in (wanted, direct):
+        if str(path) not in recorded:
+            continue
+        if _service_link_target(path, unit):
+            try:
+                os.unlink(path)
+            except OSError:
+                raise CleanupError("an owned user service link could not be removed") from None
+    for path in (direct, wanted):
+        if str(path) in recorded and os.path.lexists(path):
+            raise CleanupError("an owned user service link remains after cleanup")
 
 
 def _validate_helper_link(path: Path, *, require_executable: bool) -> Path:
@@ -441,7 +607,7 @@ def _pending_uploads(root: Path) -> tuple[int, int]:
                 stdout=output,
                 stderr=subprocess.DEVNULL,
                 env={
-                    "HOME": str(root),
+                    "HOME": str(home_directory()),
                     "XDG_CONFIG_HOME": str(root / "config"),
                     "XDG_CACHE_HOME": str(root / "cache"),
                     "TMPDIR": str(root / "logs"),
@@ -508,12 +674,44 @@ def _remove_root(root: Path) -> None:
         os.close(parent_fd)
 
 
+def _service_inventory(root: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    direct, wanted = _service_paths(root, manifest)
+    unit = root / "rclone-degoo.service"
+    recorded = set(manifest.get("service_links", []))
+    result: list[dict[str, Any]] = []
+    for path in (direct, wanted):
+        if str(path) not in recorded and not os.path.lexists(path):
+            continue
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            present = False
+            kind = "missing"
+            matches = False
+        except OSError:
+            present = False
+            kind = "unavailable"
+            matches = False
+        else:
+            present = True
+            kind = "symlink" if stat.S_ISLNK(info.st_mode) else "other"
+            matches = _service_link_target(path, unit) if kind == "symlink" else False
+        result.append({
+            "path": str(path),
+            "owned": str(path) in recorded and matches,
+            "present": present,
+            "type": kind,
+        })
+    return result
+
+
 def _inventory(root: Path, manifest: dict[str, Any], entries: list[dict[str, str]], mounted: bool) -> None:
     result = {
         "mode": "inventory",
         "root": str(root),
         "mounted": mounted,
         "files": entries,
+        "service_links": _service_inventory(root, manifest),
         "remote_data": "left untouched",
     }
     json.dump(result, sys.stdout, ensure_ascii=True, sort_keys=True)
@@ -538,12 +736,22 @@ def uninstall(args: argparse.Namespace) -> int:
         _inventory(root, layout["manifest"], entries, mounted)
         return 0
 
+    vault_exists = layout["vault_bytes"] is not None
     if args.vault_backup:
         _validate_backup(args.vault_backup, root, layout["vault_bytes"])
-    elif not args.discard_vault_secret:
+    elif vault_exists and not args.discard_vault_secret:
         raise CleanupError("local deletion requires --vault-backup or --discard-vault-secret")
 
-    if mounted:
+    config_exists = (root / "config/rclone.conf").exists()
+    binary_exists = (root / "bin/rclone").exists()
+    if vault_exists and config_exists and binary_exists:
+        files, size = _pending_uploads(root)
+        if files != 0 or size != 0:
+            raise CleanupError("pending local uploads remain; the install and cache were preserved")
+
+    # Check once before stopping a service, then check again under the cache lock.
+    _stop_owned_service(root, layout["manifest"])
+    if _mount_state(root, read_mountpoints()):
         _unmount(root)
     # Recheck the whole mount namespace after unmounting and before touching the cache.
     if _mount_state(root, read_mountpoints()):
@@ -554,9 +762,6 @@ def uninstall(args: argparse.Namespace) -> int:
     # Holding rclone's flock prevents a new mount from racing the status check.
     lock_fd = _acquire_cache_lock(root, 10 if mounted else 0)
     try:
-        vault_exists = layout["vault_bytes"] is not None
-        config_exists = (root / "config/rclone.conf").exists()
-        binary_exists = (root / "bin/rclone").exists()
         if vault_exists and config_exists and binary_exists:
             files, size = _pending_uploads(root)
             if files != 0 or size != 0:
@@ -583,6 +788,7 @@ def uninstall(args: argparse.Namespace) -> int:
             raise CleanupError("the isolated mountpoint could not be safely removed") from None
         if _mount_state(root, read_mountpoints()):
             raise CleanupError("a mount became active during cleanup")
+        _remove_owned_service_links(root, latest["manifest"])
         _remove_root(root)
     finally:
         os.close(lock_fd)
@@ -593,7 +799,7 @@ def uninstall(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True, help="isolated install root (must be ~/.local/share/rclone-degoo)")
+    parser.add_argument("--root", default=str(expected_root()), help="isolated install root (defaults to ~/.local/share/rclone-degoo)")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--delete-local", action="store_true", help="unmount safely and remove the isolated local install")
     actions.add_argument("--dry-run", action="store_true", help="inventory the install without changing it (the default)")

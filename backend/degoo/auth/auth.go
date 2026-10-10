@@ -37,6 +37,36 @@ const (
 // without an explicit login.
 var ErrLoginRequired = errors.New("degoo login required")
 
+// LoginRequiredError indicates that saved account authentication cannot be
+// renewed and the user must log in again.
+type LoginRequiredError struct {
+	statusCode int
+}
+
+// Error returns a sanitized login-required diagnostic.
+func (err *LoginRequiredError) Error() string {
+	if err == nil || err.statusCode == 0 {
+		return ErrLoginRequired.Error()
+	}
+	return fmt.Sprintf("%s (auth HTTP %d)", ErrLoginRequired, err.statusCode)
+}
+
+// Unwrap identifies this error as ErrLoginRequired.
+func (err *LoginRequiredError) Unwrap() error { return ErrLoginRequired }
+
+// StatusCode returns the authentication endpoint status, or zero if none was
+// received.
+func (err *LoginRequiredError) StatusCode() int {
+	if err == nil {
+		return 0
+	}
+	return err.statusCode
+}
+
+func loginRequired(statusCode int) error {
+	return &LoginRequiredError{statusCode: statusCode}
+}
+
 type tokenState struct {
 	Token        string `json:"token"`
 	RefreshToken string `json:"refresh_token"`
@@ -72,15 +102,12 @@ func New(client *http.Client, authFile, baseURL string) (*Client, error) {
 		api:      rest.NewClient(client).SetRoot(baseURL),
 		authFile: authFile,
 	}
-	data, err := ReadPrivateFile(authFile)
+	state, exists, err := readState(authFile)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return c, nil
-		}
 		return nil, fmt.Errorf("read Degoo auth state: %w", err)
 	}
-	if err := json.Unmarshal(data, &c.state); err != nil {
-		return nil, errors.New("degoo auth state is invalid")
+	if exists {
+		c.state = state
 	}
 	return c, nil
 }
@@ -90,6 +117,12 @@ func New(client *http.Client, authFile, baseURL string) (*Client, error) {
 func (c *Client) Token(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.state.Token != "" && !tokenExpired(c.state.Token, time.Now()) {
+		return c.state.Token, nil
+	}
+	if _, err := c.reloadStateLocked(""); err != nil {
+		return "", fmt.Errorf("reload Degoo auth state: %w", err)
+	}
 	if c.state.Token != "" && !tokenExpired(c.state.Token, time.Now()) {
 		return c.state.Token, nil
 	}
@@ -104,13 +137,40 @@ func (c *Client) Refresh(ctx context.Context, rejectedToken string) (string, err
 	if c.state.Token != "" && c.state.Token != rejectedToken {
 		return c.state.Token, nil
 	}
+	if _, err := c.reloadStateLocked(rejectedToken); err != nil {
+		return "", fmt.Errorf("reload Degoo auth state: %w", err)
+	}
+	if c.state.Token != "" && c.state.Token != rejectedToken {
+		return c.state.Token, nil
+	}
 	return c.refreshLocked(ctx)
+}
+
+// reloadStateLocked reads a different, unexpired private auth state when the
+// in-memory access token has expired or the server has rejected it. It never
+// replaces a usable in-memory token unless that token was rejected.
+func (c *Client) reloadStateLocked(rejectedToken string) (bool, error) {
+	currentExpired := c.state.Token == "" || tokenExpired(c.state.Token, time.Now())
+	currentRejected := rejectedToken != "" && c.state.Token == rejectedToken
+	if !currentExpired && !currentRejected {
+		return false, nil
+	}
+	state, exists, err := readState(c.authFile)
+	if err != nil || !exists || state == c.state {
+		return false, err
+	}
+	if state.Token == "" || tokenExpired(state.Token, time.Now()) {
+		return false, nil
+	}
+	c.state = state
+	return true, nil
 }
 
 func (c *Client) refreshLocked(ctx context.Context) (string, error) {
 	if c.state.RefreshToken == "" {
 		return "", ErrLoginRequired
 	}
+	previousState := c.state
 
 	status, body, err := c.requestJSON(ctx, refreshPath, map[string]string{
 		"RefreshToken": c.state.RefreshToken,
@@ -119,7 +179,13 @@ func (c *Client) refreshLocked(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusBadRequest {
-		return "", fmt.Errorf("%w: saved Degoo authentication was rejected", ErrLoginRequired)
+		if _, err := c.reloadStateLocked(previousState.Token); err != nil {
+			return "", fmt.Errorf("reload Degoo auth state: %w", err)
+		}
+		if c.state != previousState && c.state.Token != "" && !tokenExpired(c.state.Token, time.Now()) {
+			return c.state.Token, nil
+		}
+		return "", loginRequired(status)
 	}
 	if status < 200 || status >= 300 {
 		return "", fmt.Errorf("degoo token refresh failed (HTTP %d)", status)
@@ -144,11 +210,32 @@ func (c *Client) refreshLocked(ctx context.Context) (string, error) {
 	if response.RefreshToken != "" {
 		state.RefreshToken = response.RefreshToken
 	}
+	if savedState, exists, err := readState(c.authFile); err != nil {
+		return "", fmt.Errorf("reload Degoo auth state: %w", err)
+	} else if exists && savedState != previousState && savedState.Token != "" && !tokenExpired(savedState.Token, time.Now()) {
+		c.state = savedState
+		return savedState.Token, nil
+	}
 	if err := saveState(c.authFile, state); err != nil {
 		return "", fmt.Errorf("save Degoo auth state: %w", err)
 	}
 	c.state = state
 	return token, nil
+}
+
+func readState(path string) (tokenState, bool, error) {
+	data, err := ReadPrivateFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return tokenState{}, false, nil
+		}
+		return tokenState{}, false, err
+	}
+	var state tokenState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return tokenState{}, false, errors.New("degoo auth state is invalid")
+	}
+	return state, true, nil
 }
 
 // Login authenticates with an account password and saves only the returned

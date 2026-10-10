@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rclone/rclone/backend/degoo/auth"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/pacer"
@@ -294,16 +295,33 @@ type Error struct {
 
 // Error returns the API error's message.
 func (err *Error) Error() string {
+	var message string
 	if err.message != "" {
 		if err.statusCode != 0 {
-			return fmt.Sprintf("%s: %s (HTTP %d)", err.operation, err.message, err.statusCode)
+			message = fmt.Sprintf("%s: %s (HTTP %d)", err.operation, err.message, err.statusCode)
+		} else {
+			message = err.operation + ": " + err.message
 		}
-		return err.operation + ": " + err.message
+	} else if err.statusCode != 0 {
+		message = fmt.Sprintf("%s: HTTP request failed (status %d)", err.operation, err.statusCode)
+	} else {
+		message = err.operation + ": Degoo API request failed"
 	}
-	if err.statusCode != 0 {
-		return fmt.Sprintf("%s: HTTP request failed (status %d)", err.operation, err.statusCode)
+	if diagnostic := authDiagnostic(err.err); diagnostic != "" {
+		message += ": " + diagnostic
 	}
-	return err.operation + ": Degoo API request failed"
+	return message
+}
+
+func authDiagnostic(err error) string {
+	if !errors.Is(err, auth.ErrLoginRequired) {
+		return ""
+	}
+	var loginErr *auth.LoginRequiredError
+	if errors.As(err, &loginErr) && loginErr.StatusCode() != 0 {
+		return fmt.Sprintf("%s (auth HTTP %d)", auth.ErrLoginRequired, loginErr.StatusCode())
+	}
+	return auth.ErrLoginRequired.Error()
 }
 
 // Unwrap returns the underlying HTTP or transport error.

@@ -117,9 +117,17 @@ handling requires a newly acknowledged create and no pre-existing entry.
 The uninstall inventory passed against the installation; destructive uninstall
 was tested with offline fixtures and was not run on the active installation.
 
-Account-token lifetime, the live
-provider limit above 20 GiB, pagination beyond 1,000 entries, and failure
-recovery under Degoo's consistency model remain unverified. Keep all live
+The live access token had a one-hour lifetime. After expiry, the saved refresh
+token was rejected with HTTP 403. The status does not establish whether the
+refresh token expired, was revoked, or endpoint access was forbidden. The auth
+client now reports this safely and can adopt fresh tokens saved by interactive
+login. After fresh interactive login, an explicit renewal request succeeded
+and saved new private authentication state. A later metadata lookup renewed
+the saved token after its real expiry and completed successfully. Successful
+long-term unattended operation across repeated renewal cycles remains unverified.
+
+The live provider limit above 20 GiB, pagination beyond 1,000 entries, and
+failure recovery under Degoo's consistency model remain unverified. Keep all live
 writes inside the dedicated test folder, and do not claim release acceptance
 until the remaining gates pass.
 
@@ -127,3 +135,58 @@ The contained local installation and local-only uninstall procedure are
 documented in [INSTALLATION.md](INSTALLATION.md) and
 [contrib/degoo/README.md](../../contrib/degoo/README.md). Uninstall preserves
 remote encrypted objects deliberately.
+
+## Contained installer and persistent mount follow-up
+
+The follow-up adds cached-email login, private JSON mount settings, optional
+upload readback verification, setup/location commands, and a systemd user
+service. Validation completed:
+
+- `make quicktest BRANCH=degoo-persistent-install` passed with the freshly built
+  binary and contained FUSE helper on PATH. Focused race tests and the native
+  Linux FUSE test passed. The subsequent prompt-text and lint-only edits passed
+  focused command tests.
+- Degoo backend/auth/API and command lint passed with zero issues. Markdown
+  lint and `git diff --check` passed.
+- All 33 offline Python installer/login/setup/service/uninstall tests passed,
+  including preservation of secrets, cache and disabled verification during
+  upgrade; cached-email login without a second email prompt; service-link
+  ownership; and pending-upload refusal before service shutdown.
+- Systemd unit verification passed. On the real host, the user service was
+  enabled and exercised through stop, start, and restart. Older systemd reports
+  the unit's owned symlink as `FragmentPath`; validation accepts that recorded
+  link only when it targets the contained service file.
+- The live `create-vault` command created a uniquely named test folder beneath
+  the device container. Its ID was verified before empty-folder removal.
+- A generated 128 KiB file was written through the persistent mount with full
+  verification enabled, uploaded to zero pending files, and read back. An
+  overwrite with verification disabled also uploaded and matched readback
+  after remount. This latter read can use VFS cache and is not an independent
+  cloud integrity audit. The generated file was deleted and its absence
+  confirmed after another remount. Verification was restored to true.
+- The active installation's read-only uninstall inventory passed and recorded
+  both owned external service links. Destructive uninstall remains validated
+  with fixtures and was not run on the user's live vault.
+- The distributable packager self-check passed. Its explicit source allowlist
+  excludes account tokens, vault configurations, cached data, and runtime logs.
+
+These checks establish the contained installation and persistence behavior;
+they do not remove the long-term renewal and remaining live acceptance gates.
+
+## Information report follow-up
+
+The contained `info.sh` reports local mount/service state, private config paths
+and their roles, saved cache settings, pending writes, token expiry hints, and
+bounded disk/cache allocation estimates. The default report excludes the cloud
+mount and does not contact Degoo. An optional `--check-remote` checks only vault
+ancestry, suppresses raw provider errors, and may renew authentication.
+
+- All 44 offline information-report, installer, and uninstall tests passed.
+- The installed local report completed in under 0.1 seconds on the live host.
+  Mount and service were active, lingering was enabled, and pending uploads
+  were zero. Cache allocation and install allocation are reported separately.
+- The metadata-only remote check confirmed the configured vault location.
+  A saved access token that had genuinely expired was renewed successfully.
+- The updated secret-free Linux archive passed its packager self-check and an
+  offline install, local report, and complete uninstall using the real binary
+  under a temporary home. The archive includes the backend license notice.

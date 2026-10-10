@@ -7,6 +7,7 @@ import fcntl
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,12 +25,12 @@ class UninstallTest(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.home = self.base / "home"
         self.home.mkdir(mode=0o700)
-        self.env = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        self.env = mock.patch.dict(os.environ, {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config")})
         self.env.start()
         self.addCleanup(self.env.stop)
 
         self.root = self.home / ".local" / "share" / "rclone-degoo"
-        for name in ("bin", "config", "cache", "mount", "tools", "logs"):
+        for name in ("bin", "config", "cache", "mount", "tools", "tmp", "logs"):
             path = self.root / name
             path.mkdir(parents=True, mode=0o700)
             path.chmod(0o700)
@@ -59,6 +60,8 @@ class UninstallTest(unittest.TestCase):
             "rclone_config": "config/rclone.conf",
             "cache_dir": "cache",
             "pidfile": "mount.pid",
+            "service_config_home": str(self.home / ".config"),
+            "service_links": [],
         }, sort_keys=True).encode() + b"\n")
         self.write_rclone("Pending local uploads: 0 files, 0 bytes")
         (self.root / "tools/fusermount3").symlink_to("/usr/bin/fusermount3")
@@ -100,6 +103,14 @@ class UninstallTest(unittest.TestCase):
         self.assertNotIn("test-only-token", stdout)
         self.assertNotIn("generated-test-folder-id", stdout)
         self.assertTrue(self.root.exists())
+
+    def test_default_root_is_the_contained_install(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = uninstall.main([])
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertEqual(json.loads(stdout.getvalue())["root"], str(self.root))
 
     def test_local_delete_requires_a_vault_backup_or_explicit_discard(self) -> None:
         code, _, stderr = self.invoke("--delete-local")
@@ -211,6 +222,7 @@ class UninstallTest(unittest.TestCase):
         manifest_path = self.root / "install.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["root_folder_id"] = ""
+        manifest["remote_folder_name"] = ""
         manifest["remote_created_by_setup"] = False
         self.write_private(manifest_path, json.dumps(manifest, sort_keys=True).encode() + b"\n")
         code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
@@ -232,6 +244,19 @@ class UninstallTest(unittest.TestCase):
         self.assertIn("cache is not empty", stderr)
         self.assertTrue(self.root.exists())
 
+    def test_staged_install_without_vault_secret_can_be_removed_if_cache_is_empty(self) -> None:
+        (self.root / "config/vault.json").unlink()
+        (self.root / "config/rclone.conf").unlink()
+        manifest_path = self.root / "install.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["root_folder_id"] = ""
+        manifest["remote_folder_name"] = ""
+        manifest["remote_created_by_setup"] = False
+        self.write_private(manifest_path, json.dumps(manifest, sort_keys=True).encode() + b"\n")
+        code, _, stderr = self.invoke("--delete-local")
+        self.assertEqual(code, 0, stderr)
+        self.assertFalse(self.root.exists())
+
     def test_success_removes_only_install_root_after_zero_status(self) -> None:
         backup = self.backup()
         outside = self.base / "outside.txt"
@@ -242,6 +267,87 @@ class UninstallTest(unittest.TestCase):
         self.assertFalse(self.root.exists())
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
         self.assertTrue(backup.exists())
+
+    def _add_owned_service_links(self) -> tuple[Path, Path, Path]:
+        config_home = self.home / ".config"
+        unit_dir = config_home / "systemd/user"
+        wants_dir = unit_dir / "default.target.wants"
+        wants_dir.mkdir(parents=True, mode=0o700)
+        for directory in (config_home, config_home / "systemd", unit_dir, wants_dir):
+            directory.chmod(0o700)
+        unit = self.root / "rclone-degoo.service"
+        self.write_private(unit, b"[Service]\n")
+        direct = unit_dir / "rclone-degoo.service"
+        wanted = wants_dir / "rclone-degoo.service"
+        direct.symlink_to(unit)
+        wanted.symlink_to(unit)
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["service_links"] = [str(direct), str(wanted)]
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+        return direct, wanted, unit
+
+    def _fake_systemctl(self, direct: Path, wanted: Path, unit: Path):
+        calls: list[list[str]] = []
+        real_run = subprocess.run
+
+        def run(command: list[str], **kwargs: object):
+            if command[0] != "systemctl":
+                return real_run(command, **kwargs)
+            args = command[2:]
+            calls.append(args)
+            if args[0] == "show":
+                stdout = str(direct).encode()
+            else:
+                stdout = b""
+            if args[0] == "disable":
+                for path in (wanted, direct):
+                    if path.is_symlink():
+                        path.unlink()
+            return uninstall.subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=b"")
+
+        return calls, run
+
+    def test_dry_run_lists_external_owned_service_links(self) -> None:
+        direct, wanted, _ = self._add_owned_service_links()
+        code, stdout, stderr = self.invoke()
+        self.assertEqual(code, 0, stderr)
+        links = json.loads(stdout)["service_links"]
+        self.assertEqual({entry["path"] for entry in links}, {str(direct), str(wanted)})
+        self.assertTrue(all(entry["owned"] and entry["present"] for entry in links))
+        self.assertTrue(direct.is_symlink())
+        self.assertTrue(wanted.is_symlink())
+
+    def test_pending_upload_check_happens_before_stopping_service(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        self.write_rclone("Pending local uploads: 1 files, 12 bytes")
+        calls, fake = self._fake_systemctl(direct, wanted, unit)
+        with mock.patch.object(uninstall.subprocess, "run", side_effect=fake):
+            code, _, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+        self.assertEqual(code, 2)
+        self.assertIn("pending local uploads remain", stderr)
+        self.assertEqual(calls, [])
+        self.assertTrue(direct.is_symlink())
+        self.assertTrue(wanted.is_symlink())
+        self.assertTrue(self.root.exists())
+
+    def test_uninstall_disables_and_removes_only_its_external_service_links(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        unrelated = direct.parent / "other.service"
+        unrelated.write_text("keep", encoding="ascii")
+        backup = self.backup()
+        calls, fake = self._fake_systemctl(direct, wanted, unit)
+        with (
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, stdout, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("Remote encrypted files were left untouched", stdout)
+        self.assertFalse(self.root.exists())
+        self.assertFalse(direct.exists())
+        self.assertFalse(wanted.exists())
+        self.assertEqual(unrelated.read_text(encoding="ascii"), "keep")
+        self.assertEqual([call[0] for call in calls], ["show", "disable", "daemon-reload"])
 
 
 if __name__ == "__main__":
