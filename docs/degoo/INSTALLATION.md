@@ -1,46 +1,141 @@
 # Contained Degoo installation
 
-See [DEGOO.md](../../DEGOO.md) for the shortest installation path. The installer
-requires Python 3, Linux FUSE, and this fork's rclone binary. Upstream rclone
-cannot mount this vault. Systemd is required only for the persistent service.
+See [DEGOO.md](../../DEGOO.md) for the quick start. The installer creates an
+isolated Linux client under `~/.local/share/rclone-degoo`; it does not change a
+normal rclone installation. Upstream rclone does not include this fork's Degoo
+vault commands.
 
-## Install a new vault
+## Requirements
 
-From this repository, build and install:
+To mount the vault, the system needs:
+
+- Linux and Python 3.10 or newer.
+- FUSE 3, or a compatible `fusermount` helper, plus a readable and writable
+  `/dev/fuse` device.
+- The `mountpoint` command from `util-linux`.
+- This fork's rclone binary, either built from this repository or supplied in
+  the prebuilt Linux archive.
+
+Go 1.26 or newer is needed only when building from source. It is not needed to
+install or run the prebuilt archive. A working systemd user manager is optional
+and is needed only for the background user service. Without it, use the
+foreground mount command.
+
+The shell launcher offers to install Python 3 if the required version is not
+available. The wizard checks mount dependencies and can offer to use a detected
+`apt-get`, `dnf`, `pacman`, or `zypper` package manager for missing `fuse3` or
+`util-linux`. Installing system packages may require `sudo` or root access. If
+you decline or the system manager is unavailable, vault configuration can
+still finish, but mounting requires installing the missing dependencies first.
+The installer cannot create `/dev/fuse` when the kernel or system policy has
+not made it available; ask the system administrator to enable FUSE in that
+case. The wizard will not enable the service while mount dependencies are
+unavailable.
+
+## Start the installer
+
+From a repository checkout, start the installer. If no built binary is
+available, the wizard offers to build it from the checkout when a suitable Go
+toolchain is installed:
 
 ```sh
-go build -o rclone .
-python3 contrib/degoo/install.py --binary ./rclone
-~/.local/share/rclone-degoo/login.sh
-~/.local/share/rclone-degoo/folders.sh
-~/.local/share/rclone-degoo/setup.sh --parent-id DEVICE_ID --name EncryptedVault
+./contrib/degoo/install.sh
 ```
 
-Choose a device container ID from the folder listing. Account root ID `0`
-cannot hold a vault. Setup creates a new dedicated directory with the
-provider-specific marker needed by this backend. It refuses to repurpose an
-existing directory with the same name. Existing native Degoo files cannot be
-read as encrypted vault files.
-
-Setup generates a cryptographically random encryption password. Preserve a
-private backup of `config/vault.json` outside the installation before storing
-important data. The Degoo account password and vault encryption password have
-separate roles; account passwords are never saved.
-
-To install an existing compatible encrypted vault, supply its folder ID and
-securely transferred vault configuration:
+The interactive wizard can also be requested explicitly, including when
+passing a binary path:
 
 ```sh
-python3 contrib/degoo/install.py --binary ./rclone \
-  --folder-id EXISTING_VAULT_ID --vault-config ~/private-backups/degoo-vault.json
-~/.local/share/rclone-degoo/login.sh
+./contrib/degoo/install.sh --wizard --binary ./rclone
 ```
 
-The encryption password, optional salt, chunk size, and object cap are
-preserved. Local remote and cache paths are adapted to this installation.
-The encryption password alone is insufficient to locate a remote vault: you
-also need its folder ID and matching format settings. One machine should write
-to a vault at a time.
+From a matching prebuilt archive, extract it and run its top-level launcher:
+
+```sh
+tar -xzf rclone-degoo-linux-ARCH.tar.gz
+cd rclone-degoo
+./install.sh
+```
+
+With no arguments in a terminal, `install.sh` starts the wizard. It checks the
+dependencies, selects or confirms a Degoo folder, creates or imports a vault,
+and offers to enable the user service when a systemd user manager is available.
+The default install root is `~/.local/share/rclone-degoo`.
+
+For automation or a staged install, the existing `--binary` command-line path
+is still available. `--no-wizard` skips the wizard so a client can be staged
+before login and vault setup:
+
+```sh
+./contrib/degoo/install.sh --binary ./rclone --no-wizard
+```
+
+After a staged install, log in and finish setup with the contained helpers:
+
+```sh
+~/.local/share/rclone-degoo/login.sh
+~/.local/share/rclone-degoo/folders.sh --parent-id 0
+~/.local/share/rclone-degoo/setup.sh --parent-id DEVICE_ID --name rclone-degoo-vault
+```
+
+## Choose a dedicated vault folder
+
+The wizard lists folders under account root ID `0` to discover the account's
+device folders. A live create request under ID `0` is rejected, so the wizard
+suggests the first discovered category-1 device folder as the parent, or the
+first selectable folder if no category-1 entry is returned. Choose a listed
+device/folder or enter its ID. The new dedicated child folder defaults to
+`rclone-degoo-vault`. Account root ID `0` is never accepted as the vault folder
+or as the create parent.
+
+You may select an existing dedicated folder instead of creating a new one.
+Existing native Degoo files are not encrypted-vault files and cannot be read
+as such. Setup creates the provider-specific marker for a new vault and will
+not repurpose an existing folder with the same name.
+
+The wizard generates a cryptographically random vault encryption password for
+a new vault. Keep a private backup of `config/vault.json` outside the install
+before saving important data. Degoo account credentials and the vault password
+serve separate purposes; account passwords are never stored.
+
+To use an existing compatible encrypted vault on another machine, import its
+private vault configuration and select the same dedicated folder. The password,
+optional salt, chunk size, and object cap are preserved; local remote and cache
+paths are adapted. The password alone is not enough to locate or decrypt a
+vault: keep its folder ID and format settings together. Only one machine should
+write to a vault at a time.
+
+Provide the existing folder and configuration when starting the wizard:
+
+```sh
+./contrib/degoo/install.sh --wizard --binary ./rclone \
+  --folder-id EXISTING_VAULT_ID --vault-config ~/private-backups/vault.json
+```
+
+## Defaults
+
+The installer uses `~/.local/share/rclone-degoo` as the private root and sets
+its directories to owner-only access (`0700`) and private config files to
+`0600`. The wizard offers to enable the systemd user service by default when a
+user manager responds. It does not enable lingering automatically.
+
+For a new vault, the default chunk size is 1 GiB of plaintext and the
+provisional maximum encrypted object size is 19 GiB. The provider's live limit
+above 20 GiB has not been established. The initial `config/mount.json` values
+are:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `cache_max_size` | `20G` | Soft target for the amount of cached data. Open and dirty files are not evicted to meet it. |
+| `cache_min_free_space` | `20G` | Keep this much free space on the filesystem holding the cache when evicting clean data. |
+| `cache_max_age` | `10m` | Maximum age for clean cached data before it becomes eligible for eviction. |
+| `cache_poll_interval` | `5s` | Interval for checking remote changes while the vault is mounted. |
+| `verify_upload` | `true` | Download each encrypted upload and compare its size and SHA-256 before publication. |
+
+Change these values in `config/mount.json` and restart the mount or service to
+apply them. Cache limits are targets: open files and pending writes remain in
+the cache. A newly written logical file is staged locally in full even when
+remote storage splits it into chunks.
 
 ## Files and permissions
 
@@ -48,64 +143,45 @@ to a vault at a time.
 ~/.local/share/rclone-degoo/
   bin/rclone          dedicated executable
   config/auth.json    access and refresh tokens
-  config/login.json   remembered account email; no account password
-  config/vault.json   encryption secret and vault format settings
-  config/rclone.conf  dedicated remote and folder ID
-  config/mount.json   cache limits and upload verification
-  cache/              persistent plaintext VFS cache, lock, and identity
-  mount/              plaintext filesystem while mounted
+  config/login.json   remembered account email, no account password
+  config/vault.json   vault secret and format settings
+  config/rclone.conf  isolated remote and folder ID
+  config/mount.json   cache and upload settings
+  cache/              persistent plaintext VFS cache and lock
+  mount/              plaintext view while mounted
   tools/              contained FUSE helper alias
   tmp/                temporary upload files
   logs/               private runtime logs
-  install.json        installation inventory
+  scripts/python/     contained installer and command helpers
+  install.json        local identity and owned service links
   rclone-degoo.service user service definition
-  login.sh            interactive login; --clear-email forgets the email
-  folders.sh          list setup parent folders
-  setup.sh            create and configure a new dedicated vault
-  location.sh         show the vault's remote ancestor folders
-  mount.sh            foreground mount launcher
-  status.sh           pending-upload status
-  info.sh             local mount, cache, disk, config, and auth overview
-  stop.sh             stop/unmount the vault
-  service.sh          enable, disable, start, stop, restart, or inspect service
-  uninstall.py        local cleanup tool
+  *.sh                convenience launchers for login, mount, status, etc.
 ```
 
-Installation directories are owner-private (`0700`); configuration files are
-`0600`. `install -d -m 700 DIR` creates a directory and sets these permissions;
-it does not install a package. Neither the normal rclone configuration nor
-shell profiles are changed. Runtime Python bytecode and temporary upload files
-stay contained or are disabled.
+The installer does not alter the normal rclone config or shell profiles.
+Runtime Python bytecode and temporary upload files stay contained or are
+disabled.
 
-## Login and recovery
+## Login, mount, and recovery
 
-```sh
-~/.local/share/rclone-degoo/login.sh
-~/.local/share/rclone-degoo/login.sh --clear-email
-```
+Run `~/.local/share/rclone-degoo/login.sh` to authenticate. The helper remembers
+the email in `config/login.json` with owner-only permissions, but never saves
+the account password. Use `login.sh --clear-email` to forget the email without
+removing existing tokens or vault settings.
 
-Login prompts with the remembered email and explains how to forget it. The
-password prompt identifies the account. Clearing the email leaves existing
-authentication tokens and encryption settings intact. Access tokens refresh
-automatically when nearing expiry. If Degoo rejects refresh, the mount reports
-that login is required. Run the login script again; the authentication client
-can load freshly saved credentials. Restarting the service is also supported.
+Access tokens refresh automatically when nearing expiry. If Degoo rejects a
+refresh, the mount reports that login is needed. Run the login helper again;
+the authentication client can load the newly saved credentials. Long-term
+unattended renewal has not been verified: a live one-hour access token expired
+and renewal returned HTTP 403, though fresh login and renewal then succeeded.
 
-This account's live renewal returned HTTP 403 after a one-hour access token
-expired. Fresh interactive login and renewal of the new session succeeded.
-Successful long-term unattended renewal remains unverified. The
-service does not retain your account password to work around rejected refresh.
-
-## Mount and persist
-
-For a manual mount, keep this command running in a shell:
+Use the mount launcher for a foreground session:
 
 ```sh
 ~/.local/share/rclone-degoo/mount.sh
 ```
 
-The mountpoint is an ordinary empty directory when unmounted; data is stored
-in Degoo and the local cache. Use the user service for unattended operation:
+Or use the user service:
 
 ```sh
 ~/.local/share/rclone-degoo/service.sh enable
@@ -113,9 +189,8 @@ in Degoo and the local cache. Use the user service for unattended operation:
 ~/.local/share/rclone-degoo/service.sh restart
 ```
 
-Enabling starts the service and starts it again when your user manager starts.
-To start at boot before login and keep running after logout, check and enable
-lingering as needed:
+The service starts at login. To keep it running after logout and start it at
+boot, check and enable account lingering if needed:
 
 ```sh
 loginctl show-user "$USER" -p Linger
@@ -123,101 +198,74 @@ loginctl enable-linger "$USER"
 ```
 
 The latter may require administrator authorization. No root mount service is
-installed. The installer does not change lingering automatically. Service
-links are the only installation artifacts outside the contained directory;
-the service file itself stays inside it. The service restarts after process
-failures, but an authentication failure during ordinary operations may leave
-an active mount that cannot read Degoo until login succeeds.
+installed. The service restarts after process failures, but an authentication
+failure during ordinary operations can leave an active mount unable to read
+Degoo until login succeeds. Keep only one mount process using this cache.
 
-Use `service.sh disable` to stop the service and remove automatic startup.
-Keep only one mount process for this cache. Before replacing a binary, stop the
-service or manual mount and use the installer's upgrade operation. Upgrade
-preserves credentials, the vault secret, cache, and existing mount settings.
-
-## Information report
+Before replacing the binary, stop the service or manual mount and upgrade from
+the repository:
 
 ```sh
-~/.local/share/rclone-degoo/info.sh
-~/.local/share/rclone-degoo/info.sh --check-remote
+./contrib/degoo/install.sh --binary /path/to/rclone --upgrade --no-wizard
 ```
 
-The default report uses local state. It shows the mounted directory, cached
-remote location, service state, config file locations and roles, cache settings
-and their effects, pending uploads, token expiry, and local disk usage. It never
-prints passwords, salts, email addresses, account tokens, or signed URLs.
+Upgrade preserves the vault secret, account tokens, email, remote settings,
+mount settings, and cache; it refuses a change to the folder ID.
 
-Local size estimates use a bounded scan that excludes the cloud mount and does
-not follow symlinks. Sparse cache files are counted by their allocated blocks.
-Outside usage means other data on the same local filesystem; it is not a scan
-of your home or server. Truncated scans are labelled approximate.
+## Inspect local status
 
-`--check-remote` additionally performs a bounded metadata-only lookup of the
-vault and its ancestors. It can establish whether credentials currently work
-or a fresh login is required, and update the displayed remote location. It
-does not download file contents or enumerate the cloud to calculate its size.
-Zero pending uploads indicates no dirty local writes, rather than an
-independent remote integrity audit.
+`~/.local/share/rclone-degoo/info.sh` reports the mount and service state,
+configuration locations and roles, cache settings, pending uploads, token
+expiry, and local disk use. The default report is local-only and never prints
+passwords, salts, email addresses, account tokens, or signed URLs. Its bounded
+size scan excludes the cloud mount and does not follow symlinks.
 
-## Cache settings and verification
+Use `info.sh --check-remote` for an optional bounded metadata lookup of the
+vault and ancestor folders. It may refresh account authentication; it does not
+download file contents or enumerate the cloud to calculate its size. Zero
+pending uploads means there are no local dirty writes, not that remote data
+passed an independent integrity audit.
 
-Edit `config/mount.json`, then restart the service:
+## Uninstall
 
-```json
-{
-  "cache_max_size": "20G",
-  "cache_min_free_space": "20G",
-  "cache_max_age": "10m",
-  "cache_poll_interval": "5s",
-  "verify_upload": true
-}
-```
-
-The contained launcher passes this file through `--settings`. Explicit mount
-flags take precedence, for example:
+The explicit inventory command inspects the installation without changing it:
 
 ```sh
-~/.local/share/rclone-degoo/mount.sh --vfs-cache-max-size 40G --verify-upload=false
+~/.local/share/rclone-degoo/uninstall.sh --inventory
 ```
 
-With verification enabled, each registered encrypted upload is downloaded and
-compared against its full size and SHA-256 before publication. Disabling it
-skips this payload download; metadata, identity, size, and publication checks
-remain. It reduces bandwidth and latency while weakening immediate detection
-of corrupted uploads. Authenticated encryption still detects ciphertext damage
-when reading the affected data. The raw backend also exposes the advanced
-`--degoo-skip-upload-verification` flag; use the mount setting for the vault.
+In a terminal, running `uninstall.sh` with no arguments starts the cleanup
+wizard; use `--wizard` to request it explicitly. The wizard offers to retain the
+vault/account configuration, cache, and logs in a private backup directory
+outside the install. Each retention choice defaults to No. It asks for
+confirmation before discarding a vault secret and before removing the local
+install. If the cache has pending uploads, cleanup refuses to discard them;
+keep both the cache and its matching configuration in the backup or resume
+cleanup after uploads finish. A default backup directory is suggested and
+selected state is copied there with private permissions. The backup includes
+the binary and install identity when pending uploads are retained, so local
+changes can be recovered. If you choose not to retain a vault config, type
+`DISCARD` to confirm losing the local secret. Type `REMOVE` to confirm local
+cleanup.
 
-Cache targets are soft limits. Open and dirty files cannot be evicted. A newly
-written logical file is staged in full locally, even though remote storage
-uses smaller chunks. Upload starts after the file is closed. Reads cache the
-requested ranges and read-ahead. Keep the cache until `status.sh` reports zero
-pending uploads; it can contain the only copy of unuploaded changes.
-
-## Cleanup
-
-First inspect the installation without deleting anything:
+To resume uploads, restore the retained backup contents into
+`~/.local/share/rclone-degoo`, then run this from a source checkout:
 
 ```sh
-python3 ~/.local/share/rclone-degoo/uninstall.py
+./contrib/degoo/install.sh \
+  --binary ~/.local/share/rclone-degoo/bin/rclone --upgrade --no-wizard
 ```
 
-Preserve a private copy of `config/vault.json` outside the installation, then:
+The cleanup is local only: it removes this installation and its owned systemd
+links, but leaves remote encrypted files and Degoo account data untouched. It
+does not disable account-wide lingering. If you enabled lingering solely for
+this service, you can disable it separately with
+`loginctl disable-linger "$USER"` after considering your other user services.
 
-```sh
-python3 ~/.local/share/rclone-degoo/uninstall.py \
-  --delete-local --vault-backup ~/private-backups/degoo-vault.json
-```
-
-The uninstaller verifies the backup, refuses pending uploads and unsafe paths,
-stops the owned service, removes its owned links, and removes the contained
-installation. It leaves unrelated service files and account settings alone.
-The explicit `--discard-vault-secret` alternative permits deletion without a
-backup; losing the encryption secret makes the remote files unreadable.
-
-Remote encrypted objects and Degoo sessions remain untouched. Uninstall does
-not disable an existing account-wide lingering setting. A lingering setting
-you enabled solely for this service can be disabled separately with
-`loginctl disable-linger "$USER"`, after considering your other user services.
-The checkout and shared Go toolchain/module/build caches are development
-resources outside the vault installation and are not removed. Installing a
-prebuilt binary avoids those development artifacts.
+The noninteractive cleanup command remains available through the Python helper
+at `contrib/degoo/scripts/python/uninstall.py`. Use `--keep-config`,
+`--keep-cache`, and `--keep-logs` with `--delete-local` to select data for
+retention. It also supports an exact private `--vault-backup` or the explicit
+`--discard-vault-secret` choice when deleting the only local copy. It refuses
+active mounts, cache locks, unsafe paths, and pending uploads unless both cache
+and matching configuration are retained in a private backup.

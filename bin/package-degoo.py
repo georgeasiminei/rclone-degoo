@@ -17,19 +17,25 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT_NAME = "rclone-degoo"
-REQUIRED_FILES = (
-    "DEGOO.md",
-    "contrib/degoo/install.py",
-    "contrib/degoo/login.py",
-    "contrib/degoo/setup.py",
-    "contrib/degoo/service.py",
-    "contrib/degoo/info.py",
-    "backend/degoo/NOTICE",
-    "contrib/degoo/uninstall.py",
-    "contrib/degoo/README.md",
-    "docs/degoo/INSTALLATION.md",
-    "docs/degoo/USAGE.md",
-    "docs/degoo/VALIDATION.md",
+PYTHON_HELPERS = (
+    "install.py",
+    "login.py",
+    "setup.py",
+    "service.py",
+    "info.py",
+    "uninstall.py",
+    "wizard.py",
+)
+PACKAGE_ENTRIES = (
+    ("DEGOO.md", "DEGOO.md"),
+    ("contrib/degoo/install.sh", "install.sh"),
+    ("contrib/degoo/uninstall.sh", "uninstall.sh"),
+    *((f"contrib/degoo/scripts/python/{name}", f"scripts/python/{name}") for name in PYTHON_HELPERS),
+    ("backend/degoo/NOTICE", "backend/degoo/NOTICE"),
+    ("contrib/degoo/README.md", "contrib/degoo/README.md"),
+    ("docs/degoo/INSTALLATION.md", "docs/degoo/INSTALLATION.md"),
+    ("docs/degoo/USAGE.md", "docs/degoo/USAGE.md"),
+    ("docs/degoo/VALIDATION.md", "docs/degoo/VALIDATION.md"),
 )
 LICENSE_FILES = ("LICENSE", "COPYING")
 HELP_TIMEOUT_SECONDS = 30
@@ -38,27 +44,49 @@ Encrypted Degoo vault for Linux
 
 This archive contains a prebuilt rclone executable for the Linux architecture
 named in the archive filename. Go is not required to install or use it. Use a
-binary that matches your machine's Linux architecture. Python 3 and Linux FUSE
-are required.
+binary that matches your machine's Linux architecture. The installer requires
+Python 3.10 or newer. Mounting also requires FUSE 3 or a compatible fusermount
+helper, readable and writable /dev/fuse, and the mountpoint utility from
+util-linux. A systemd user manager is optional and is used only for the
+persistent service.
 
-From the extracted archive directory, install the contained client:
+From the extracted archive directory, start the guided installer:
 
-    python3 contrib/degoo/install.py --binary ./rclone
+    ./install.sh
 
-Then log in, choose a device folder, create the dedicated encrypted vault, and
-enable the user service:
+With no arguments in a terminal, the installer opens the wizard. You can also
+request it explicitly with --wizard. It checks dependencies and offers to
+install missing packages through a detected apt-get, dnf, pacman, or zypper
+package manager. Vault setup can continue when mount dependencies are
+unavailable, but the service will not be enabled until they are ready. It
+suggests a discovered Degoo device folder and the name rclone-degoo-vault for a
+new dedicated vault. Account root ID 0 is only used to list device folders; it
+cannot be selected as the vault parent.
+
+For unattended or staged installs, pass --binary and optionally --no-wizard:
+
+    ./install.sh --binary ./rclone --no-wizard
+
+You can then log in and finish setup manually:
 
     ~/.local/share/rclone-degoo/login.sh
-    ~/.local/share/rclone-degoo/folders.sh
-    ~/.local/share/rclone-degoo/setup.sh --parent-id DEVICE_ID --name EncryptedVault
+    ~/.local/share/rclone-degoo/folders.sh --parent-id 0
+    ~/.local/share/rclone-degoo/setup.sh --parent-id DEVICE_ID --name rclone-degoo-vault
     ~/.local/share/rclone-degoo/service.sh enable
     ~/.local/share/rclone-degoo/info.sh
 
+To inspect an installed copy without changing it, run
+~/.local/share/rclone-degoo/uninstall.sh --inventory. Run
+~/.local/share/rclone-degoo/uninstall.sh in a terminal to start the guided
+local cleanup flow. Retained settings, cache, and logs are copied to a private
+backup directory. Cleanup never removes remote Degoo data and refuses to
+discard pending local uploads.
+
 The installer keeps account credentials, vault settings, cache, logs, and
 runtime files inside ~/.local/share/rclone-degoo. This archive contains only
-the executable, installer sources, documentation, and license files. It does
-not contain account tokens, configuration, logs, caches, or other runtime
-state.
+the executable, launchers, Python helper sources, documentation, and license
+files. It does not contain account tokens, configuration, logs, caches, tests,
+or other runtime state.
 
 Read DEGOO.md and docs/degoo/INSTALLATION.md before using the vault. Each user
 must create or import their own dedicated vault and protect a backup of its
@@ -76,21 +104,21 @@ def repository_root() -> Path:
 
 def package_sources(root: Path) -> list[tuple[Path, str]]:
     """Return the explicit documentation and installer allowlist."""
-    selected = list(REQUIRED_FILES)
-    licenses = [name for name in LICENSE_FILES if (root / name).exists()]
+    selected = list(PACKAGE_ENTRIES)
+    licenses = [(name, name) for name in LICENSE_FILES if (root / name).exists()]
     if not licenses:
         raise PackageError("no LICENSE or COPYING file is available for the archive")
     selected.extend(licenses)
 
     missing: list[str] = []
     entries: list[tuple[Path, str]] = []
-    for relative in selected:
+    for relative, package_path in selected:
         source = root / relative
         info = safe_source_info(root, relative)
         if info is None:
             missing.append(relative)
             continue
-        arcname = PurePosixPath(ROOT_NAME, *PurePosixPath(relative).parts).as_posix()
+        arcname = PurePosixPath(ROOT_NAME, *PurePosixPath(package_path).parts).as_posix()
         entries.append((source, arcname))
     if missing:
         missing_text = ", ".join(missing)
@@ -211,7 +239,8 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
                     add_bytes(archive, f"{ROOT_NAME}/INSTALL.txt", INSTALL_TEXT.encode("utf-8"))
                     for source, arcname in sources:
                         with source.open("rb") as stream:
-                            archive.addfile(tar_info(arcname, source.stat().st_size, 0o644), stream)
+                            mode = 0o755 if PurePosixPath(arcname).name in {"install.sh", "uninstall.sh"} else 0o644
+                            archive.addfile(tar_info(arcname, source.stat().st_size, mode), stream)
             raw.flush()
             os.fsync(raw.fileno())
         os.chmod(temp_name, 0o644)
@@ -250,13 +279,13 @@ def self_check(root: Path) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
 
-        missing_source = fixture_root / "contrib/degoo/install.py"
+        missing_source = fixture_root / "contrib/degoo/scripts/python/install.py"
         hidden_source = missing_source.with_suffix(".missing")
         missing_source.rename(hidden_source)
         try:
             package_sources(fixture_root)
         except PackageError as exc:
-            if "contrib/degoo/install.py" not in str(exc):
+            if "contrib/degoo/scripts/python/install.py" not in str(exc):
                 raise PackageError("self-check did not identify a missing installer source") from None
         else:
             raise PackageError("self-check did not reject a missing installer source")
@@ -304,13 +333,22 @@ def self_check(root: Path) -> None:
             binary_info = archive.getmember(f"{ROOT_NAME}/rclone")
             if not binary_info.mode & 0o111:
                 raise PackageError("self-check found a non-executable packaged binary")
+            for launcher in (f"{ROOT_NAME}/install.sh", f"{ROOT_NAME}/uninstall.sh"):
+                launcher_info = archive.getmember(launcher)
+                if not launcher_info.mode & 0o111:
+                    raise PackageError(f"self-check found a non-executable launcher: {launcher}")
             install_data = archive.extractfile(f"{ROOT_NAME}/INSTALL.txt")
             if install_data is None:
                 raise PackageError("self-check could not read INSTALL.txt")
             install_text = install_data.read().decode("utf-8")
             for required in (
                 "Go is not required",
-                "contrib/degoo/install.py --binary ./rclone",
+                "./install.sh",
+                "--wizard",
+                "--no-wizard",
+                "Python 3.10 or newer",
+                "install missing packages",
+                "uninstall.sh --inventory",
                 "login.sh",
                 "folders.sh",
                 "setup.sh",

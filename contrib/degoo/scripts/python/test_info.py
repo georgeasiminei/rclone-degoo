@@ -246,7 +246,7 @@ class InfoTest(unittest.TestCase):
         with mock.patch.object(install, "validate_binary"):
             args = install.build_parser().parse_args(["--binary", str(binary), "--folder-id", "folder-id"])
             self.assertEqual(install.install(args), 0)
-        installed = self.root / "info.py"
+        installed = self.root / "scripts/python/info.py"
         self.assertTrue(installed.is_file())
         wrapper = (self.root / "info.sh").read_text(encoding="utf-8")
         self.assertIn("exec python3", wrapper)
