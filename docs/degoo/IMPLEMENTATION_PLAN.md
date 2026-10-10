@@ -1,6 +1,56 @@
 # Degoo private vault implementation plan
 
-**Status:** Advisory handoff for a future Linux implementation agent.
+**Status:** Implemented with offline validation (2026-10-10). Live acceptance
+is pending because no disposable test vault is available.
+
+## Implementation decisions and validation plan
+
+The user selected implementation of the Degoo mount and offline validation;
+no disposable live vault is available. The original sequence below remains
+the release acceptance guide. Live gates cannot be inferred from mock results.
+
+1. Implement the provider request contracts from the pinned Python reference
+   in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and
+   partial registration failures. See [API_EVIDENCE.md](API_EVIDENCE.md).
+2. Keep account tokens in an atomic private file. Prompt for the account
+   password and never persist it; the independent vault secret lives in a
+   separate versioned private configuration.
+3. Construct `VFS -> chunker -> crypt -> Degoo` inside `rclone degoo mount`.
+   Require the raw remote to identify a dedicated folder; fix crypt data and
+   name encryption settings rather than trusting an arbitrary remote chain.
+4. Force full VFS caching, bind the cache to its vault settings, and lock it
+   against concurrent use. Add pending-upload status, restart recovery, and
+   subprocess-crash recovery tests. Close/fsync promise local persistence,
+   while remote publication is asynchronous.
+5. Use `norename` transactions and manifests for every file. Repair generic
+   chunker behavior that deletes old chunks before publishing new metadata,
+   and reject orphan transaction manifests instead of returning them as data.
+   Regression tests must reproduce both failures before applying the fixes.
+6. Prove encrypted object names, data, and manifests; seek across chunk
+   boundaries; reject wrong secrets and damaged/missing chunks. Run an opt-in
+   generated 21 GiB encrypted round trip against local storage, then build,
+   run the full offline test suite, and lint the changed packages/documents.
+7. Commit and push a fork PR targeting `master`. This fork has no `staging`;
+   leave merge of this PR to the user under the repository's Git instructions.
+
+Defaults are 1 GiB plaintext chunks and a provisional 19 GiB encrypted object
+safety cap. Configuration validation includes crypt overhead and manifest
+size. This does not establish the live provider limit. The vault uses rclone
+crypt's existing format and chunker version 2 `simplejson` manifests, with
+SHA1 for all files and encrypted manifest contents.
+
+Folder promotion is an explicit live uncertainty: the raw backend uses an
+opaque internal child marker to distinguish the reference's directory
+placeholders from ordinary empty documents. The marker contains no user
+name or content. Verify empty directories, promotion, rename, and cleanup in
+a disposable live vault before release. Remote orphan garbage collection,
+multi-writer coordination, and distributed atomic rename remain unsupported.
+
+See [USAGE.md](USAGE.md) for configuration, commands, recovery behavior, and
+the live acceptance checklist. [VALIDATION.md](VALIDATION.md) records offline
+results and reproducible checks.
+
+## Original advisory handoff
 
 This document describes a recommended route, not an API contract or a binding
 architecture. [REQUIREMENTS.md](REQUIREMENTS.md) records the required behavior;

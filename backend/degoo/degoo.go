@@ -1,0 +1,1411 @@
+// Package degoo implements a raw Degoo filesystem for an encrypted vault stack.
+package degoo
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	stdhash "hash"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rclone/rclone/backend/degoo/api"
+	"github.com/rclone/rclone/backend/degoo/auth"
+	"github.com/rclone/rclone/backend/overview"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fshttp"
+	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/pacer"
+)
+
+const (
+	defaultGraphQLURL = "https://production-appsync.degoo.com/graphql"
+	defaultRESTURL    = "https://rest-api.degoo.com"
+	defaultAPIKey     = "da2-vs6twz5vnjdavpqndtbzg3prra"
+
+	directoryMarkerPrefix = ".rclone-degoo-dir-marker-"
+	temporaryPrefix       = ".rclone-degoo-upload-"
+	backupPrefix          = ".rclone-degoo-backup-"
+
+	minPacerSleep = 100 * time.Millisecond
+	maxPacerSleep = 30 * time.Second
+)
+
+func init() {
+	fs.Register(&fs.RegInfo{
+		Name:        "degoo",
+		Description: "Degoo (experimental raw vault storage)",
+		NewFs:       NewFs,
+		Overview:    &overview.BackendConfig{Backend: "degoo", Name: "Degoo", IntegrationTests: "not run"},
+		Options: []fs.Option{{
+			Name:      "auth_file",
+			Help:      "Path to the private file holding Degoo account tokens.",
+			Required:  true,
+			Sensitive: true,
+		}, {
+			Name:      "root_folder_id",
+			Help:      "Degoo folder ID reserved for the encrypted vault; root ID 0 is not allowed.",
+			Required:  true,
+			Sensitive: true,
+		}, {
+			Name:     "api_key",
+			Help:     "Degoo AppSync routing key. This public key can be overridden if Degoo rotates it.",
+			Default:  defaultAPIKey,
+			Advanced: true,
+		}, {
+			Name:     "api_url",
+			Help:     "Degoo GraphQL endpoint.",
+			Default:  defaultGraphQLURL,
+			Advanced: true,
+		}, {
+			Name:     "rest_url",
+			Help:     "Degoo REST API base URL used for token refresh.",
+			Default:  defaultRESTURL,
+			Advanced: true,
+		}},
+	})
+}
+
+var errMutationAmbiguous = errors.New("degoo mutation state is ambiguous")
+
+// Options defines the configuration for the Degoo backend.
+type Options struct {
+	AuthFile     string `config:"auth_file"`      // AuthFile is the path to private Degoo token state.
+	RootFolderID string `config:"root_folder_id"` // RootFolderID is the dedicated encrypted vault folder ID.
+	APIKey       string `config:"api_key"`        // APIKey is the AppSync routing key.
+	APIURL       string `config:"api_url"`        // APIURL is the GraphQL endpoint.
+	RESTURL      string `config:"rest_url"`       // RESTURL is the authentication endpoint base URL.
+}
+
+// Fs represents a Degoo vault root.
+type Fs struct {
+	name     string
+	root     string
+	opt      Options
+	api      *api.Client
+	pacer    *fs.Pacer
+	dirCache *dircache.DirCache
+	features *fs.Features
+
+	placeholderMu sync.RWMutex
+	placeholders  map[string]struct{}
+	writeMu       sync.Mutex
+}
+
+// Object describes a file stored in Degoo.
+type Object struct {
+	fs       *Fs
+	remote   string
+	id       string
+	parentID string
+	name     string
+	size     int64
+	modTime  time.Time
+}
+
+// NewFs constructs a Degoo filesystem rooted under a configured vault folder.
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	opt := new(Options)
+	if err := configstruct.Set(m, opt); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(opt.AuthFile) == "" {
+		return nil, errors.New("degoo: auth_file is required")
+	}
+	if strings.TrimSpace(opt.RootFolderID) != opt.RootFolderID || opt.RootFolderID == "" || opt.RootFolderID == "0" {
+		return nil, errors.New("degoo: root_folder_id must identify a dedicated vault folder")
+	}
+	if opt.APIKey == "" {
+		opt.APIKey = defaultAPIKey
+	}
+	if opt.APIURL == "" {
+		opt.APIURL = defaultGraphQLURL
+	}
+	if opt.RESTURL == "" {
+		opt.RESTURL = defaultRESTURL
+	}
+	if err := validateEndpoint(opt.APIURL); err != nil {
+		return nil, fmt.Errorf("degoo: invalid api_url: %w", err)
+	}
+
+	root, err := normalizeRemote(root)
+	if err != nil {
+		return nil, fmt.Errorf("degoo: invalid root path: %w", err)
+	}
+
+	// Degoo's GraphQL request body contains the access token and signed download
+	// URLs are short-lived credentials, so this backend never permits HTTP dumps.
+	clientCtx, ci := fs.AddConfig(ctx)
+	ci.Dump = 0
+	httpClient := fshttp.NewClient(clientCtx)
+	authClient, err := auth.New(httpClient, opt.AuthFile, opt.RESTURL)
+	if err != nil {
+		return nil, err
+	}
+
+	f := &Fs{
+		name:         name,
+		root:         root,
+		opt:          *opt,
+		api:          api.New(httpClient, authClient, opt.APIURL, opt.APIKey),
+		pacer:        fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minPacerSleep), pacer.MaxSleep(maxPacerSleep), pacer.DecayConstant(2))),
+		placeholders: make(map[string]struct{}),
+	}
+	f.dirCache = dircache.New(root, opt.RootFolderID, f)
+	f.features = (&fs.Features{
+		CaseInsensitive:          false,
+		DuplicateFiles:           false,
+		CanHaveEmptyDirectories:  true,
+		DirModTimeUpdatesOnWrite: true,
+		Move:                     f.Move,
+		DirMove:                  f.DirMove,
+		DirCacheFlush:            f.DirCacheFlush,
+		PutStream:                f.PutStream,
+	}).Fill(ctx, f)
+
+	rootItem, err := f.getItem(ctx, opt.RootFolderID)
+	if err != nil {
+		return nil, fmt.Errorf("degoo: inspect configured vault folder: %w", err)
+	}
+	isDir, err := f.itemIsDirectory(ctx, rootItem)
+	if err != nil {
+		return nil, fmt.Errorf("degoo: inspect configured vault folder children: %w", err)
+	}
+	if !isDir {
+		return nil, errors.New("degoo: root_folder_id does not identify a directory")
+	}
+	if err := f.dirCache.FindRoot(ctx, false); err != nil {
+		if root == "" {
+			return nil, fmt.Errorf("degoo: resolve vault root: %w", err)
+		}
+		parentPath, leaf := dircache.SplitPath(root)
+		parentCache := dircache.New(parentPath, opt.RootFolderID, f)
+		if parentErr := parentCache.FindRoot(ctx, false); parentErr != nil {
+			if errors.Is(parentErr, fs.ErrorDirNotFound) {
+				return f, nil
+			}
+			return nil, fmt.Errorf("degoo: resolve root parent: %w", parentErr)
+		}
+		parentID, parentErr := parentCache.FindDir(ctx, "", false)
+		if parentErr != nil {
+			return nil, fmt.Errorf("degoo: resolve root parent ID: %w", parentErr)
+		}
+		item, isDir, _, lookupErr := f.lookupChild(ctx, parentID, leaf)
+		if lookupErr != nil {
+			if isNotFoundError(lookupErr) {
+				return f, nil
+			}
+			return nil, fmt.Errorf("degoo: inspect root path: %w", lookupErr)
+		}
+		if item == nil {
+			return f, nil
+		}
+		if isDir {
+			return nil, fmt.Errorf("degoo: resolve root path: %w", err)
+		}
+		f.root = parentPath
+		f.dirCache = parentCache
+		return f, fs.ErrorIsFile
+	}
+	return f, nil
+}
+
+// RootFolderID returns the configured root ID for wrapper validation.
+func (f *Fs) RootFolderID() string { return f.opt.RootFolderID }
+
+func (f *Fs) sameVault(other *Fs) bool {
+	if other == nil || f.opt.RootFolderID != other.opt.RootFolderID || f.opt.APIKey != other.opt.APIKey || f.opt.APIURL != other.opt.APIURL || f.opt.RESTURL != other.opt.RESTURL {
+		return false
+	}
+	left, leftErr := filepath.Abs(f.opt.AuthFile)
+	right, rightErr := filepath.Abs(other.opt.AuthFile)
+	return leftErr == nil && rightErr == nil && left == right
+}
+
+// Name returns the name of the remote.
+func (f *Fs) Name() string { return f.name }
+
+// Root returns the root path of the remote.
+func (f *Fs) Root() string { return f.root }
+
+// String describes the filesystem.
+func (f *Fs) String() string { return "Degoo vault" }
+
+// Precision reports that Degoo does not support setting modification times.
+func (f *Fs) Precision() time.Duration { return fs.ModTimeNotSupported }
+
+// Hashes returns no hashes because Degoo's checksum is not a standard hash.
+func (f *Fs) Hashes() hash.Set { return hash.NewHashSet() }
+
+// Features returns the optional capabilities of the filesystem.
+func (f *Fs) Features() *fs.Features { return f.features }
+
+// FindLeaf resolves a directory child under pathID.
+func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (string, bool, error) {
+	if err := validateLeaf(leaf); err != nil {
+		return "", false, err
+	}
+	item, isDir, _, err := f.lookupChild(ctx, pathID, leaf)
+	if err != nil || item == nil {
+		return "", false, err
+	}
+	if !isDir {
+		return "", false, fs.ErrorDirNotFound
+	}
+	if item.Category == 6 {
+		f.rememberPlaceholder(item.ID)
+	}
+	return item.ID, true, nil
+}
+
+// CreateDir creates a directory below pathID and returns its provider ID.
+func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error) {
+	if err := validateLeaf(leaf); err != nil {
+		return "", err
+	}
+	item, isDir, _, err := f.lookupChild(ctx, pathID, leaf)
+	if err != nil {
+		return "", err
+	}
+	if item != nil {
+		if isDir {
+			return item.ID, nil
+		}
+		return "", fs.ErrorDirExists
+	}
+
+	_, createErr := f.api.Mkdir(ctx, pathID, leaf)
+	resolveTimeout := 20 * time.Second
+	if createErr != nil {
+		if !api.Retryable(createErr) {
+			return "", fmt.Errorf("degoo: create directory placeholder: %w", createErr)
+		}
+		resolveTimeout = 2 * time.Second
+	}
+	placeholder, err := f.waitForItem(ctx, pathID, leaf, resolveTimeout)
+	if err != nil {
+		if createErr != nil {
+			return "", fmt.Errorf("degoo: create directory placeholder failed and state could not be confirmed: %w", createErr)
+		}
+		return "", fmt.Errorf("degoo: directory placeholder may have been created but could not be resolved: %w", err)
+	}
+	if placeholder.Category != 6 {
+		isDir, err := f.itemIsDirectory(ctx, placeholder)
+		if err != nil {
+			return "", err
+		}
+		if isDir {
+			return placeholder.ID, nil
+		}
+		return "", fs.ErrorDirExists
+	}
+	if placeholder.Size != 0 {
+		return "", fs.ErrorDirExists
+	}
+
+	markerName := directoryMarkerName(placeholder.ID)
+	_, markerErr := f.api.Mkdir(ctx, placeholder.ID, markerName)
+	markerTimeout := 20 * time.Second
+	if markerErr != nil {
+		if !api.Retryable(markerErr) {
+			return "", fmt.Errorf("degoo: create directory marker: %w", markerErr)
+		}
+		markerTimeout = 2 * time.Second
+	}
+	if err := f.waitForMarker(ctx, placeholder.ID, markerName, markerTimeout); err != nil {
+		if markerErr != nil {
+			return "", fmt.Errorf("degoo: create directory marker failed and state could not be confirmed: %w", markerErr)
+		}
+		return "", fmt.Errorf("degoo: directory marker may have been created but could not be verified: %w", err)
+	}
+	f.rememberPlaceholder(placeholder.ID)
+	return placeholder.ID, nil
+}
+
+func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout time.Duration) (api.Item, error) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		items, err := f.listDir(ctx, parentID)
+		if err == nil {
+			matches := make([]api.Item, 0, 1)
+			for _, item := range items {
+				if item.Name == name {
+					matches = append(matches, item)
+				}
+			}
+			if len(matches) == 1 {
+				return matches[0], nil
+			}
+			if len(matches) > 1 {
+				return api.Item{}, fmt.Errorf("degoo returned %d items named %q", len(matches), name)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return api.Item{}, ctx.Err()
+		case <-deadline.C:
+			if err != nil {
+				return api.Item{}, err
+			}
+			return api.Item{}, fs.ErrorDirNotFound
+		case <-ticker.C:
+		}
+	}
+}
+
+func (f *Fs) waitForMarker(ctx context.Context, directoryID, markerName string, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		items, err := f.listDir(ctx, directoryID)
+		if err == nil {
+			for _, item := range items {
+				if item.Name == markerName {
+					return nil
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			if err != nil {
+				return err
+			}
+			return errors.New("directory marker did not become visible")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (f *Fs) lookupChild(ctx context.Context, parentID, name string) (*api.Item, bool, []api.Item, error) {
+	items, err := f.listDir(ctx, parentID)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	matches := make([]api.Item, 0, 1)
+	var backups []api.Item
+	for _, item := range items {
+		if item.Name == name && !isInternalName(item.Name) {
+			matches = append(matches, item)
+			continue
+		}
+		if target, ok := backupTarget(item.Name); ok && target == name {
+			backups = append(backups, item)
+		}
+	}
+	if len(matches) == 0 {
+		matches = backups
+	}
+	return f.resolveNameGroup(ctx, matches)
+}
+
+func (f *Fs) resolveNameGroup(ctx context.Context, matches []api.Item) (*api.Item, bool, []api.Item, error) {
+	if len(matches) == 0 {
+		return nil, false, nil, nil
+	}
+	if len(matches) == 1 {
+		item := matches[0]
+		if f.isProviderDirectoryCategory(item.Category) {
+			return &item, true, nil, nil
+		}
+		if item.Category == 6 && item.Size == 0 {
+			marker, err := f.hasDirectoryMarker(ctx, item.ID)
+			if err != nil {
+				return nil, false, nil, err
+			}
+			if marker {
+				f.rememberPlaceholder(item.ID)
+				return &item, true, nil, nil
+			}
+		}
+		return &item, false, nil, nil
+	}
+
+	var realFolder *api.Item
+	var placeholders []api.Item
+	for i := range matches {
+		item := matches[i]
+		if item.Category == 2 {
+			if realFolder != nil {
+				return nil, false, nil, duplicateNameError(matches)
+			}
+			copy := item
+			realFolder = &copy
+		} else if item.Category == 6 && item.Size == 0 {
+			placeholders = append(placeholders, item)
+		}
+	}
+	if realFolder != nil && len(placeholders) == len(matches)-1 {
+		for _, placeholder := range placeholders {
+			marker, err := f.hasDirectoryMarker(ctx, placeholder.ID)
+			if err != nil {
+				return nil, false, nil, err
+			}
+			if marker {
+				return realFolder, true, placeholders, nil
+			}
+		}
+	}
+	return nil, false, nil, duplicateNameError(matches)
+}
+
+func duplicateNameError(items []api.Item) error {
+	return fmt.Errorf("degoo: ambiguous duplicate name %q (%d matching items)", items[0].Name, len(items))
+}
+
+func (f *Fs) hasDirectoryMarker(ctx context.Context, directoryID string) (bool, error) {
+	items, err := f.listDir(ctx, directoryID)
+	if err != nil {
+		return false, err
+	}
+	expectedName := directoryMarkerName(directoryID)
+	for _, item := range items {
+		if item.Name == expectedName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *Fs) itemIsDirectory(ctx context.Context, item api.Item) (bool, error) {
+	if f.isProviderDirectoryCategory(item.Category) {
+		return true, nil
+	}
+	if item.Category == 6 && item.Size == 0 {
+		marker, err := f.hasDirectoryMarker(ctx, item.ID)
+		return marker, err
+	}
+	return false, nil
+}
+
+func (f *Fs) isProviderDirectoryCategory(category int) bool {
+	return category == 1 || category == 2
+}
+
+func (f *Fs) rememberPlaceholder(id string) {
+	f.placeholderMu.Lock()
+	f.placeholders[id] = struct{}{}
+	f.placeholderMu.Unlock()
+}
+
+func (f *Fs) isPlaceholder(id string) bool {
+	f.placeholderMu.RLock()
+	_, ok := f.placeholders[id]
+	f.placeholderMu.RUnlock()
+	return ok
+}
+
+func directoryMarkerName(directoryID string) string {
+	markerID := sha256.Sum256([]byte(directoryID))
+	return directoryMarkerPrefix + hex.EncodeToString(markerID[:16])
+}
+
+func newInternalName(prefix string) (string, error) {
+	var randomID [16]byte
+	if _, err := rand.Read(randomID[:]); err != nil {
+		return "", fmt.Errorf("degoo: generate internal name: %w", err)
+	}
+	return prefix + hex.EncodeToString(randomID[:]), nil
+}
+
+func newBackupName(leaf string) (string, error) {
+	if err := validateLeaf(leaf); err != nil {
+		return "", err
+	}
+	randomName, err := newInternalName("")
+	if err != nil {
+		return "", err
+	}
+	return backupPrefix + hex.EncodeToString([]byte(leaf)) + "-" + randomName, nil
+}
+
+func backupTarget(name string) (string, bool) {
+	if !strings.HasPrefix(name, backupPrefix) {
+		return "", false
+	}
+	payload := strings.TrimPrefix(name, backupPrefix)
+	separator := strings.IndexByte(payload, '-')
+	if separator <= 0 || len(payload)-separator-1 != 32 {
+		return "", false
+	}
+	encoded := payload[:separator]
+	if _, err := hex.DecodeString(payload[separator+1:]); err != nil {
+		return "", false
+	}
+	leaf, err := hex.DecodeString(encoded)
+	if err != nil || len(leaf) == 0 || validateLeaf(string(leaf)) != nil {
+		return "", false
+	}
+	return string(leaf), true
+}
+
+func isInternalName(name string) bool {
+	return strings.HasPrefix(name, directoryMarkerPrefix) || strings.HasPrefix(name, temporaryPrefix) || strings.HasPrefix(name, backupPrefix)
+}
+
+func normalizeRemote(remote string) (string, error) {
+	if remote == "" {
+		return "", nil
+	}
+	if path.IsAbs(remote) || strings.ContainsRune(remote, '\x00') {
+		return "", errors.New("absolute paths and NUL bytes are not supported")
+	}
+	if path.Clean(remote) != remote {
+		return "", errors.New("path must be clean and cannot contain empty, dot, or parent segments")
+	}
+	if err := validateRemote(remote); err != nil {
+		return "", err
+	}
+	return remote, nil
+}
+
+func validateEndpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return errors.New("endpoint must be an absolute HTTPS URL")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("endpoint must not contain credentials, query parameters, or a fragment")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" {
+		host := strings.ToLower(u.Hostname())
+		ip := net.ParseIP(host)
+		if host == "localhost" || (ip != nil && ip.IsLoopback()) {
+			return nil
+		}
+	}
+	return errors.New("endpoint must use HTTPS except for loopback test servers")
+}
+
+func validateRemote(remote string) error {
+	if remote == "" {
+		return nil
+	}
+	if path.IsAbs(remote) || strings.ContainsRune(remote, '\x00') {
+		return errors.New("absolute paths and NUL bytes are not supported")
+	}
+	for _, part := range strings.Split(remote, "/") {
+		if part == "" || part == "." || part == ".." {
+			return errors.New("path contains an unsafe segment")
+		}
+		if isInternalName(part) {
+			return errors.New("path uses a reserved Degoo internal name")
+		}
+	}
+	return nil
+}
+
+func validateLeaf(leaf string) error {
+	if leaf == "" || leaf == "." || leaf == ".." || strings.ContainsAny(leaf, "/\x00") {
+		return errors.New("invalid path component")
+	}
+	if isInternalName(leaf) {
+		return errors.New("path component uses a reserved Degoo internal name")
+	}
+	return nil
+}
+
+// DirCacheFlush resets the directory ID cache.
+func (f *Fs) DirCacheFlush() { f.dirCache.ResetRoot() }
+
+func (f *Fs) findDir(ctx context.Context, remote string, create bool) (string, error) {
+	if err := validateRemote(remote); err != nil {
+		return "", err
+	}
+	if remote != "" {
+		if id, ok := f.dirCache.Get(remote); ok && f.isPlaceholder(id) {
+			f.dirCache.FlushDir(remote)
+		}
+	}
+	return f.dirCache.FindDir(ctx, remote, create)
+}
+
+// List lists files and directories directly below dir.
+func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	if err := validateRemote(dir); err != nil {
+		return nil, err
+	}
+	directoryID, err := f.findDir(ctx, dir, false)
+	if err != nil {
+		return nil, err
+	}
+	items, err := f.listDir(ctx, directoryID)
+	if err != nil {
+		if isNotFoundError(err) {
+			return nil, fs.ErrorDirNotFound
+		}
+		return nil, err
+	}
+
+	groups := make(map[string][]api.Item)
+	backups := make(map[string][]api.Item)
+	for _, item := range items {
+		if target, ok := backupTarget(item.Name); ok {
+			backups[target] = append(backups[target], item)
+			continue
+		}
+		if isInternalName(item.Name) {
+			continue
+		}
+		if err := validateLeaf(item.Name); err != nil {
+			return nil, fmt.Errorf("degoo: provider returned an unsafe name: %w", err)
+		}
+		groups[item.Name] = append(groups[item.Name], item)
+	}
+	for name, backupItems := range backups {
+		if _, exists := groups[name]; !exists {
+			groups[name] = backupItems
+		}
+	}
+
+	names := make([]string, 0, len(groups))
+	for name := range groups {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	entries := make(fs.DirEntries, 0, len(names))
+	for _, name := range names {
+		item, isDir, _, err := f.resolveNameGroup(ctx, groups[name])
+		if err != nil {
+			return nil, err
+		}
+		remote := path.Join(dir, name)
+		if isDir {
+			f.dirCache.Put(remote, item.ID)
+			d := fs.NewDir(remote, itemModTime(*item)).SetID(item.ID).SetParentID(item.ParentID)
+			entries = append(entries, d)
+		} else {
+			entries = append(entries, newObject(f, remote, *item))
+		}
+	}
+	return entries, nil
+}
+
+// NewObject finds the file at remote.
+func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	if err := validateRemote(remote); err != nil {
+		return nil, err
+	}
+	if remote == "" {
+		return nil, fs.ErrorIsDir
+	}
+	parentPath, leaf := dircache.SplitPath(remote)
+	parentID, err := f.findDir(ctx, parentPath, false)
+	if err != nil {
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return nil, fs.ErrorObjectNotFound
+		}
+		return nil, err
+	}
+	item, isDir, _, err := f.lookupChild(ctx, parentID, leaf)
+	if err != nil {
+		if isNotFoundError(err) {
+			return nil, fs.ErrorObjectNotFound
+		}
+		return nil, err
+	}
+	if item == nil {
+		return nil, fs.ErrorObjectNotFound
+	}
+	if isDir {
+		return nil, fs.ErrorIsDir
+	}
+	return newObject(f, remote, *item), nil
+}
+
+func newObject(f *Fs, remote string, item api.Item) *Object {
+	modTime := itemModTime(item)
+	return &Object{
+		fs:       f,
+		remote:   remote,
+		id:       item.ID,
+		parentID: item.ParentID,
+		name:     item.Name,
+		size:     item.Size,
+		modTime:  modTime,
+	}
+}
+
+func itemModTime(item api.Item) time.Time {
+	if !item.LastModificationTime.IsZero() {
+		return item.LastModificationTime
+	}
+	return item.CreationTime
+}
+
+// Put stores an object at the path given by src.Remote.
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	remote := src.Remote()
+	if err := validateRemote(remote); err != nil {
+		return nil, err
+	}
+	if remote == "" {
+		return nil, errors.New("degoo: cannot store an object at the vault root")
+	}
+	if existing, err := f.NewObject(ctx, remote); err == nil {
+		if err := existing.(*Object).Update(ctx, in, src, options...); err != nil {
+			return existing, err
+		}
+		return f.NewObject(ctx, remote)
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+	return f.uploadAndCommit(ctx, remote, nil, in, src.Size())
+}
+
+// PutStream stores an object whose size may not be known in advance.
+func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.Put(ctx, in, src, options...)
+}
+
+// Mkdir creates dir below the configured vault root.
+func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	if err := validateRemote(dir); err != nil {
+		return err
+	}
+	if dir == "" {
+		_, err := f.findDir(ctx, "", true)
+		return err
+	}
+	_, err := f.findDir(ctx, dir, true)
+	return err
+}
+
+// Rmdir removes dir if it contains no user files or directories.
+func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if err := validateRemote(dir); err != nil {
+		return err
+	}
+	if dir == "" {
+		return errors.New("degoo: refusing to remove the configured vault root")
+	}
+	parentPath, leaf := dircache.SplitPath(dir)
+	parentID, err := f.findDir(ctx, parentPath, false)
+	if err != nil {
+		return err
+	}
+	item, isDir, ghosts, err := f.lookupChild(ctx, parentID, leaf)
+	if err != nil {
+		return err
+	}
+	if item == nil {
+		return fs.ErrorDirNotFound
+	}
+	if !isDir {
+		return fs.ErrorIsFile
+	}
+	ids := []string{item.ID}
+	for _, ghost := range ghosts {
+		ids = append(ids, ghost.ID)
+	}
+	for _, id := range ids {
+		children, err := f.listDir(ctx, id)
+		if err != nil && !isNotFoundError(err) {
+			return err
+		}
+		for _, child := range children {
+			if child.Name != directoryMarkerName(id) {
+				return fs.ErrorDirectoryNotEmpty
+			}
+			if err := f.api.Delete(ctx, child.ID, true); err != nil {
+				return fmt.Errorf("degoo: remove directory marker: %w", err)
+			}
+		}
+	}
+	for _, id := range ids {
+		if err := f.api.Delete(ctx, id, false); err != nil && !isNotFoundError(err) {
+			return fmt.Errorf("degoo: remove directory: %w", err)
+		}
+	}
+	f.dirCache.FlushDir(dir)
+	return nil
+}
+
+// Move moves src to remote using Degoo's move and rename mutations.
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok || !f.sameVault(srcObj.fs) {
+		return nil, fs.ErrorCantMove
+	}
+	if err := validateRemote(srcObj.remote); err != nil {
+		return nil, err
+	}
+	if srcObj.remote == "" || srcObj.id == f.opt.RootFolderID {
+		return nil, errors.New("degoo: refusing to move the configured vault root")
+	}
+	if err := validateRemote(remote); err != nil {
+		return nil, err
+	}
+	if remote == "" {
+		return nil, errors.New("degoo: cannot move an object to the vault root")
+	}
+	if srcObj.remote == remote {
+		return f.NewObject(ctx, remote)
+	}
+	parentPath, dstLeaf := dircache.SplitPath(remote)
+	dstParentID, err := f.findDir(ctx, parentPath, true)
+	if err != nil {
+		return nil, err
+	}
+	if existing, err := f.NewObject(ctx, remote); err == nil {
+		return nil, fmt.Errorf("degoo: move destination exists: %q", existing.Remote())
+	} else if errors.Is(err, fs.ErrorIsDir) {
+		return nil, fs.ErrorDirExists
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+	if srcObj.parentID != dstParentID {
+		if err := f.moveConfirmed(ctx, srcObj.id, dstParentID); err != nil {
+			return nil, fmt.Errorf("degoo: move object: %w", err)
+		}
+	}
+	if srcObj.name != dstLeaf {
+		if err := f.renameConfirmed(ctx, srcObj.id, dstParentID, dstLeaf); err != nil {
+			return nil, fmt.Errorf("degoo: object moved but rename failed: %w", err)
+		}
+	}
+	return f.NewObject(ctx, remote)
+}
+
+// DirMove moves a directory within the same configured vault.
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok || !f.sameVault(srcFs) {
+		return fs.ErrorCantDirMove
+	}
+	if err := validateRemote(srcRemote); err != nil {
+		return err
+	}
+	if err := validateRemote(dstRemote); err != nil {
+		return err
+	}
+	if srcRemote == "" || dstRemote == "" {
+		return errors.New("degoo: cannot move the configured vault root")
+	}
+	if dstRemote == srcRemote || strings.HasPrefix(dstRemote, srcRemote+"/") {
+		return errors.New("degoo: cannot move a directory into itself")
+	}
+	srcID, srcParentID, srcLeaf, dstParentID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	if err != nil {
+		return err
+	}
+	if existing, _, _, err := f.lookupChild(ctx, dstParentID, dstLeaf); err != nil {
+		return err
+	} else if existing != nil {
+		return fs.ErrorDirExists
+	}
+	if srcParentID != dstParentID {
+		if err := f.moveConfirmed(ctx, srcID, dstParentID); err != nil {
+			return fmt.Errorf("degoo: move directory: %w", err)
+		}
+	}
+	if srcLeaf != dstLeaf {
+		if err := f.renameConfirmed(ctx, srcID, dstParentID, dstLeaf); err != nil {
+			return fmt.Errorf("degoo: directory moved but rename failed: %w", err)
+		}
+	}
+	srcFs.dirCache.FlushDir(srcRemote)
+	f.dirCache.FlushDir(dstRemote)
+	return nil
+}
+
+// Open opens the object, validating any requested byte range.
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	if err := validateRemote(o.remote); err != nil {
+		return nil, err
+	}
+	if o.remote == "" || o.id == o.fs.opt.RootFolderID {
+		return nil, fs.ErrorIsDir
+	}
+	openOptions := append([]fs.OpenOption(nil), options...)
+	fs.FixRangeOption(openOptions, o.size)
+	rangeHeader := ""
+	for _, option := range openOptions {
+		key, value := option.Header()
+		if strings.EqualFold(key, "Range") {
+			if rangeHeader != "" {
+				return nil, errors.New("degoo: multiple range requests are not supported")
+			}
+			rangeHeader = value
+		}
+	}
+	item, err := o.fs.getItem(ctx, o.id)
+	if err != nil {
+		return nil, fmt.Errorf("degoo: refresh download metadata: %w", err)
+	}
+	if item.URL == "" {
+		return nil, errors.New("degoo: item has no download URL")
+	}
+	resp, err := o.fs.api.Download(ctx, item.URL, rangeHeader)
+	if err != nil {
+		return nil, err
+	}
+	expected, known, err := expectedReadLength(o.size, openOptions)
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
+	if known && resp.ContentLength >= 0 && resp.ContentLength != expected {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("degoo: download length mismatch: got %d, want %d", resp.ContentLength, expected)
+	}
+	return &verifiedReadCloser{ReadCloser: resp.Body, expected: expected, known: known}, nil
+}
+
+func expectedReadLength(size int64, options []fs.OpenOption) (int64, bool, error) {
+	if size < 0 {
+		return 0, false, nil
+	}
+	for _, option := range options {
+		if rangeOption, ok := option.(*fs.RangeOption); ok {
+			offset, limit := rangeOption.Decode(size)
+			if offset > size {
+				return 0, false, fmt.Errorf("degoo: range starts past end of object")
+			}
+			if limit < 0 || limit > size-offset {
+				limit = size - offset
+			}
+			return limit, true, nil
+		}
+	}
+	return size, true, nil
+}
+
+type verifiedReadCloser struct {
+	io.ReadCloser
+	expected int64
+	read     int64
+	known    bool
+}
+
+func (r *verifiedReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.read += int64(n)
+	if err == io.EOF && r.known && r.read != r.expected {
+		return n, fmt.Errorf("degoo: truncated response: read %d of %d bytes: %w", r.read, r.expected, io.ErrUnexpectedEOF)
+	}
+	if r.known && r.read > r.expected {
+		return n, fmt.Errorf("degoo: response exceeded requested length %d", r.expected)
+	}
+	return n, err
+}
+
+// Remove moves the object to Degoo's recycle bin.
+func (o *Object) Remove(ctx context.Context) error {
+	if err := validateRemote(o.remote); err != nil {
+		return err
+	}
+	if o.remote == "" || o.id == o.fs.opt.RootFolderID {
+		return errors.New("degoo: refusing to remove the configured vault root")
+	}
+	if err := o.fs.api.Delete(ctx, o.id, false); err != nil {
+		return fmt.Errorf("degoo: delete object: %w", err)
+	}
+	return nil
+}
+
+// Update replaces the object only after its new encrypted bytes are uploaded and verified.
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	if err := validateRemote(o.remote); err != nil {
+		return err
+	}
+	if o.remote == "" || o.id == o.fs.opt.RootFolderID {
+		return errors.New("degoo: refusing to replace the configured vault root")
+	}
+	if src.Remote() != o.remote {
+		return errors.New("degoo: object update path does not match source path")
+	}
+	_, err := o.fs.uploadAndCommit(ctx, o.remote, o, in, src.Size())
+	return err
+}
+
+func (f *Fs) uploadAndCommit(ctx context.Context, remote string, old *Object, in io.Reader, expectedSize int64) (*Object, error) {
+	if err := validateRemote(remote); err != nil {
+		return nil, err
+	}
+	if remote == "" {
+		return nil, errors.New("degoo: cannot store an object at the vault root")
+	}
+	if in == nil {
+		return nil, errors.New("degoo: nil upload reader")
+	}
+	if expectedSize < -1 {
+		return nil, fmt.Errorf("degoo: invalid upload size %d", expectedSize)
+	}
+	f.writeMu.Lock()
+	defer f.writeMu.Unlock()
+
+	parentPath, leaf := dircache.SplitPath(remote)
+	parentID, err := f.findDir(ctx, parentPath, true)
+	if err != nil {
+		return nil, err
+	}
+	current, isDir, _, err := f.lookupChild(ctx, parentID, leaf)
+	if err != nil {
+		return nil, err
+	}
+	if old == nil {
+		if current != nil {
+			if isDir {
+				return nil, fs.ErrorIsDir
+			}
+			return nil, fmt.Errorf("degoo: object already exists: %q", remote)
+		}
+	} else {
+		if current == nil || current.ID != old.id || isDir {
+			return nil, errors.New("degoo: target changed before update; refusing to replace it")
+		}
+	}
+
+	var stagedFile *os.File
+	var stagedSize int64
+	var localDigest [sha256.Size]byte
+	var uploadReader io.Reader
+	var providerChecksum string
+	if expectedSize >= 0 {
+		prefix, err := readChecksumPrefix(in, expectedSize)
+		if err != nil {
+			return nil, err
+		}
+		stagedSize = expectedSize
+		providerChecksum, err = api.Checksum(bytes.NewReader(prefix))
+		if err != nil {
+			return nil, err
+		}
+		uploadReader = io.MultiReader(bytes.NewReader(prefix), in)
+	} else {
+		var err error
+		stagedFile, stagedSize, localDigest, err = spoolUpload(in, expectedSize)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			_ = stagedFile.Close()
+			_ = os.Remove(stagedFile.Name())
+		}()
+		providerChecksum, err = api.Checksum(stagedFile)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := stagedFile.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		uploadReader = stagedFile
+	}
+	tempName, err := newInternalName(temporaryPrefix)
+	if err != nil {
+		return nil, err
+	}
+	tempName += ".bin"
+	writeAuth, authErr := f.api.GetWriteAuth(ctx, parentID, tempName, stagedSize, providerChecksum)
+	if authErr != nil && !errors.Is(authErr, api.ErrAlreadyExists) {
+		return nil, fmt.Errorf("degoo: get upload authorization: %w", authErr)
+	}
+	if authErr == nil {
+		if stagedFile != nil {
+			if _, err := stagedFile.Seek(0, io.SeekStart); err != nil {
+				return nil, err
+			}
+		}
+		digestReader := newDigestReader(uploadReader)
+		if err := f.api.Upload(ctx, writeAuth, tempName, providerChecksum, stagedSize, "application/octet-stream", digestReader); err != nil {
+			return nil, fmt.Errorf("degoo: upload encrypted bytes (unregistered storage may remain): %w", err)
+		}
+		if digestReader.n != stagedSize {
+			return nil, fmt.Errorf("degoo: upload read %d bytes, want %d; pending storage may remain", digestReader.n, stagedSize)
+		}
+		if stagedFile == nil {
+			localDigest = digestReader.sum()
+		}
+	} else if stagedFile == nil {
+		digestReader := newDigestReader(uploadReader)
+		if _, err := io.Copy(io.Discard, digestReader); err != nil {
+			return nil, fmt.Errorf("degoo: read content for existing Degoo blob: %w", err)
+		}
+		if digestReader.n != stagedSize {
+			return nil, fmt.Errorf("degoo: upload size mismatch: read %d bytes, source reported %d", digestReader.n, stagedSize)
+		}
+		localDigest = digestReader.sum()
+	}
+	created := time.Now()
+	_, registerErr := f.api.Register(ctx, parentID, tempName, providerChecksum, stagedSize, created)
+	if registerErr != nil {
+		item, resolveErr := f.waitForItem(ctx, parentID, tempName, 2*time.Second)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("degoo: register uploaded data; result is ambiguous and pending storage may remain: %w", registerErr)
+		}
+		return f.finishUpload(ctx, remote, leaf, parentID, item, old, stagedSize, localDigest)
+	}
+	item, err := f.waitForItem(ctx, parentID, tempName, 20*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("degoo: uploaded bytes are not yet registered; pending storage retained: %w", err)
+	}
+	return f.finishUpload(ctx, remote, leaf, parentID, item, old, stagedSize, localDigest)
+}
+
+func readChecksumPrefix(in io.Reader, size int64) ([]byte, error) {
+	prefixSize := int64(1024 * 1024)
+	if size < prefixSize {
+		prefixSize = size
+	}
+	prefix := make([]byte, prefixSize)
+	read, err := io.ReadFull(in, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("degoo: read checksum prefix: %w", err)
+	}
+	if int64(read) != prefixSize {
+		return nil, fmt.Errorf("degoo: read %d checksum prefix bytes, want %d", read, prefixSize)
+	}
+	return prefix, nil
+}
+
+type digestReader struct {
+	reader io.Reader
+	hasher stdhash.Hash
+	n      int64
+}
+
+func newDigestReader(reader io.Reader) *digestReader {
+	return &digestReader{reader: reader, hasher: sha256.New()}
+}
+
+func (reader *digestReader) Read(p []byte) (int, error) {
+	n, err := reader.reader.Read(p)
+	if n > 0 {
+		_, _ = reader.hasher.Write(p[:n])
+		reader.n += int64(n)
+	}
+	return n, err
+}
+
+func (reader *digestReader) sum() [sha256.Size]byte {
+	var digest [sha256.Size]byte
+	copy(digest[:], reader.hasher.Sum(nil))
+	return digest
+}
+
+func spoolUpload(in io.Reader, expectedSize int64) (*os.File, int64, [sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	file, err := os.CreateTemp("", "rclone-degoo-upload-")
+	if err != nil {
+		return nil, 0, digest, fmt.Errorf("degoo: create secure upload spool: %w", err)
+	}
+	cleanup := func(err error) (*os.File, int64, [sha256.Size]byte, error) {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+		return nil, 0, digest, err
+	}
+	hasher := sha256.New()
+	size, err := io.Copy(io.MultiWriter(file, hasher), in)
+	if err != nil {
+		return cleanup(fmt.Errorf("degoo: spool upload: %w", err))
+	}
+	if expectedSize >= 0 && size != expectedSize {
+		return cleanup(fmt.Errorf("degoo: upload size mismatch: read %d bytes, source reported %d", size, expectedSize))
+	}
+	copy(digest[:], hasher.Sum(nil))
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return cleanup(fmt.Errorf("degoo: rewind upload spool: %w", err))
+	}
+	return file, size, digest, nil
+}
+
+func (f *Fs) finishUpload(ctx context.Context, remote, leaf, parentID string, staged api.Item, old *Object, size int64, digest [sha256.Size]byte) (*Object, error) {
+	if staged.Size != size {
+		return nil, fmt.Errorf("degoo: registered upload size mismatch: got %d, want %d", staged.Size, size)
+	}
+	if staged.ParentID != parentID || staged.Name == "" || !strings.HasPrefix(staged.Name, temporaryPrefix) {
+		return nil, errors.New("degoo: registered upload metadata does not match the pending object")
+	}
+	if err := f.verifyUploaded(ctx, staged.ID, size, digest); err != nil {
+		return nil, fmt.Errorf("degoo: uploaded object verification failed; pending data retained: %w", err)
+	}
+
+	var backupName string
+	if old != nil {
+		var err error
+		backupName, err = newBackupName(leaf)
+		if err != nil {
+			return nil, err
+		}
+		if err := f.renameConfirmed(ctx, old.id, old.parentID, backupName); err != nil {
+			return nil, fmt.Errorf("degoo: preserve prior object before publishing replacement: %w", err)
+		}
+	}
+	if err := f.renameConfirmed(ctx, staged.ID, parentID, leaf); err != nil {
+		if old != nil {
+			if errors.Is(err, errMutationAmbiguous) {
+				return nil, fmt.Errorf("degoo: replacement publication is ambiguous; prior object remains recoverable under its internal backup name: %w", err)
+			}
+			if rollbackErr := f.renameConfirmed(ctx, old.id, old.parentID, leaf); rollbackErr != nil {
+				return nil, fmt.Errorf("degoo: publish replacement failed: %v; prior object remains recoverable under its internal backup name: %w", err, rollbackErr)
+			}
+		}
+		return nil, fmt.Errorf("degoo: publish verified upload: %w", err)
+	}
+
+	publishedObject, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, fmt.Errorf("degoo: verified upload was published but cannot be resolved: %w", err)
+	}
+	published := publishedObject.(*Object)
+	if published.id != staged.ID || published.parentID != parentID || published.size != size {
+		return nil, errors.New("degoo: published object metadata does not match the verified upload; prior backup retained")
+	}
+	if old != nil {
+		if err := f.api.Delete(ctx, old.id, true); err != nil {
+			fs.Errorf(f, "could not remove hidden backup after replacement; new object is committed: %v", err)
+		}
+	}
+	return published, nil
+}
+
+func (f *Fs) verifyUploaded(ctx context.Context, id string, size int64, want [sha256.Size]byte) error {
+	item, err := f.getItem(ctx, id)
+	if err != nil {
+		return err
+	}
+	if item.Size != size || item.URL == "" {
+		return errors.New("degoo metadata size or download URL is invalid")
+	}
+	resp, err := f.api.Download(ctx, item.URL, "")
+	if err != nil {
+		return err
+	}
+	hasher := sha256.New()
+	readSize, readErr := io.Copy(hasher, resp.Body)
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if readSize != size {
+		return fmt.Errorf("downloaded %d bytes, want %d", readSize, size)
+	}
+	if !strings.EqualFold(hex.EncodeToString(hasher.Sum(nil)), hex.EncodeToString(want[:])) {
+		return errors.New("downloaded bytes do not match the spooled upload")
+	}
+	return nil
+}
+
+func (f *Fs) renameConfirmed(ctx context.Context, id, parentID, name string) error {
+	requestErr := f.api.Rename(ctx, id, name)
+	if requestErr == nil {
+		return nil
+	}
+	item, err := f.getItem(ctx, id)
+	if err != nil {
+		return fmt.Errorf("%w: rename request could not be reconciled: %v", errMutationAmbiguous, requestErr)
+	}
+	if item.ID == id && item.ParentID == parentID && item.Name == name {
+		return nil
+	}
+	return fmt.Errorf("rename request failed and item state could not confirm the requested name: %w", requestErr)
+}
+
+func (f *Fs) moveConfirmed(ctx context.Context, id, parentID string) error {
+	requestErr := f.api.Move(ctx, id, parentID)
+	if requestErr == nil {
+		return nil
+	}
+	item, err := f.getItem(ctx, id)
+	if err != nil {
+		return fmt.Errorf("%w: move request could not be reconciled: %v", errMutationAmbiguous, requestErr)
+	}
+	if item.ID == id && item.ParentID == parentID {
+		return nil
+	}
+	return fmt.Errorf("move request failed and item state shows parent %q: %w", item.ParentID, requestErr)
+}
+
+// SetModTime reports that Degoo does not expose a modification-time mutation.
+func (o *Object) SetModTime(context.Context, time.Time) error { return fs.ErrorCantSetModTime }
+
+// Fs returns the filesystem containing the object.
+func (o *Object) Fs() fs.Info { return o.fs }
+
+// String returns a description of the object.
+func (o *Object) String() string { return o.remote }
+
+// Remote returns the path of the object.
+func (o *Object) Remote() string { return o.remote }
+
+// ModTime returns the provider modification time.
+func (o *Object) ModTime(context.Context) time.Time { return o.modTime }
+
+// Size returns the object size in bytes.
+func (o *Object) Size() int64 { return o.size }
+
+// Hash returns an error because Degoo's seeded prefix checksum is not an rclone hash.
+func (o *Object) Hash(context.Context, hash.Type) (string, error) { return "", hash.ErrUnsupported }
+
+// Storable reports whether this object can be stored.
+func (o *Object) Storable() bool { return true }
+
+// ID returns the provider ID of the object.
+func (o *Object) ID() string { return o.id }
+
+// ParentID returns the provider ID of the parent directory.
+func (o *Object) ParentID() string { return o.parentID }
+
+func (f *Fs) listDir(ctx context.Context, parentID string) ([]api.Item, error) {
+	var items []api.Item
+	err := f.pacer.Call(func() (bool, error) {
+		var callErr error
+		items, callErr = f.api.ListDir(ctx, parentID)
+		return api.Retryable(callErr), callErr
+	})
+	return items, err
+}
+
+func (f *Fs) getItem(ctx context.Context, id string) (api.Item, error) {
+	var item api.Item
+	err := f.pacer.Call(func() (bool, error) {
+		var callErr error
+		item, callErr = f.api.GetItem(ctx, id)
+		return api.Retryable(callErr), callErr
+	})
+	return item, err
+}
+
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if api.HTTPStatus(err) == http.StatusNotFound {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "not found") || strings.Contains(message, "notfound")
+}
+
+var _ fs.Fs = (*Fs)(nil)
+var _ dircache.DirCacher = (*Fs)(nil)
+var _ fs.Object = (*Object)(nil)

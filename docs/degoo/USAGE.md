@@ -1,0 +1,155 @@
+# Encrypted Degoo vault on Linux
+
+This fork provides a `degoo` transport backend and a `rclone degoo mount`
+entry point. The entry point always constructs:
+
+```text
+Linux FUSE -> VFS full cache -> chunker -> crypt -> Degoo
+```
+
+The implementation is experimental. Offline tests exercise the request shapes
+and vault behavior. Current Degoo endpoint availability, folder behavior,
+download ranges, account renewal, and the provider object-size limit still
+need acceptance against a disposable live vault.
+
+## Setup
+
+Build this fork with `go build`. Linux FUSE and `fusermount3` must be installed
+to run the mount. Choose a dedicated Degoo folder and obtain its folder ID
+without changing existing personal files. Use a separate private directory
+for account tokens and the vault configuration:
+
+```sh
+install -d -m 700 "$HOME/.config/rclone-degoo"
+install -d -m 700 "$HOME/.cache/rclone-degoo"
+./rclone degoo login "$HOME/.config/rclone-degoo/auth.json" --email you@example.com
+```
+
+Login prompts for the account password. It saves access and refresh tokens in
+an atomic, permission-protected file, and does not save the account password.
+Accounts that cannot use email/password login need a Degoo-supported password
+login or separately provisioned refresh token; browser-token extraction is
+not provided.
+
+Add a raw remote to your usual rclone configuration, replacing the paths and
+folder ID below. `root_folder_id` is mandatory and must identify a dedicated
+folder, rather than account root `0`. The backend scopes mutations beneath
+this ID.
+
+```ini
+[degoo-test]
+type = degoo
+root_folder_id = YOUR_DISPOSABLE_FOLDER_ID
+auth_file = /absolute/private/path/auth.json
+```
+
+Create a vault configuration, with a password independent of the account
+password, then mount it:
+
+```sh
+./rclone degoo init "$HOME/.config/rclone-degoo/vault.json" \
+  --remote degoo-test: --cache-dir "$HOME/.cache/rclone-degoo"
+mkdir -p "$HOME/degoo-vault"
+./rclone degoo mount "$HOME/.config/rclone-degoo/vault.json" "$HOME/degoo-vault"
+```
+
+The command runs in the foreground. Use a service manager for unattended
+operation. Standard mount and VFS flags are available; full caching is always
+enabled. HTTP request/response dumps are refused because the API carries
+tokens in JSON. A mount is refused if its cache cannot initialize. The generic
+`rclone mount` command does not construct or enforce the private vault stack;
+use `rclone degoo mount` for this vault.
+
+`vault.json` uses this versioned format. Sizes can be strings accepted by
+rclone or integer byte counts:
+
+```json
+{
+  "version": 1,
+  "remote": "degoo-test:",
+  "password": "YOUR_INDEPENDENT_VAULT_PASSWORD",
+  "cache_dir": "/absolute/private/cache/directory",
+  "chunk_size": "1Gi",
+  "max_object_size": "19Gi"
+}
+```
+
+An optional `password_salt` supplies crypt's independent password salt. Back up
+the vault configuration securely: lost passwords make the remote data
+unreadable. Both config and token files must be regular owner-private files
+inside owner-private directories. The vault configuration deliberately stores
+the password as plaintext on the trusted local machine. Host compromise can
+expose it and the plaintext cache.
+
+## Persistence and recovery
+
+`fsync` syncs the local VFS cache. Close queues an asynchronous upload. Neither
+operation promises that Degoo has already received the file. Keep the cache
+directory across restarts and login failures. Dirty files are reloaded by VFS
+and uploaded when the same vault is mounted again with working credentials.
+
+```sh
+./rclone degoo status "$HOME/.config/rclone-degoo/vault.json"
+```
+
+Status counts dirty cached files and their logical byte sizes without reading
+Degoo or displaying file contents. Counts can change during uploads. Upload
+errors are also reported in the normal rclone logs. Zero pending uploads means
+the local cache has no outstanding dirty files; it is not an independent
+provider integrity audit.
+
+A process lock prevents two mounts from sharing a cache. Use one writer for
+each vault; separate machines or cache directories cannot coordinate through
+this lock. A local cache binding refuses changes to the remote, secret, salt,
+or chunk settings, so pending plaintext cannot be silently uploaded to a
+different vault. Preserve the original configuration to recover it.
+If the identity file is missing while the cache contains files, mounting also
+fails; restore the original identity before reusing that cache.
+
+Stop the mount before logging out:
+
+```sh
+fusermount -u "$HOME/degoo-vault"
+./rclone degoo logout "$HOME/.config/rclone-degoo/auth.json"
+```
+
+Logout removes only the token file. It leaves the vault password, cache,
+configuration, and remote objects intact. A running process may still hold
+its access token until it exits; logout does not revoke tokens at Degoo.
+
+## Remote format and limits
+
+The vault uses rclone crypt's authenticated data format and standard encrypted
+file/directory names. Chunker uses version 2 `simplejson` manifests, SHA1
+metadata for every file, and `norename` transactions. Crypt encrypts both the
+chunks and their manifests. Authenticated reads reject damaged ciphertext.
+Missing chunks fail reads and listings rather than succeeding with truncated
+data. Provider deletion and rollback are outside encryption's protection.
+
+Chunks default to 1 GiB. The provisional maximum encrypted object size is
+19 GiB, including crypt headers and authentication tags, leaving a margin
+below the historical 20 GiB report. This is a configuration safety cap, not a
+verified provider limit. Choose a smaller cap if required by your account.
+
+Chunker publishes a manifest after all its chunks are uploaded. For `norename`
+overwrites, old chunks are retired after successful manifest publication.
+Failed uploads leave the cached logical write pending. Crashes can leave
+unreferenced remote transaction objects; automatic orphan garbage collection
+and distributed atomic rename are not provided. Provider metadata operations
+can fail ambiguously and must be reconciled rather than blindly retried.
+
+Remote sizes, object counts, directory topology, timing, and access patterns
+remain visible. Existing native Degoo files are outside the encrypted vault
+format; copy them into the mounted vault explicitly if desired.
+
+## Live acceptance still required
+
+Use only generated data in a dedicated disposable vault. Exercise empty
+files/directories, rename, delete, remount, pagination beyond 1,000 entries,
+token renewal/re-login, and failures between byte upload and registration.
+Confirm CDN `206`/`Content-Range` support before relying on seeks. Test a logical
+file larger than 20 GiB, inspect the encrypted object sizes, and compare local
+hashes after readback. Interrupt a multi-chunk update and verify that recovery
+returns a complete old/new version or a clear failure.
+
+The full acceptance checklist is in [REQUIREMENTS.md](REQUIREMENTS.md).

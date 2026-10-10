@@ -5,7 +5,9 @@
 This is
 [georgeasiminei/rclone-degoo](https://github.com/georgeasiminei/rclone-degoo),
 a fork of rclone for an encrypted, writable Degoo mount on Linux.
-The Degoo backend and project-specific setup are not implemented yet.
+The Degoo backend and encrypted vault command are implemented in
+`backend/degoo` and `cmd/degoo`. Offline validation and remaining live
+acceptance gates are recorded in `docs/degoo`.
 
 Read these documents before starting Degoo work:
 

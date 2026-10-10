@@ -1,6 +1,7 @@
 # Degoo backend requirements handoff
 
-Status: requirements only; no backend is implemented as of 2026-10-09.
+Status: requirements recorded on 2026-10-09; implementation and offline
+validation are tracked in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
 This document gives a future implementation agent the user’s requirements for
 a Degoo filesystem in the `rclone-degoo` fork. It separates those requirements

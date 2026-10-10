@@ -26,6 +26,7 @@ import (
 	_ "github.com/rclone/rclone/cmd/cryptcheck"
 	_ "github.com/rclone/rclone/cmd/cryptdecode"
 	_ "github.com/rclone/rclone/cmd/dedupe"
+	_ "github.com/rclone/rclone/cmd/degoo"
 	_ "github.com/rclone/rclone/cmd/delete"
 	_ "github.com/rclone/rclone/cmd/deletefile"
 	_ "github.com/rclone/rclone/cmd/genautocomplete"
