@@ -141,6 +141,15 @@ Installed launchers live under `~/.local/share/rclone-degoo/`:
 ~/.local/share/rclone-degoo/logs.sh --follow
 ```
 
+Press Ctrl+C to stop following logs. `logs.sh` is the viewer; `logs/` is a
+directory. New mounts log notices and errors by default. The upgrade wizard
+offers to stop the contained mount and waits briefly for it to start again.
+To stop the user service manually:
+
+```sh
+~/.local/share/rclone-degoo/service.sh stop
+```
+
 If authentication cannot renew, status reports a login-required warning with
 the login command. Run `~/.local/share/rclone-degoo/login.sh` again. Its
 password prompt stays visible in the terminal while logs go to a file, and

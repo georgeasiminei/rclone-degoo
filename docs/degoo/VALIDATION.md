@@ -65,6 +65,42 @@ The production archive and checksum also passed verification. These checks
 performed no account login, remote changes, system package installation, or
 live mounting.
 
+## Upgrade preflight and mount readiness
+
+The follow-up installer checks on 2026-10-10 address the live transcript where
+an upgrade failed after collecting settings and a successful service start
+briefly appeared as "not mounted":
+
+- Upgrade preflight asks to stop the contained service or manual mount before
+  collecting settings. Ownership validation prevents stopping another unit,
+  and the kernel mount must be absent before upgrading.
+- Startup waits up to 15 seconds for the kernel mount. An unconfirmed mount
+  produces diagnostics and a nonzero wizard result. Active systemd state
+  alone is insufficient to report a ready mount.
+- Summary examples have shell comment labels and executable commands on
+  separate lines, including service stop, manual unmount, and the log viewer.
+- The mount launcher defaults to NOTICE; later CLI flags can request INFO.
+  Historical log entries are preserved.
+- A live stop exposed a disconnected FUSE mount that `mountpoint` could not
+  inspect (exit 1). The old stop helper incorrectly treated that error as an
+  absent mount (exit 32). The helper now distinguishes these cases. Recovery
+  detachment requires a disconnected endpoint, no active cache writer, and
+  user acceptance; connected busy mounts are not detached automatically.
+- All 104 offline Python tests passed, along with the package self-check,
+  `go build`, `make quicktest BRANCH=degoo-upgrade-startup`, changed Markdown
+  lint, and `git diff --check`.
+- A repeated live upgrade using the new preflight and readiness helpers
+  preserved all five configuration files, cache file metadata, and existing
+  log contents. The restarted mount was connected and the service active,
+  with zero pending uploads. The log viewer succeeded; routine cache polling
+  appended no messages over a six-second check at the default NOTICE level.
+- The built binary accepted a trailing INFO override after NOTICE and emitted
+  the expected local-copy INFO message. The reverse order suppressed it.
+  This used generated temporary local files, with no cloud requests.
+- The extracted distributable passed a staged install with its actual binary,
+  NOTICE wrapper inspection, local status and logs, inventory, local uninstall,
+  and all 18 relative Markdown links in a temporary home.
+
 ## Wizard completion and diagnostics
 
 The completion handoff and diagnostics changes were checked on 2026-10-10:

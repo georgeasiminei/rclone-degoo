@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import info
 import install
 import login
 import service
@@ -89,6 +90,97 @@ class InstallTest(unittest.TestCase):
         self.assertIn("StartLimitIntervalSec=0", unit.split("[Service]", 1)[0])
         self.assertIn("RestartSec=30s", unit)
         self.assertIn("WantedBy=default.target", unit)
+
+    def test_mount_wrapper_defaults_to_notice_and_allows_later_info_override(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        capture = self.base / "mount argv"
+        fake_binary = self.root / "bin/rclone"
+        fake_binary.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE_ARGS\"\n",
+            encoding="ascii",
+        )
+        fake_binary.chmod(0o700)
+        env = {**os.environ, "CAPTURE_ARGS": str(capture)}
+
+        result = subprocess.run([str(self.root / "mount.sh")], env=env, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        args = capture.read_text(encoding="utf-8").splitlines()
+        levels = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--log-level"]
+        self.assertEqual(levels, ["NOTICE"])
+
+        result = subprocess.run(
+            [str(self.root / "mount.sh"), "--log-level", "INFO"],
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        args = capture.read_text(encoding="utf-8").splitlines()
+        levels = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--log-level"]
+        self.assertEqual(levels, ["NOTICE", "INFO"])
+
+    def test_stop_wrapper_only_skips_unmount_for_mountpoint_exit_32(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        calls = self.base / "stop calls"
+        tools = self.root / "tools"
+        mountpoint = tools / "mountpoint"
+        mountpoint.write_text(
+            "#!/bin/sh\nprintf '%s\\n' mountpoint >> \"$CALLS_FILE\"\nexit \"$MOUNTPOINT_EXIT\"\n",
+            encoding="ascii",
+        )
+        mountpoint.chmod(0o700)
+        fusermount = tools / "fusermount3"
+        if fusermount.is_symlink():
+            fusermount.unlink()
+        fusermount.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' fusermount3 >> \"$CALLS_FILE\"\n"
+            "printf '%s\\n' \"$@\" >> \"$CALLS_FILE\"\n"
+            "exit \"$UNMOUNT_EXIT\"\n",
+            encoding="ascii",
+        )
+        fusermount.chmod(0o700)
+
+        cases = (
+            (
+                "disconnected mount, busy unmount",
+                "1",
+                "1",
+                1,
+                ["mountpoint", "fusermount3", "-u", str(self.root / "mount"), "mountpoint"],
+            ),
+            ("confirmed unmounted", "32", "1", 0, ["mountpoint"]),
+            (
+                "normal unmount succeeds",
+                "0",
+                "0",
+                0,
+                ["mountpoint", "fusermount3", "-u", str(self.root / "mount")],
+            ),
+            (
+                "active mount unmount fails",
+                "0",
+                "1",
+                1,
+                ["mountpoint", "fusermount3", "-u", str(self.root / "mount"), "mountpoint"],
+            ),
+        )
+        for label, mountpoint_exit, unmount_exit, expected_code, expected_calls in cases:
+            with self.subTest(case=label):
+                calls.unlink(missing_ok=True)
+                env = {
+                    **os.environ,
+                    "CALLS_FILE": str(calls),
+                    "MOUNTPOINT_EXIT": mountpoint_exit,
+                    "UNMOUNT_EXIT": unmount_exit,
+                }
+                result = subprocess.run(
+                    [str(self.root / "stop.sh")], env=env, capture_output=True, check=False
+                )
+                self.assertEqual(result.returncode, expected_code, result.stderr.decode(errors="replace"))
+                self.assertEqual(calls.read_text(encoding="ascii").splitlines(), expected_calls)
 
     def test_systemd_accepts_unit_paths_with_spaces(self) -> None:
         analyzer = shutil.which("systemd-analyze")
@@ -287,6 +379,44 @@ class InstallTest(unittest.TestCase):
             self.assertIn("cache is active", stderr)
         finally:
             os.close(fd)
+
+    def test_mounted_upgrade_refusal_gives_service_or_manual_stop_command(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        binary_before = (self.root / "bin/rclone").read_bytes()
+        vault_before = (self.root / "config/vault.json").read_bytes()
+        cache_file = self.root / "cache/pending-upload"
+        cache_file.write_bytes(b"pending local data")
+
+        for service_active, wrapper in ((False, "stop.sh"), (True, "service.sh")):
+            with self.subTest(wrapper=wrapper), mock.patch.object(
+                install.os.path, "ismount", side_effect=[False, True]
+            ), mock.patch.object(install, "_user_service_active", return_value=service_active):
+                code, _, stderr = self.invoke("--upgrade")
+
+            self.assertEqual(code, 2)
+            self.assertIn("stop the contained mount before upgrading", stderr)
+            command = shlex.quote(str(self.root / wrapper))
+            if wrapper == "service.sh":
+                command += " stop"
+            self.assertIn(command, stderr)
+            self.assertEqual((self.root / "bin/rclone").read_bytes(), binary_before)
+            self.assertEqual((self.root / "config/vault.json").read_bytes(), vault_before)
+            self.assertEqual(cache_file.read_bytes(), b"pending local data")
+
+    def test_upgrade_stop_hint_uses_active_service_states(self) -> None:
+        for state, expected in (
+            ("enabled; active", True),
+            ("disabled; activating", True),
+            ("enabled; deactivating", True),
+            ("enabled; reloading", True),
+            ("disabled; inactive", False),
+            ("disabled; failed", False),
+            ("unknown (user systemd manager is unavailable)", False),
+        ):
+            with self.subTest(state=state), mock.patch.object(info, "service_status", return_value=state) as status:
+                self.assertEqual(install._user_service_active(self.root), expected)
+                status.assert_called_once_with(self.root, {})
 
     def test_imported_vault_secret_is_adapted_to_local_cache(self) -> None:
         backup = self.home / "vault backup.json"

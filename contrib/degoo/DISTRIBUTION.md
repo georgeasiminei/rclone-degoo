@@ -92,7 +92,10 @@ or use it like any other directory while it is mounted.
 ```
 
 `logs.sh` shows recent mount, login, setup, and status logs. Use `--follow` to
-watch new messages. If authentication cannot renew, `info.sh` shows a login-required
+watch new messages; press Ctrl+C to stop following. The `logs/` path is a
+directory, while `logs.sh` is the viewer. New mounts log notices and errors
+by default; routine cache-cleanup messages require a foreground mount with
+`mount.sh --log-level INFO`. If authentication cannot renew, `info.sh` shows a login-required
 warning with the login command. Run `~/.local/share/rclone-degoo/login.sh`
 again; the mount can reload the saved credentials. An expired access token
 alone does not establish a failure when automatic renewal is still possible.
@@ -104,12 +107,21 @@ use `~/.local/share/rclone-degoo/mount.sh` for a foreground mount. The
 plaintext chunks and a provisional 19 GiB encrypted object cap. The live
 provider limit above 20 GiB has not been verified.
 
-Stop the service or mount before upgrading. From the package root, run the
-launcher against the packaged binary:
+The upgrade wizard offers to stop the contained service or mount before
+collecting settings. It waits briefly for the mount after starting the service
+and reports the observed state. Command labels in its summary are shell
+comments; copy the executable command on the following line.
+
+For a noninteractive upgrade, stop the service and run the launcher against
+the packaged binary from the package root:
 
 ```sh
+~/.local/share/rclone-degoo/service.sh stop
 ./install.sh --binary ./bin/rclone --upgrade --no-wizard
+~/.local/share/rclone-degoo/service.sh start
 ```
+
+For a manual mount, use `~/.local/share/rclone-degoo/stop.sh` to unmount first.
 
 Upgrade preserves the vault secret, account tokens, email, remote and mount
 settings, and cache. It refuses a change to the vault folder ID. `login.sh`
