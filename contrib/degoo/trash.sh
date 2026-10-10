@@ -29,8 +29,9 @@ Options:
 
 The default auth file is
 ~/.local/share/rclone-degoo/config/auth.json. The default executable is
-build/rclone from this repository, then rclone on PATH. Set RCLONE_DEGOO_BIN
-or pass --rclone to override it.
+bin/rclone beside a packaged helper, then build/rclone from this source
+checkout, then rclone on PATH. Set RCLONE_DEGOO_BIN or pass --rclone to
+override it.
 
 Trash is account-wide and empty is irreversible. Generic rclone cleanup is
 deliberately not supported yet, and no restore operation exists.
@@ -130,8 +131,10 @@ if [ ! -f "$AUTH" ]; then
 fi
 
 if [ -z "$RCLONE" ]; then
-    if [ -x "$BASE/../build/rclone" ]; then
-        RCLONE=$BASE/../build/rclone
+    if [ -x "$BASE/bin/rclone" ]; then
+        RCLONE=$BASE/bin/rclone
+    elif [ -x "$BASE/../../build/rclone" ]; then
+        RCLONE=$BASE/../../build/rclone
     elif command -v rclone >/dev/null 2>&1; then
         RCLONE=$(command -v rclone)
     else

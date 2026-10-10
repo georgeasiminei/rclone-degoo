@@ -42,6 +42,17 @@ const itemFields = `
 		CreationTime
 `
 
+const trashItemFields = `
+		ID
+		Name
+		ParentID
+		Category
+		Size
+		LastModificationTime
+		CreationTime
+		IsInRecycleBin
+`
+
 const getFileChildrenQuery = `query GetFileChildren5(
 	$Token: String!
 	$ParentID: String
@@ -58,6 +69,24 @@ const getFileChildrenQuery = `query GetFileChildren5(
 	) {
 		Items {
 ` + itemFields + `		}
+		NextToken
+	}
+}`
+
+const getDeletedFilesQuery = `query GetDeletedFiles(
+	$Token: String!
+	$Limit: Int!
+	$Order: Int!
+	$NextToken: String
+) {
+	getDeletedFiles(
+		Token: $Token
+		Limit: $Limit
+		Order: $Order
+		NextToken: $NextToken
+	) {
+		Items {
+` + trashItemFields + `		}
 		NextToken
 	}
 }`
@@ -161,6 +190,8 @@ type Item struct {
 	LastModificationTime time.Time
 	// CreationTime is the provider creation time.
 	CreationTime time.Time
+	// IsInRecycleBin reports whether the item is in Degoo's recycle bin.
+	IsInRecycleBin bool
 }
 
 // UnmarshalJSON accepts numeric fields as JSON numbers or decimal strings and
@@ -175,6 +206,7 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 		URL                  string          `json:"URL"`
 		LastModificationTime json.RawMessage `json:"LastModificationTime"`
 		CreationTime         json.RawMessage `json:"CreationTime"`
+		IsInRecycleBin       bool            `json:"IsInRecycleBin"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
@@ -204,6 +236,7 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 		URL:                  wire.URL,
 		LastModificationTime: modified,
 		CreationTime:         created,
+		IsInRecycleBin:       wire.IsInRecycleBin,
 	}
 	return nil
 }
@@ -648,6 +681,63 @@ func (c *Client) ListDir(ctx context.Context, parentID string) ([]Item, error) {
 	}
 }
 
+// ListTrash returns items in the account-wide recycle bin. A limit of zero or
+// less requests every page; a positive limit returns at most that many items.
+// It rejects items that are not marked as recycled, repeated item IDs, and
+// repeated pagination cursors.
+func (c *Client) ListTrash(ctx context.Context, limit int) ([]Item, error) {
+	if limit < 0 {
+		return nil, &Error{operation: "GetDeletedFiles", message: "negative item limit"}
+	}
+	items := make([]Item, 0)
+	seenIDs := make(map[string]struct{})
+	seenTokens := make(map[string]struct{})
+	var nextToken string
+	for {
+		pageLimit := maxLimit
+		if limit > 0 {
+			pageLimit = min(maxLimit, limit-len(items))
+		}
+		variables := map[string]any{"Limit": pageLimit, "Order": 3}
+		if nextToken != "" {
+			variables["NextToken"] = nextToken
+		}
+		var response struct {
+			GetDeletedFiles struct {
+				Items     []Item `json:"Items"`
+				NextToken string `json:"NextToken"`
+			} `json:"getDeletedFiles"`
+		}
+		if err := c.graphql(ctx, "GetDeletedFiles", getDeletedFilesQuery, variables, &response, false); err != nil {
+			return nil, err
+		}
+		for _, item := range response.GetDeletedFiles.Items {
+			if item.ID == "" {
+				return nil, &Error{operation: "GetDeletedFiles", message: "response contained an item with an empty ID"}
+			}
+			if !item.IsInRecycleBin {
+				return nil, &Error{operation: "GetDeletedFiles", message: fmt.Sprintf("item %q was not marked as in the recycle bin", item.ID)}
+			}
+			if _, exists := seenIDs[item.ID]; exists {
+				return nil, &Error{operation: "GetDeletedFiles", message: fmt.Sprintf("duplicate item ID %q across pages", item.ID)}
+			}
+			seenIDs[item.ID] = struct{}{}
+			items = append(items, item)
+		}
+		if limit > 0 && len(items) >= limit {
+			return items[:limit], nil
+		}
+		nextToken = response.GetDeletedFiles.NextToken
+		if nextToken == "" {
+			return items, nil
+		}
+		if _, exists := seenTokens[nextToken]; exists {
+			return nil, &Error{operation: "GetDeletedFiles", message: "response repeated a pagination cursor"}
+		}
+		seenTokens[nextToken] = struct{}{}
+	}
+}
+
 // GetItem returns fresh metadata for an item, including its short-lived URL.
 func (c *Client) GetItem(ctx context.Context, id string) (Item, error) {
 	var response struct {
@@ -856,6 +946,32 @@ func (c *Client) Delete(ctx context.Context, id string, inRecycleBin bool) error
 	if err := c.graphql(ctx, "SetDeleteFile5", deleteMutation, map[string]any{
 		"IsInRecycleBin": inRecycleBin,
 		"IDs":            []map[string]string{{"FileID": id}},
+	}, &response, true); err != nil {
+		return err
+	}
+	_, err := mutationAcknowledgement("SetDeleteFile5", response.SetDeleteFile5)
+	return err
+}
+
+// DeleteTrashItems permanently deletes items that are already in Degoo's
+// recycle bin. An empty input is a successful no-op.
+func (c *Client) DeleteTrashItems(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	input := make([]map[string]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			return &Error{operation: "SetDeleteFile5", message: "permanent deletion requested an item with an empty ID"}
+		}
+		input = append(input, map[string]string{"FileID": id})
+	}
+	var response struct {
+		SetDeleteFile5 json.RawMessage `json:"setDeleteFile5"`
+	}
+	if err := c.graphql(ctx, "SetDeleteFile5", deleteMutation, map[string]any{
+		"IsInRecycleBin": true,
+		"IDs":            input,
 	}, &response, true); err != nil {
 		return err
 	}

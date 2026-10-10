@@ -205,9 +205,10 @@ release checks are:
   containing only generated trash. Because trash is account-wide, it must not
   be run against an account with personal or unrelated trash items.
 
-Local wrapper checks for this branch are recorded in the local validation
-section below; they do not substitute for mocked command tests or the isolated
-live acceptance gate.
+Local wrapper syntax, help, argument-forwarding, package self-check, Go
+tests, Go build, Go vet, and changed-file Markdown linting passed for this
+branch. They do not substitute for live trash listing or emptying against a
+disposable account.
 
 ## Reproduce the opt-in checks
 

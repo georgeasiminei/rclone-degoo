@@ -132,9 +132,10 @@ configuration and commands.
 
 From a source checkout, `trash.sh` gives the account-trash commands a concise
 interface. The auth file defaults to the contained installation's
-`config/auth.json`, and `--rclone PATH` can override the default binary lookup.
-The auth file is passed to rclone without being read or displayed by the
-wrapper:
+`config/auth.json`. The helper prefers a packaged `bin/rclone`, then a source
+checkout's `build/rclone`, then `rclone` from `PATH`; `--rclone PATH` can
+override that lookup. The auth file is passed to rclone without being read or
+displayed by the wrapper:
 
 ```sh
 ./contrib/degoo/trash.sh list --auth ~/.config/rclone-degoo/auth.json

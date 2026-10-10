@@ -19,6 +19,7 @@ These request shapes are reference evidence, not a live provider guarantee.
 | Registration | `SetUploadFile3`, string size/checksum/time | Outcome can be ambiguous; mutation idempotency is unproven |
 | Rename | `SetRenameFile`, `FileRenames: [{ID, NewName}]` | No distributed transaction across move and rename |
 | Move | `SetMoveFile`, `FileIDs`, `NewParentID`, `Copy=false` | Account-root moves are not supported by the reference |
+| Trash listing | `GetDeletedFiles`, `Limit=1000`, `Order=3`, opaque `NextToken`, `IsInRecycleBin` | The reference request has no parent/device filter and may be account-wide |
 | Delete | `SetDeleteFile5`, `IDs: [{FileID}]`, `IsInRecycleBin` | Dedicated-vault confinement is essential |
 
 The provider checksum is SHA1 over seed bytes and at most the first 1 MiB,

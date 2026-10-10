@@ -101,6 +101,24 @@ until remote uploads complete.
 See [installation and cleanup](docs/degoo/INSTALLATION.md) for existing vaults,
 dependency setup, service operation, settings, and recovery.
 
+## Account trash
+
+Degoo trash is account-wide, not limited to the configured vault. The explicit
+commands below take the account-auth file directly and never appear as a normal
+remote path:
+
+```sh
+./rclone degoo trash ~/.config/rclone-degoo/auth.json
+./rclone degoo empty-trash ~/.config/rclone-degoo/auth.json --dry-run
+./rclone degoo empty-trash ~/.config/rclone-degoo/auth.json --yes
+```
+
+`trash` lists all recycled items, `--dry-run` previews what emptying would
+delete, and `empty-trash` permanently removes them after two confirmations
+unless `--yes` is supplied. There is no restore operation.
+
+See [usage](docs/degoo/USAGE.md) and the packaged `trash.sh` helper for details.
+
 ## Cache and verification
 
 Edit `~/.local/share/rclone-degoo/config/mount.json` and restart the mount or
