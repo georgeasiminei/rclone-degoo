@@ -46,11 +46,16 @@ guarantee of current Degoo behavior. It is not a filesystem implementation.
 Keep handoff documents portable: no dependence on another chat, Windows paths,
 local credentials, or a particular developer's environment.
 
-Fetch before creating a feature branch. This fork currently follows upstream
-`master` and has no `development` branch, so use the latest `origin/master`
-unless the user or later repository policy selects another base. `origin` is
-the user's fork; `upstream` is rclone. Keep fork pull requests directed at the
-fork. Submitting changes to upstream rclone is a separate decision.
+The `staging` branch is the integration branch for this fork. It was initialized
+from `feat/degoo-vault` at the user's request; subsequent work starts from
+`origin/staging` and returns through a pull request targeting `staging`.
+
+Fetch before creating each feature branch and base it on the latest
+`origin/staging`. Make changes on feature branches and open a pull request to
+`staging` in the user's fork. The user will merge each pull request and delete
+its source branch; do not merge pull requests or delete their source branches.
+Keep this fork's pull requests directed to the fork; submitting changes to
+upstream rclone is a separate decision.
 
 For documentation-only work, check Markdown and `git diff --check`. For source
 changes, follow the build, lint, and test guidance below. Report checks that
