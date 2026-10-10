@@ -77,6 +77,34 @@ login and vault setup:
 ./contrib/degoo/degoo-rc install --binary ./build/rclone --no-wizard
 ```
 
+## Build the distributable archive
+
+From the repository root, build the Degoo-enabled binary and create the Linux
+amd64 archive with its SHA-256 sidecar:
+
+```sh
+mkdir -p build
+go build -o build/rclone .
+python3 bin/package-degoo.py \
+  --binary build/rclone \
+  --output dist/rclone-degoo-linux-amd64.tar.gz
+```
+
+The package builder checks the binary's Degoo command, assembles the allowlisted
+installer files and documentation, then validates the archive in an isolated
+temporary home. To run its fixture-based packaging checks separately:
+
+```sh
+python3 bin/package-degoo.py --self-check
+```
+
+Verify the generated checksum from the output directory:
+
+```sh
+cd dist
+sha256sum -c rclone-degoo-linux-amd64.tar.gz.sha256
+```
+
 After a staged install, log in and finish setup with the installed command:
 
 ```sh

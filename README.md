@@ -66,6 +66,9 @@ newer for the installer. Mounting also needs FUSE 3 or a compatible
 packages using a detected package manager. A systemd user manager is optional;
 without it, mount in the foreground.
 
+To build the archive for distribution, follow
+[the archive packaging instructions](docs/degoo/INSTALLATION.md#build-the-distributable-archive).
+
 The installer puts `degoo-rc` at `~/.local/share/rclone-degoo/degoo-rc` and
 links `~/.local/bin/degoo-rc` to it. It does not edit shell profiles; if that
 directory is missing from `PATH`, it prints an export command. Use
