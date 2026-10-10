@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -15,6 +16,11 @@ import install as installer
 
 class SetupError(Exception):
     """A safe error from the contained vault setup helper."""
+
+
+def _degoo_rc(root: Path, *arguments: str) -> str:
+    """Return a copyable command through the contained user-facing CLI."""
+    return " ".join(shlex.quote(value) for value in (str(root / "degoo-rc"), *arguments))
 
 
 def _root(value: str) -> Path:
@@ -108,7 +114,7 @@ def _run_create(root: Path, parent_id: str, name: str) -> str:
         raise SetupError("Degoo could not create the dedicated vault folder") from None
     if result.returncode != 0:
         # Do not include provider output, which may contain account metadata.
-        raise SetupError("Degoo rejected vault creation; check login.sh and the parent folder ID")
+        raise SetupError(f"Degoo rejected vault creation; check {_degoo_rc(root, 'login')} and the parent folder ID")
     try:
         text = result.stdout.decode("ascii").strip()
     except UnicodeDecodeError:
@@ -154,7 +160,11 @@ def run(args: argparse.Namespace) -> int:
     folder_id = _run_create(root, parent_id, name)
     code = _finish_install(root, folder_id, name, created=True, vault_config=args.vault_config)
     if code != 0:
-        print(f"The folder was created, but local setup did not finish. Re-run with --folder-id {folder_id} --name {name!r}.", file=sys.stderr)
+        print(
+            "The folder was created, but local setup did not finish. Re-run with "
+            f"{_degoo_rc(root, 'setup', '--folder-id', folder_id, '--name', name)}.",
+            file=sys.stderr,
+        )
         return code
     return 0
 

@@ -1,8 +1,8 @@
 # Degoo vault installer for Linux
 
 This is the README shipped at the root of the prebuilt archive. The archive
-contains the Linux amd64 client, installer, helper scripts, license, and
-documentation. It does not contain Degoo account credentials, vault
+contains the Linux amd64 client, unified `degoo-rc` command, helper scripts,
+license, and documentation. It does not contain Degoo account credentials, vault
 configuration, cache data, or a vault secret. The same tarball can be shared
 with other Linux amd64 users; it is not currently uploaded as a GitHub release
 asset.
@@ -37,12 +37,12 @@ sha256sum -c rclone-degoo-linux-amd64.tar.gz.sha256
 extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
 tar -xzf "$HOME/Downloads/rclone-degoo-linux-amd64.tar.gz" -C "$extract_dir"
 cd "$extract_dir/rclone-degoo"
-./install.sh
+./degoo-rc install
 ```
 
-With no options in a terminal, `install.sh` starts the setup wizard. It checks
-dependencies, installs or upgrades the contained client, logs into Degoo, and
-helps select an existing dedicated folder or create a new one. It suggests a
+With no options in a terminal, `degoo-rc install` starts the setup wizard. It
+checks dependencies, installs or upgrades the contained client, logs into Degoo,
+and helps select an existing dedicated folder or create a new one. It suggests a
 discovered device folder and names a new vault `rclone-degoo-vault` by default.
 Account root ID `0` is used to list device folders; it cannot be the vault
 folder or the parent of a live create request. Each user should use their own
@@ -58,67 +58,73 @@ git clone --branch staging https://github.com/georgeasiminei/rclone-degoo.git
 cd rclone-degoo
 mkdir -p build
 go build -o build/rclone .
-./contrib/degoo/install.sh --wizard --binary ./build/rclone
+./contrib/degoo/degoo-rc install
 ```
+
+Pass `--binary ./build/rclone` to choose a specific binary.
 
 For an unattended or staged source install, keep the `--binary` option and add
 `--no-wizard`:
 
 ```sh
-./contrib/degoo/install.sh --binary ./build/rclone --no-wizard
+./contrib/degoo/degoo-rc install --binary ./build/rclone --no-wizard
 ```
 
-Then log in and finish setup using the contained helpers:
+Then log in and finish setup with the installed command:
 
 ```sh
-~/.local/share/rclone-degoo/login.sh
-~/.local/share/rclone-degoo/folders.sh --parent-id 0
-~/.local/share/rclone-degoo/setup.sh --parent-id DEVICE_ID --name rclone-degoo-vault
-~/.local/share/rclone-degoo/service.sh enable
+degoo-rc login
+degoo-rc folders --parent-id 0
+degoo-rc setup --parent-id DEVICE_ID --name rclone-degoo-vault
+degoo-rc service enable
 ```
 
 ## Account trash
 
-The packaged `trash.sh` helper wraps the account-wide Degoo trash commands and
-uses the packaged `bin/rclone` automatically:
+The unified command provides separate list and deletion operations for
+account-wide Degoo trash:
 
 ```sh
-./trash.sh list --auth ~/.config/rclone-degoo/auth.json
-./trash.sh list --auth ~/.config/rclone-degoo/auth.json --limit 10 --json
-./trash.sh empty --auth ~/.config/rclone-degoo/auth.json --dry-run
-./trash.sh empty --auth ~/.config/rclone-degoo/auth.json --yes
+degoo-rc trash --auth ~/.config/rclone-degoo/auth.json --limit 10 --json
+degoo-rc empty-trash --auth ~/.config/rclone-degoo/auth.json --dry-run
+degoo-rc empty-trash --auth ~/.config/rclone-degoo/auth.json --yes
 ```
 
 Trash is account-wide, not vault-scoped. Emptying it is irreversible and prompts
-twice unless `--yes` is supplied. The wrapper does not read or print the auth
+twice unless `--yes` is supplied. The command does not read or print the auth
 file contents. There is no restore operation.
 
 ## Mount, upgrade, and recover
 
 At the end of setup, the wizard prints the install directory, mount path,
-actual mount state, helper commands, and log locations. Your helper scripts
-live under `~/.local/share/rclone-degoo/`. The default mount path is
+actual mount state, helper commands, and log locations. The `degoo-rc`
+command is installed on `PATH`; the default mount path is
 `~/.local/share/rclone-degoo/mount`; open that directory in your file manager
 or use it like any other directory while it is mounted.
 
 ```sh
-~/.local/share/rclone-degoo/info.sh
-~/.local/share/rclone-degoo/logs.sh
-~/.local/share/rclone-degoo/logs.sh --follow
+degoo-rc info
+degoo-rc logs
+degoo-rc logs --follow
 ```
 
-`logs.sh` shows recent mount, login, setup, and status logs. Use `--follow` to
-watch new messages; press Ctrl+C to stop following. The `logs/` path is a
-directory, while `logs.sh` is the viewer. New mounts log notices and errors
-by default; routine cache-cleanup messages require a foreground mount with
-`mount.sh --log-level INFO`. If authentication cannot renew, `info.sh` shows a login-required
-warning with the login command. Run `~/.local/share/rclone-degoo/login.sh`
+`degoo-rc logs` shows recent mount, login, setup, and status logs. Use
+`--follow` to watch new messages; press Ctrl+C to stop following. The `logs/`
+path is a directory, while `degoo-rc logs` is the viewer. New mounts log
+notices and errors by default; routine cache-cleanup messages require a
+foreground mount with `degoo-rc mount --log-level INFO`. If authentication
+cannot renew, `degoo-rc info` shows a login-required warning with the login
+command. Run `degoo-rc login`
 again; the mount can reload the saved credentials. An expired access token
 alone does not establish a failure when automatic renewal is still possible.
 
-The private install root is `~/.local/share/rclone-degoo`. The wizard offers
+The private install root is `~/.local/share/rclone-degoo`. The installer puts
+the entrypoint at `~/.local/share/rclone-degoo/degoo-rc` and links it from
+`~/.local/bin/degoo-rc`. It does not edit shell profiles; when needed, it prints
+a `PATH` export for the current shell or for you to add yourself. Uninstall
+removes the link when it still points to this installation. The wizard offers
 to enable a systemd user service when a user manager is available. Otherwise,
-use `~/.local/share/rclone-degoo/mount.sh` for a foreground mount. The
+use `degoo-rc mount` for a foreground mount. The
 `config/mount.json` file holds cache and upload settings. New vaults use 1 GiB
 plaintext chunks and a provisional 19 GiB encrypted object cap. The live
 provider limit above 20 GiB has not been verified.
@@ -132,20 +138,20 @@ For a noninteractive upgrade, stop the service and run the launcher against
 the packaged binary from the package root:
 
 ```sh
-~/.local/share/rclone-degoo/service.sh stop
-./install.sh --binary ./bin/rclone --upgrade --no-wizard
-~/.local/share/rclone-degoo/service.sh start
+degoo-rc service stop
+./degoo-rc install --binary ./bin/rclone --upgrade --no-wizard
+degoo-rc service start
 ```
 
-For a manual mount, use `~/.local/share/rclone-degoo/stop.sh` to unmount first.
+For a manual mount, use `degoo-rc stop` to unmount first.
 
 Upgrade preserves the vault secret, account tokens, email, remote and mount
-settings, and cache. It refuses a change to the vault folder ID. `login.sh`
+settings, and cache. It refuses a change to the vault folder ID. `degoo-rc login`
 remembers the account email but never saves the account password; token renewal
 is automatic when supported, though long-term unattended renewal remains
 unverified.
 
-Run `~/.local/share/rclone-degoo/info.sh` to inspect mount, service, cache, and
+Run `degoo-rc info` to inspect mount, service, cache, and
 pending-upload status. Keep the cache until pending uploads reach zero. A
 locally saved file may still await remote upload; pending changes and their
 matching vault configuration are both needed to resume work after recovery.
@@ -155,10 +161,10 @@ matching vault configuration are both needed to resume work after recovery.
 Inspect the install without changing it:
 
 ```sh
-~/.local/share/rclone-degoo/uninstall.sh --inventory
+degoo-rc uninstall --inventory
 ```
 
-In a terminal, running `uninstall.sh` with no arguments or with `--wizard`
+In a terminal, running `degoo-rc uninstall` with no arguments or with `--wizard`
 starts guided cleanup. It offers to retain the vault/account configuration,
 cache, and logs in a private backup directory; each choice defaults to No.
 
@@ -193,19 +199,30 @@ limits.
 ```text
 rclone-degoo/
   README.md
-  install.sh
-  uninstall.sh
-  trash.sh
+  degoo-rc
   bin/rclone
+  scripts/*.sh
   scripts/python/*.py
+  install.sh                 legacy compatibility wrapper
+  uninstall.sh               legacy compatibility wrapper
+  trash.sh                   legacy compatibility wrapper
   docs/*.md
   docs/BUILD.json
   licenses/COPYING
   licenses/degoo-NOTICE
 ```
 
-The six Markdown files in `docs/` are copied from `docs/degoo/` and flattened
-to that directory. `docs/BUILD.json` records package provenance and the
+The unified command dispatches to shell helpers in `scripts/` and Python
+implementations in `scripts/python/`. The source and archive roots may include
+legacy install, uninstall, and trash shims. A fresh installed root has
+`degoo-rc` as its only root-level command; upgrades retain existing root-level
+`.sh` shims. New examples use `degoo-rc`. The command list is available with
+`degoo-rc help`, and `degoo-rc COMMAND help` shows that command's options.
+`service` accepts `enable`, `disable`, `start`, `stop`, `restart`, and `status`;
+existing command options remain available. `trash` lists account trash, while
+`empty-trash` is the separate deletion command. The six Markdown files in
+`docs/` are copied from `docs/degoo/` and flattened to that directory.
+`docs/BUILD.json` records package provenance and the
 included binary's SHA-256. The two license files are the repository's `COPYING`
 and the Degoo backend notice. The `.tar.gz.sha256` checksum sidecar is next to
 the archive, not inside it.

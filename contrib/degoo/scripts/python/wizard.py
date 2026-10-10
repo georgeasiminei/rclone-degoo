@@ -317,6 +317,11 @@ def _shell_path(path: Path) -> str:
     return shlex.quote(str(path))
 
 
+def _degoo_rc(root: Path, *arguments: str) -> str:
+    """Return a copyable command through the contained user-facing CLI."""
+    return " ".join(shlex.quote(value) for value in (str(root / "degoo-rc"), *arguments))
+
+
 def _print_command_block(label: str, command: str) -> None:
     print(f"  # {label}")
     print(f"  {command}")
@@ -409,8 +414,8 @@ def _trusted_fusermount() -> Path | None:
 
 def _mount_stop_command(root: Path, service_configured: bool) -> str:
     if service_configured:
-        return f"{_shell_path(root / 'service.sh')} stop"
-    return _shell_path(root / "stop.sh")
+        return _degoo_rc(root, "service", "stop")
+    return _degoo_rc(root, "stop")
 
 
 def _busy_mount_error(root: Path, service_configured: bool) -> WizardError:
@@ -418,15 +423,15 @@ def _busy_mount_error(root: Path, service_configured: bool) -> WizardError:
     return WizardError(
         "the mount is still connected or busy; close applications using it, then stop this install and retry.\n"
         f"# Stop this install's mount\n  {stop_command}\n\n"
-        f"# Inspect mount and service logs\n  {_shell_path(root / 'logs.sh')}"
+        f"# Inspect mount and service logs\n  {_degoo_rc(root, 'logs')}"
     )
 
 
 def _mount_state_error(root: Path, detail: str) -> WizardError:
     return WizardError(
         f"{detail}; refusing to upgrade safely.\n"
-        f"# Check local mount and service state\n  {_shell_path(root / 'info.sh')}\n\n"
-        f"# Inspect mount and service logs\n  {_shell_path(root / 'logs.sh')}"
+        f"# Check local mount and service state\n  {_degoo_rc(root, 'info')}\n\n"
+        f"# Inspect mount and service logs\n  {_degoo_rc(root, 'logs')}"
     )
 
 
@@ -603,7 +608,7 @@ def _completion_summary(
                 f"  The service accepted the start request, but the mount was not confirmed after "
                 f"up to {MOUNT_STATE_TIMEOUT:g} seconds (last check: {waited})."
             )
-            print(f"  Inspect recent startup output with {_shell_path(root / 'logs.sh')}.")
+            print(f"  Inspect recent startup output with {_degoo_rc(root, 'logs')}.")
     elif not mount_ready:
         print(
             "  Mount dependencies are incomplete; install the FUSE helper and mountpoint utility, "
@@ -614,19 +619,19 @@ def _completion_summary(
 
     print("  # Run the command block for the action you need:")
     print()
-    _print_command_block("Local status", _shell_path(root / "info.sh"))
-    _print_command_block("Degoo account login or re-login", _shell_path(root / "login.sh"))
-    _print_command_block("Vault folder setup options", f"{_shell_path(root / 'setup.sh')} --help")
-    _print_command_block("Pending local upload count", _shell_path(root / "status.sh"))
-    _print_command_block("User service state, if configured", f"{_shell_path(root / 'service.sh')} status")
-    _print_command_block("Enable and start the user service", f"{_shell_path(root / 'service.sh')} enable")
-    _print_command_block("Stop the user service before an upgrade, if configured", f"{_shell_path(root / 'service.sh')} stop")
-    _print_command_block("Manual foreground mount", _shell_path(root / "mount.sh"))
-    _print_command_block("Unmount this install's foreground/manual mount", _shell_path(root / "stop.sh"))
-    _print_command_block("Uninstall wizard", _shell_path(root / "uninstall.sh"))
-    _print_command_block("Recent mount, login, setup, and status logs", _shell_path(root / "logs.sh"))
-    _print_command_block("Follow mount, login, setup, and status logs", f"{_shell_path(root / 'logs.sh')} --follow")
-    _print_command_block("Log helper options", f"{_shell_path(root / 'logs.sh')} --help")
+    _print_command_block("Local status", _degoo_rc(root, "info"))
+    _print_command_block("Degoo account login or re-login", _degoo_rc(root, "login"))
+    _print_command_block("Vault folder setup options", _degoo_rc(root, "setup", "help"))
+    _print_command_block("Pending local upload count", _degoo_rc(root, "status"))
+    _print_command_block("User service state, if configured", _degoo_rc(root, "service", "status"))
+    _print_command_block("Enable and start the user service", _degoo_rc(root, "service", "enable"))
+    _print_command_block("Stop the user service before an upgrade, if configured", _degoo_rc(root, "service", "stop"))
+    _print_command_block("Manual foreground mount", _degoo_rc(root, "mount"))
+    _print_command_block("Unmount this install's foreground/manual mount", _degoo_rc(root, "stop"))
+    _print_command_block("Uninstall wizard", _degoo_rc(root, "uninstall"))
+    _print_command_block("Recent mount, login, setup, and status logs", _degoo_rc(root, "logs"))
+    _print_command_block("Follow mount, login, setup, and status logs", _degoo_rc(root, "logs", "--follow"))
+    _print_command_block("Log helper options", _degoo_rc(root, "logs", "help"))
     print(f"  # Log directory: {shlex.quote(str(root / 'logs') + os.sep)}")
     print()
     _print_command_block("Recent user service journal", "journalctl --user -u rclone-degoo.service -n 100 --no-pager")
@@ -793,9 +798,9 @@ def _load_folders(root: Path) -> list[dict[str, Any]]:
             umask=0o077,
         )
     except (OSError, subprocess.TimeoutExpired):
-        raise WizardError("Degoo could not list device folders; run login.sh and retry") from None
+        raise WizardError(f"Degoo could not list device folders; run {_degoo_rc(root, 'login')} and retry") from None
     if result.returncode != 0:
-        raise WizardError("Degoo could not list device folders; run login.sh and retry")
+        raise WizardError(f"Degoo could not list device folders; run {_degoo_rc(root, 'login')} and retry")
     try:
         data = json.loads(result.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
@@ -1028,7 +1033,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             root,
             mount_ready=mount_ready,
             systemd_available=systemd_available,
-            note="Account login did not complete; retry with login.sh.",
+            note=f"Account login did not complete; retry with {_degoo_rc(root, 'login')}.",
         )
         raise
     if login_result != 0:
@@ -1036,7 +1041,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             root,
             mount_ready=mount_ready,
             systemd_available=systemd_available,
-            note=f"Account login did not complete (exit code {login_result}); retry with login.sh.",
+            note=f"Account login did not complete (exit code {login_result}); retry with {_degoo_rc(root, 'login')}.",
         )
         return login_result
     if configured_folder_id:
@@ -1059,7 +1064,10 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                     root,
                     mount_ready=mount_ready,
                     systemd_available=systemd_available,
-                    note="Vault folder discovery did not complete; retry after checking login.sh and setup.sh.",
+                    note=(
+                        "Vault folder discovery did not complete; retry after checking "
+                        f"{_degoo_rc(root, 'login')} and {_degoo_rc(root, 'setup', 'help')}."
+                    ),
                 )
                 raise
             parent_id = _select_parent(folders, input_fn=input_fn)
@@ -1089,7 +1097,10 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 root,
                 mount_ready=mount_ready,
                 systemd_available=systemd_available,
-                note="Vault folder setup did not complete; inspect info.sh and retry with setup.sh.",
+                note=(
+                    "Vault folder setup did not complete; inspect "
+                    f"{_degoo_rc(root, 'info')} and retry with {_degoo_rc(root, 'setup', 'help')}."
+                ),
             )
             raise
         if setup_result != 0:
@@ -1099,7 +1110,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 systemd_available=systemd_available,
                 note=(
                     f"Vault folder setup did not complete (exit code {setup_result}); "
-                    "inspect info.sh and retry with setup.sh."
+                    f"inspect {_degoo_rc(root, 'info')} and retry with {_degoo_rc(root, 'setup', 'help')}."
                 ),
             )
             return setup_result
@@ -1111,7 +1122,10 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             root,
             mount_ready=mount_ready,
             systemd_available=systemd_available,
-            note="Vault mount settings could not be saved; inspect info.sh before retrying setup.",
+            note=(
+                "Vault mount settings could not be saved; inspect "
+                f"{_degoo_rc(root, 'info')} before retrying {_degoo_rc(root, 'setup', 'help')}."
+            ),
         )
         raise
 

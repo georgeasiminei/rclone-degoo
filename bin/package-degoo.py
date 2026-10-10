@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 
 ROOT_NAME = "rclone-degoo"
 PYTHON_HELPERS = (
+    "cli.py",
     "install.py",
     "login.py",
     "setup.py",
@@ -37,7 +38,17 @@ DOC_FILES = (
     "USAGE.md",
     "VALIDATION.md",
 )
+SHELL_LAUNCHERS = (
+    "degoo-rc", "install.sh", "uninstall.sh", "trash.sh",
+    "scripts/install.sh", "scripts/uninstall.sh", "scripts/trash.sh",
+)
+CLI_COMMANDS = (
+    "install", "uninstall", "login", "setup", "mount", "stop", "status",
+    "location", "folders", "service", "info", "logs", "trash", "empty-trash",
+)
 PACKAGE_ENTRIES = (
+    ("contrib/degoo/degoo-rc", "degoo-rc"),
+    *((f"contrib/degoo/{name}", name) for name in SHELL_LAUNCHERS if name.startswith("scripts/")),
     ("contrib/degoo/install.sh", "install.sh"),
     ("contrib/degoo/uninstall.sh", "uninstall.sh"),
     ("contrib/degoo/trash.sh", "trash.sh"),
@@ -235,12 +246,7 @@ def extracted_archive(archive_path: Path, expected_paths: set[str], destination:
                 path = PurePosixPath(member.name)
                 if path.is_absolute() or ".." in path.parts or not member.isfile():
                     raise PackageError(f"the package archive contains an unsafe entry: {member.name}")
-                if member.name in (
-                    f"{ROOT_NAME}/bin/rclone",
-                    f"{ROOT_NAME}/install.sh",
-                    f"{ROOT_NAME}/uninstall.sh",
-                    f"{ROOT_NAME}/trash.sh",
-                ) and not member.mode & 0o111:
+                if member.name in {f"{ROOT_NAME}/{name}" for name in ("bin/rclone", *SHELL_LAUNCHERS)} and not member.mode & 0o111:
                     raise PackageError(f"the package entrypoint is not executable: {member.name}")
             root = destination / ROOT_NAME
             for member in members:
@@ -257,10 +263,10 @@ def extracted_archive(archive_path: Path, expected_paths: set[str], destination:
     return root
 
 
-def run_launcher_help(launcher: Path, env: dict[str, str]) -> None:
+def run_launcher_help(launcher: Path, env: dict[str, str], *arguments: str) -> None:
     try:
         result = subprocess.run(
-            [str(launcher), "--help"],
+            [str(launcher), *(arguments or ("--help",))],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -296,8 +302,10 @@ def validate_archive_launchers(archive_path: Path, expected_paths: set[str]) -> 
             "LC_ALL": "C",
         }
         Path(env["HOME"]).mkdir()
-        for name in ("install.sh", "uninstall.sh", "trash.sh"):
+        for name in SHELL_LAUNCHERS:
             run_launcher_help(extracted / name, env)
+        for command in CLI_COMMANDS:
+            run_launcher_help(extracted / "degoo-rc", env, command, "help")
 
 
 def tar_info(arcname: str, size: int, mode: int) -> tarfile.TarInfo:
@@ -371,7 +379,7 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
                             add_bytes(archive, arcname, data)
                             continue
                         with source.open("rb") as stream:
-                            mode = 0o755 if PurePosixPath(arcname).name in {"install.sh", "uninstall.sh", "trash.sh"} else 0o644
+                            mode = 0o755 if str(PurePosixPath(arcname).relative_to(ROOT_NAME)) in SHELL_LAUNCHERS else 0o644
                             archive.addfile(tar_info(arcname, source.stat().st_size, mode), stream)
             raw.flush()
             os.fsync(raw.fileno())
@@ -496,7 +504,7 @@ def self_check(root: Path) -> None:
         good_binary = workspace / "fake-rclone"
         good_binary.write_text(
             "#!/bin/sh\n"
-            "if [ \"$1\" = degoo ] && [ \"$2\" = --help ]; then\n"
+            "if [ \"$1\" = degoo ]; then\n"
             "  printf '%s\\n' 'Usage: rclone degoo command mount login'\n"
             "  exit 0\n"
             "fi\n"
@@ -573,9 +581,7 @@ def self_check(root: Path) -> None:
         if archive_path.read_bytes() != first_archive or checksum_path.read_bytes() != first_checksum:
             raise PackageError("self-check found that repeated packaging is not deterministic")
         required_paths = {
-            f"{ROOT_NAME}/install.sh",
-            f"{ROOT_NAME}/uninstall.sh",
-            f"{ROOT_NAME}/trash.sh",
+            *(f"{ROOT_NAME}/{name}" for name in SHELL_LAUNCHERS),
             f"{ROOT_NAME}/README.md",
             f"{ROOT_NAME}/bin/rclone",
             f"{ROOT_NAME}/licenses/COPYING",
@@ -593,7 +599,7 @@ def self_check(root: Path) -> None:
             binary_info = archive.getmember(f"{ROOT_NAME}/bin/rclone")
             if not binary_info.mode & 0o111:
                 raise PackageError("self-check found a non-executable packaged binary")
-            for launcher in (f"{ROOT_NAME}/install.sh", f"{ROOT_NAME}/uninstall.sh", f"{ROOT_NAME}/trash.sh"):
+            for launcher in (f"{ROOT_NAME}/{name}" for name in SHELL_LAUNCHERS):
                 launcher_info = archive.getmember(launcher)
                 if not launcher_info.mode & 0o111:
                     raise PackageError(f"self-check found a non-executable launcher: {launcher}")
@@ -631,7 +637,7 @@ def self_check(root: Path) -> None:
             "LC_ALL": "C",
         }
         install_result = subprocess.run(
-            [str(extracted / "install.sh"), "--binary", str(extracted / "bin/rclone"), "--no-wizard"],
+            [str(extracted / "degoo-rc"), "install", "--binary", str(extracted / "bin/rclone"), "--no-wizard"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -651,7 +657,7 @@ def self_check(root: Path) -> None:
             (["--delete-local", "--root", str(staged_root)], "remove the staged local install"),
         ):
             result = subprocess.run(
-                [str(extracted / "uninstall.sh"), *arguments],
+                [str(extracted / "degoo-rc"), "uninstall", *arguments],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

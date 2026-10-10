@@ -1,5 +1,5 @@
 #!/bin/sh
+# Compatibility entrypoint; use degoo-rc uninstall.
 set -eu
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-export PYTHONDONTWRITEBYTECODE=1
-exec python3 "$BASE/scripts/python/uninstall.py" "$@"
+exec "$BASE/scripts/uninstall.sh" "$@"

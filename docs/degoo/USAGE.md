@@ -15,6 +15,24 @@ that session. Long-term renewal, larger live files, and the provider object-size
 limit remain acceptance gates; see
 [VALIDATION.md](VALIDATION.md) for the tested scope.
 
+The contained installer and maintenance commands use one `degoo-rc` entrypoint.
+Start it from a source checkout with `./contrib/degoo/degoo-rc install`,
+from the archive root with `./degoo-rc install`, or use `degoo-rc help` after
+installation. Run `degoo-rc COMMAND help` for detailed options. The installer
+places the command at `~/.local/share/rclone-degoo/degoo-rc` and links it from
+`~/.local/bin/degoo-rc`; it does not edit shell profiles and prints a `PATH`
+export if that directory is missing from `PATH`. Uninstall removes the link
+only when it still points to this install. A fresh installed root has
+`degoo-rc` as its only root-level command; upgrades retain existing root-level
+`.sh` shims. Source and archive roots may include legacy install, uninstall,
+and trash shims. Examples here use `degoo-rc`.
+
+The command set is `install`, `uninstall`, `login`, `setup`, `mount`, `stop`,
+`status`, `location`, `folders`, `service`, `info`, `logs`, `trash`, and
+`empty-trash`. Service actions are `enable`, `disable`, `start`, `stop`,
+`restart`, and `status`. Existing command options remain available. `trash`
+lists account trash; `empty-trash` separately performs account-wide deletion.
+
 For the recommended contained installer, persistent user service, cached-email
 login, mount settings, and complete local cleanup, see
 [INSTALLATION.md](INSTALLATION.md). The manual steps below are an alternative
@@ -164,20 +182,18 @@ directly. They do not use the vault configuration or a remote path:
 The command prompts twice unless `--yes` is supplied. `--dry-run` only lists
 what would be deleted and makes no account changes.
 
-The source-checkout wrapper provides friendly aliases and the same checks:
+The unified command provides the same operations:
 
 ```sh
-./contrib/degoo/trash.sh list --auth ~/.config/rclone-degoo/auth.json --limit 10 --json
-./contrib/degoo/trash.sh empty --auth ~/.config/rclone-degoo/auth.json --dry-run
-./contrib/degoo/trash.sh empty --auth ~/.config/rclone-degoo/auth.json --yes
+degoo-rc trash --auth ~/.config/rclone-degoo/auth.json --limit 10 --json
+degoo-rc empty-trash --auth ~/.config/rclone-degoo/auth.json --dry-run
+degoo-rc empty-trash --auth ~/.config/rclone-degoo/auth.json --yes
 ```
 
-`list` maps to `trash`, and `empty` maps to `empty-trash`. The wrapper defaults
-to the contained installation's `config/auth.json`. It prefers a packaged
-`bin/rclone`, then a source checkout's `build/rclone`, then `rclone` from
-`PATH`. Set `RCLONE_DEGOO_AUTH` or `RCLONE_DEGOO_BIN`, or pass `--auth`
-or `--rclone`, to override either path. It passes the auth file through
-without reading or displaying its contents.
+The auth file defaults to the contained installation's `config/auth.json`.
+Pass `--auth` to select another private file. The command passes the auth path
+through without reading or displaying its contents. The legacy `trash.sh`
+wrapper remains available for compatibility.
 
 Trash is not confined to one Degoo folder or vault. Listing can expose
 account-wide metadata, and emptying can destroy unrelated trash. Generic

@@ -151,14 +151,16 @@ class WizardTest(unittest.TestCase):
         self.assertEqual(result, 2)
         setup_call.assert_not_called()
         self.assertIn("Installation summary:", output)
-        self.assertIn("retry with login.sh", output)
+        self.assertIn("retry with", output)
+        self.assertIn("degoo-rc login", output)
 
     def test_failed_setup_stops_before_mount_service(self) -> None:
         result, _, setup_call, output = self._run_default_flow(setup_code=3)
         self.assertEqual(result, 3)
         setup_call.assert_called_once()
         self.assertIn("Installation summary:", output)
-        self.assertIn("retry with setup.sh", output)
+        self.assertIn("retry with", output)
+        self.assertIn("degoo-rc setup help", output)
 
     def test_manual_flow_prints_completion_summary_when_dependencies_are_incomplete(self) -> None:
         result, _, _, output = self._run_default_flow()
@@ -166,8 +168,24 @@ class WizardTest(unittest.TestCase):
         self.assertIn("Install root:", output)
         self.assertIn("Mount point:", output)
         self.assertIn("not mounted", output)
-        for helper in ("info.sh", "login.sh", "status.sh", "service.sh", "mount.sh", "uninstall.sh", "logs.sh"):
-            self.assertIn(helper, output)
+        for command in (
+            "info",
+            "login",
+            "setup help",
+            "status",
+            "service status",
+            "service enable",
+            "service stop",
+            "mount",
+            "stop",
+            "uninstall",
+            "logs",
+            "logs --follow",
+            "logs help",
+        ):
+            self.assertIn(f"degoo-rc {command}", output)
+        for legacy in ("info.sh", "login.sh", "status.sh", "service.sh", "mount.sh", "uninstall.sh", "logs.sh"):
+            self.assertNotIn(legacy, output)
         self.assertIn("/logs", output)
 
     def test_service_enable_times_out_without_claiming_mount_or_success(self) -> None:
@@ -200,8 +218,9 @@ class WizardTest(unittest.TestCase):
         self.assertNotIn(f"Mount point: {mountpoint} — mounted", output.getvalue())
         self.assertIn("mount was not confirmed after up to 15 seconds", output.getvalue())
         self.assertIn("Recent mount, login, setup, and status logs", output.getvalue())
-        self.assertIn(f"# Local status\n  {shlex.quote(str(root / 'info.sh'))}", output.getvalue())
-        self.assertIn(f"{shlex.quote(str(root / 'logs.sh'))} --follow", output.getvalue())
+        cli = shlex.quote(str(root / "degoo-rc"))
+        self.assertIn(f"# Local status\n  {cli} info", output.getvalue())
+        self.assertIn(f"{cli} logs --follow", output.getvalue())
 
     def test_failed_service_start_keeps_nonzero_result_and_explains_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -228,8 +247,8 @@ class WizardTest(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("service is configured but the mount did not start", output.getvalue().lower())
         self.assertIn("Mount point:", output.getvalue())
-        self.assertIn("service.sh status", output.getvalue())
-        self.assertIn("logs.sh", output.getvalue())
+        self.assertIn("degoo-rc service status", output.getvalue())
+        self.assertIn("degoo-rc logs", output.getvalue())
 
     def test_upgrade_stops_owned_service_even_before_mount_attaches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -358,8 +377,9 @@ class WizardTest(unittest.TestCase):
         ):
             wizard._prepare_upgrade_mount(root, {"service_links": []}, input_fn=lambda _: "")
 
-        self.assertIn(str(root / "logs.sh"), str(failure.exception))
-        self.assertIn(str(root / "stop.sh"), str(failure.exception))
+        cli = shlex.quote(str(root / "degoo-rc"))
+        self.assertIn(f"{cli} logs", str(failure.exception))
+        self.assertIn(f"{cli} stop", str(failure.exception))
         run.assert_not_called()
 
     def test_startup_wait_returns_mount_evidence_with_fake_clock(self) -> None:
@@ -480,13 +500,14 @@ class WizardTest(unittest.TestCase):
         ):
             wizard._completion_summary(root, mount_ready=True, systemd_available=False)
         summary = output.getvalue()
+        cli = shlex.quote(str(root / "degoo-rc"))
         self.assertIn("# Local status", summary)
-        self.assertIn(f"  {shlex.quote(str(root / 'info.sh'))}\n", summary)
+        self.assertIn(f"  {cli} info\n", summary)
         self.assertIn("# Stop the user service before an upgrade, if configured", summary)
-        self.assertIn(f"  {shlex.quote(str(root / 'service.sh'))} stop\n", summary)
+        self.assertIn(f"  {cli} service stop\n", summary)
         self.assertIn("# Unmount this install's foreground/manual mount", summary)
-        self.assertIn(f"  {shlex.quote(str(root / 'stop.sh'))}\n", summary)
-        self.assertIn(f"  {shlex.quote(str(root / 'logs.sh'))}\n", summary)
+        self.assertIn(f"  {cli} stop\n", summary)
+        self.assertIn(f"  {cli} logs\n", summary)
         self.assertIn("# Log directory:", summary)
         self.assertIn("Recent mount, login, setup, and status logs", summary)
 
