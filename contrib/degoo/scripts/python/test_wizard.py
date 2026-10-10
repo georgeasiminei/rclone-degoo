@@ -18,6 +18,34 @@ import wizard
 
 
 class WizardTest(unittest.TestCase):
+    def test_default_binary_uses_distribution_bin_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "bin/rclone"
+            binary.parent.mkdir()
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o755)
+            with (
+                mock.patch.object(wizard, "_source_repo", return_value=None),
+                mock.patch.object(wizard, "_source_roots", return_value=[root]),
+                mock.patch.object(wizard.installer, "expected_root", return_value=root / "installed"),
+            ):
+                self.assertEqual(wizard._default_binary(), binary)
+
+    def test_default_binary_prefers_source_build_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "build/rclone"
+            binary.parent.mkdir()
+            for candidate in (binary, root / "rclone"):
+                candidate.write_text("#!/bin/sh\nexit 0\n")
+                candidate.chmod(0o755)
+            with (
+                mock.patch.object(wizard, "_source_repo", return_value=root),
+                mock.patch.object(wizard, "_source_roots", return_value=[root]),
+            ):
+                self.assertEqual(wizard._default_binary(), binary)
+
     def test_rclone_size_suffixes_and_encrypted_object_bounds(self) -> None:
         self.assertEqual(wizard._size_bytes("1Gi"), 1024**3)
         self.assertEqual(wizard._size_bytes("512MiB"), 512 * 1024**2)

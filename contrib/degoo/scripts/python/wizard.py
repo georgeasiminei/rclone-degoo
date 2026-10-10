@@ -119,7 +119,10 @@ def _source_repo() -> Path | None:
 
 def _default_binary() -> Path:
     source_repo = _source_repo()
-    candidates = ([source_repo / "rclone"] if source_repo else []) + [root / "rclone" for root in _source_roots() if root != source_repo]
+    candidates = [source_repo / "build/rclone", source_repo / "rclone"] if source_repo else []
+    for root in _source_roots():
+        if root != source_repo:
+            candidates.extend((root / "bin/rclone", root / "rclone"))
     candidates.extend((installer.expected_root() / "bin/rclone", Path.cwd() / "rclone"))
     for candidate in candidates:
         try:

@@ -1,6 +1,6 @@
 # Contained Degoo installation
 
-See [DEGOO.md](../../DEGOO.md) for the quick start. The installer creates an
+See [USAGE.md](USAGE.md) for the quick start. The installer creates an
 isolated Linux client under `~/.local/share/rclone-degoo`; it does not change a
 normal rclone installation. Upstream rclone does not include this fork's Degoo
 vault commands.
@@ -34,29 +34,37 @@ unavailable.
 
 ## Start the installer
 
-From a repository checkout, start the installer. If no built binary is
-available, the wizard offers to build it from the checkout when a suitable Go
-toolchain is installed:
+From a repository checkout, build the binary and start the wizard:
 
 ```sh
-./contrib/degoo/install.sh
+mkdir -p build
+go build -o build/rclone .
+./contrib/degoo/install.sh --wizard --binary ./build/rclone
 ```
 
-The interactive wizard can also be requested explicitly, including when
-passing a binary path:
+Go 1.26 or newer is required only for this source-build path. In a terminal,
+running the source launcher with no options also starts the wizard. To pass a
+different built binary explicitly:
 
 ```sh
-./contrib/degoo/install.sh --wizard --binary ./rclone
+./contrib/degoo/install.sh --wizard --binary /path/to/rclone
 ```
 
-From a matching prebuilt archive, extract it and run its top-level launcher:
+The matching prebuilt Linux amd64 archive does not require Go. Put
+`rclone-degoo-linux-amd64.tar.gz` in `~/Downloads`, extract it into a new
+temporary directory to avoid mixing it with files from an older extraction,
+and run the archive's top-level launcher:
 
 ```sh
-tar -xzf rclone-degoo-linux-ARCH.tar.gz
-cd rclone-degoo
+extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
+tar -xzf "$HOME/Downloads/rclone-degoo-linux-amd64.tar.gz" -C "$extract_dir"
+cd "$extract_dir/rclone-degoo"
 ./install.sh
 ```
 
+The archive can be shared with other Linux amd64 users. It contains the client,
+installer, helper scripts, license, and documentation, but no account
+credentials or vault secret. No GitHub release archive has been uploaded yet.
 With no arguments in a terminal, `install.sh` starts the wizard. It checks the
 dependencies, selects or confirms a Degoo folder, creates or imports a vault,
 and offers to enable the user service when a systemd user manager is available.
@@ -67,7 +75,7 @@ is still available. `--no-wizard` skips the wizard so a client can be staged
 before login and vault setup:
 
 ```sh
-./contrib/degoo/install.sh --binary ./rclone --no-wizard
+./contrib/degoo/install.sh --binary ./build/rclone --no-wizard
 ```
 
 After a staged install, log in and finish setup with the contained helpers:
@@ -108,7 +116,7 @@ write to a vault at a time.
 Provide the existing folder and configuration when starting the wizard:
 
 ```sh
-./contrib/degoo/install.sh --wizard --binary ./rclone \
+./contrib/degoo/install.sh --wizard --binary ./build/rclone \
   --folder-id EXISTING_VAULT_ID --vault-config ~/private-backups/vault.json
 ```
 
