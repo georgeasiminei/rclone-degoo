@@ -81,6 +81,11 @@ func init() {
 			Help:     "Degoo REST API base URL used for token refresh.",
 			Default:  defaultRESTURL,
 			Advanced: true,
+		}, {
+			Name:     "skip_upload_verification",
+			Help:     "Skip the full download and hash readback before publishing an upload. Registered metadata and the canonical published listing are still checked, but Degoo may store bytes that differ from the upload.",
+			Default:  false,
+			Advanced: true,
 		}},
 	})
 }
@@ -89,11 +94,12 @@ var errMutationAmbiguous = errors.New("degoo mutation state is ambiguous")
 
 // Options defines the configuration for the Degoo backend.
 type Options struct {
-	AuthFile     string `config:"auth_file"`      // AuthFile is the path to private Degoo token state.
-	RootFolderID string `config:"root_folder_id"` // RootFolderID is the dedicated encrypted vault folder ID.
-	APIKey       string `config:"api_key"`        // APIKey is the AppSync routing key.
-	APIURL       string `config:"api_url"`        // APIURL is the GraphQL endpoint.
-	RESTURL      string `config:"rest_url"`       // RESTURL is the authentication endpoint base URL.
+	AuthFile               string `config:"auth_file"`                // AuthFile is the path to private Degoo token state.
+	RootFolderID           string `config:"root_folder_id"`           // RootFolderID is the dedicated encrypted vault folder ID.
+	APIKey                 string `config:"api_key"`                  // APIKey is the AppSync routing key.
+	APIURL                 string `config:"api_url"`                  // APIURL is the GraphQL endpoint.
+	RESTURL                string `config:"rest_url"`                 // RESTURL is the authentication endpoint base URL.
+	SkipUploadVerification bool   `config:"skip_upload_verification"` // SkipUploadVerification disables full payload readback after upload.
 }
 
 // Fs represents a Degoo vault root.
@@ -1681,13 +1687,16 @@ func spoolUpload(in io.Reader, expectedSize int64) (*os.File, int64, [sha256.Siz
 }
 
 func (f *Fs) finishUpload(ctx context.Context, remote, leaf, parentID string, staged api.Item, old *Object, size int64, digest [sha256.Size]byte) (*Object, error) {
+	if staged.ID == "" {
+		return nil, errors.New("degoo: registered upload has no item ID")
+	}
 	if staged.Size != size {
 		return nil, fmt.Errorf("degoo: registered upload size mismatch: got %d, want %d", staged.Size, size)
 	}
 	if staged.ParentID != parentID || staged.Name == "" || !strings.HasPrefix(staged.Name, temporaryPrefix) {
 		return nil, errors.New("degoo: registered upload metadata does not match the pending object")
 	}
-	verifiedItem, err := f.verifyUploaded(ctx, staged.ID, size, digest)
+	verifiedItem, err := f.verifyUploaded(ctx, staged.ID, size, digest, !f.opt.SkipUploadVerification)
 	if err != nil {
 		return nil, fmt.Errorf("degoo: uploaded object verification failed; pending data retained: %w", err)
 	}
@@ -1776,13 +1785,19 @@ func (f *Fs) waitForPublishedObject(ctx context.Context, remote, leaf, parentID 
 	}
 }
 
-func (f *Fs) verifyUploaded(ctx context.Context, id string, size int64, want [sha256.Size]byte) (api.Item, error) {
+func (f *Fs) verifyUploaded(ctx context.Context, id string, size int64, want [sha256.Size]byte, verifyPayload bool) (api.Item, error) {
 	item, err := f.getItem(ctx, id)
 	if err != nil {
 		return api.Item{}, err
 	}
-	if item.Size != size || item.URL == "" {
-		return api.Item{}, errors.New("degoo metadata size or download URL is invalid")
+	if item.ID != id || item.Size != size {
+		return api.Item{}, errors.New("degoo metadata ID or size is invalid")
+	}
+	if !verifyPayload {
+		return item, nil
+	}
+	if item.URL == "" {
+		return api.Item{}, errors.New("degoo metadata download URL is invalid")
 	}
 	resp, err := f.api.Download(ctx, item.URL, "")
 	if err != nil {

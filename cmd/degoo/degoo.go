@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/rclone/rclone/backend/chunker"
@@ -34,6 +35,7 @@ import (
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/rclone/rclone/vfs/vfsflags"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
@@ -56,10 +58,19 @@ type VaultConfig struct {
 	MaxObjectSize rfs.SizeSuffix `json:"max_object_size"`
 }
 
+type mountSettings struct {
+	CacheMaxSize      *string `json:"cache_max_size,omitempty"`
+	CacheMinFreeSpace *string `json:"cache_min_free_space,omitempty"`
+	CacheMaxAge       *string `json:"cache_max_age,omitempty"`
+	CachePollInterval *string `json:"cache_poll_interval,omitempty"`
+	VerifyUpload      *bool   `json:"verify_upload,omitempty"`
+}
+
 func init() {
 	root := &cobra.Command{Use: "degoo", Short: "Manage an encrypted Degoo vault on Linux."}
 	cmd.Root.AddCommand(root)
 	var email, restURL string
+	var cachedEmail bool
 	login := &cobra.Command{Use: "login auth.json", Short: "Log in without saving the account password.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		if err := safeLogging(c.Context()); err != nil {
 			return err
@@ -67,13 +78,15 @@ func init() {
 		if strings.TrimSpace(email) == "" {
 			return errors.New("--email is required")
 		}
-		password, err := promptPassword("Degoo account password: ")
+		email = strings.TrimSpace(email)
+		password, err := promptPassword(loginPasswordPrompt(email, cachedEmail))
 		if err != nil {
 			return err
 		}
 		return auth.Login(c.Context(), fshttp.NewClient(c.Context()), restURL, args[0], email, password)
 	}}
 	login.Flags().StringVar(&email, "email", "", "Degoo account email")
+	login.Flags().BoolVar(&cachedEmail, "cached-email", false, "Indicate that --email came from the wrapper's saved email")
 	login.Flags().StringVar(&restURL, "rest-url", "https://rest-api.degoo.com", "Degoo login endpoint")
 	logout := &cobra.Command{Use: "logout auth.json", Short: "Remove account tokens while keeping the vault secret and data.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error { return auth.Logout(args[0]) }}
 	var remote, cacheDir string
@@ -104,16 +117,22 @@ func init() {
 	}}
 	initialize.Flags().StringVar(&remote, "remote", "", "Configured raw Degoo remote reserved for this vault (required)")
 	initialize.Flags().StringVar(&cacheDir, "cache-dir", "", "Private persistent cache directory (required)")
+	var settingsFile string
+	var verifyUpload bool
 	mount := &cobra.Command{Use: "mount vault.json /path/to/mountpoint", Short: "Mount a writable vault with encrypted names, contents, and chunk metadata.", Long: `Mount a private Degoo vault through VFS, chunker, and crypt.
 The configuration must be a private version 1 JSON file. Encryption and full
 VFS caching are enforced. fsync commits to the local cache; uploads finish
 asynchronously. Keep the cache until pending uploads complete. Use degoo status
 to count locally pending files. Only one process may use a vault cache at a time.
-Live Degoo behavior is experimental; use a disposable vault first.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
-		return mountVault(c.Context(), args[0], args[1])
+Live Degoo behavior is experimental; use a disposable vault first. Upload readback
+verification is enabled by default. The private --settings file may set cache
+limits and verify_upload; explicit command-line flags take precedence.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
+		return mountVault(c.Context(), args[0], args[1], settingsFile, c.Flags(), verifyUpload)
 	}}
 	mountlib.AddFlags(mount.Flags())
 	vfsflags.AddFlags(mount.Flags())
+	mount.Flags().StringVar(&settingsFile, "settings", "", "Private JSON file with optional mount settings")
+	mount.Flags().BoolVar(&verifyUpload, "verify-upload", true, "Read back and hash each uploaded object before publishing it")
 	status := &cobra.Command{Use: "status vault.json", Short: "Show the number and size of locally pending uploads.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		cfg, err := readConfig(args[0])
 		if err != nil {
@@ -127,6 +146,7 @@ Live Degoo behavior is experimental; use a disposable vault first.`, Args: cobra
 		return err
 	}}
 	root.AddCommand(initialize, login, logout, mount, status)
+	addSetupCommands(root)
 }
 
 func promptPassword(prompt string) (string, error) {
@@ -141,6 +161,13 @@ func promptPassword(prompt string) (string, error) {
 		return "", errors.New("could not read password")
 	}
 	return string(password), nil
+}
+
+func loginPasswordPrompt(email string, cachedEmail bool) string {
+	if cachedEmail {
+		return fmt.Sprintf("Degoo account password for %s (cached email; clear with ~/.local/share/rclone-degoo/login.sh --clear-email): ", email)
+	}
+	return fmt.Sprintf("Degoo account password for %s: ", email)
 }
 
 func safeLogging(ctx context.Context) error {
@@ -168,6 +195,99 @@ func readConfig(filename string) (*VaultConfig, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func readMountSettings(filename string) (*mountSettings, error) {
+	if filename == "" {
+		return &mountSettings{}, nil
+	}
+	data, err := auth.ReadPrivateFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	var settings mountSettings
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&settings); err != nil {
+		return nil, errors.New("invalid mount settings JSON")
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, errors.New("mount settings contain trailing data")
+	}
+	return &settings, nil
+}
+
+func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, verifyUploadFlag bool) (bool, error) {
+	var cacheMaxSize rfs.SizeSuffix
+	if s.CacheMaxSize != nil {
+		if err := cacheMaxSize.Set(*s.CacheMaxSize); err != nil {
+			return false, fmt.Errorf("invalid cache_max_size: %w", err)
+		}
+	}
+	var cacheMinFreeSpace rfs.SizeSuffix
+	if s.CacheMinFreeSpace != nil {
+		if err := cacheMinFreeSpace.Set(*s.CacheMinFreeSpace); err != nil {
+			return false, fmt.Errorf("invalid cache_min_free_space: %w", err)
+		}
+	}
+	var cacheMaxAge rfs.Duration
+	if s.CacheMaxAge != nil {
+		if err := cacheMaxAge.Set(*s.CacheMaxAge); err != nil {
+			return false, fmt.Errorf("invalid cache_max_age: %w", err)
+		}
+	}
+	var cachePollInterval rfs.Duration
+	if s.CachePollInterval != nil {
+		if err := cachePollInterval.Set(*s.CachePollInterval); err != nil {
+			return false, fmt.Errorf("invalid cache_poll_interval: %w", err)
+		}
+	}
+	if s.CacheMaxSize != nil && !flagChanged(flags, "vfs-cache-max-size") {
+		options.CacheMaxSize = cacheMaxSize
+	}
+	if s.CacheMinFreeSpace != nil && !flagChanged(flags, "vfs-cache-min-free-space") {
+		options.CacheMinFreeSpace = cacheMinFreeSpace
+	}
+	if s.CacheMaxAge != nil && !flagChanged(flags, "vfs-cache-max-age") {
+		options.CacheMaxAge = cacheMaxAge
+	}
+	if s.CachePollInterval != nil && !flagChanged(flags, "vfs-cache-poll-interval") {
+		options.CachePollInterval = cachePollInterval
+	}
+	verifyUpload := true
+	if s.VerifyUpload != nil {
+		verifyUpload = *s.VerifyUpload
+	}
+	if flagChanged(flags, "verify-upload") {
+		verifyUpload = verifyUploadFlag
+	}
+	return verifyUpload, nil
+}
+
+func flagChanged(flags *pflag.FlagSet, name string) bool {
+	return flags != nil && flags.Changed(name)
+}
+
+func mountRawConfig(remote string, verify bool) (*rfs.RegInfo, string, string, configmap.Mapper, error) {
+	fsInfo, configName, fsPath, originalConfig, err := rfs.ConfigFs(remote)
+	if err != nil {
+		return nil, "", "", nil, err
+	}
+	if fsInfo.Name != "degoo" {
+		return nil, "", "", nil, errors.New("mount remote must be a configured Degoo remote")
+	}
+	config := configmap.New().
+		AddGetter(configmap.Simple{"skip_upload_verification": strconv.FormatBool(!verify)}, configmap.PriorityNormal).
+		AddGetter(originalConfig, configmap.PriorityMax)
+	return fsInfo, configName, fsPath, config, nil
+}
+
+func newMountRawFs(ctx context.Context, remote string, verify bool) (rfs.Fs, error) {
+	fsInfo, configName, fsPath, config, err := mountRawConfig(remote, verify)
+	if err != nil {
+		return nil, err
+	}
+	return fsInfo.NewFs(ctx, configName, fsPath, config)
 }
 
 func (c *VaultConfig) validate() error {
@@ -298,7 +418,7 @@ func bindCache(c *VaultConfig, base rfs.Fs) error {
 	return nil
 }
 
-func mountVault(ctx context.Context, filename, mountpoint string) error {
+func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, flags *pflag.FlagSet, verifyUploadFlag bool) error {
 	if err := safeLogging(ctx); err != nil {
 		return err
 	}
@@ -306,6 +426,15 @@ func mountVault(ctx context.Context, filename, mountpoint string) error {
 		return errors.New("degoo mount runs in the foreground; use a service manager for background operation")
 	}
 	c, err := readConfig(filename)
+	if err != nil {
+		return err
+	}
+	settings, err := readMountSettings(settingsFile)
+	if err != nil {
+		return err
+	}
+	options := vfscommon.Opt
+	verifyUpload, err := settings.apply(&options, flags, verifyUploadFlag)
 	if err != nil {
 		return err
 	}
@@ -325,7 +454,17 @@ func mountVault(ctx context.Context, filename, mountpoint string) error {
 	if err := bindCache(c, base); err != nil {
 		return err
 	}
-	stack, err := newStack(ctx, base, c)
+	// Bind the cache to the configured remote above. The verification setting is
+	// scoped to the mounted raw filesystem and must not change the cache identity.
+	mountBase, err := newMountRawFs(ctx, c.Remote, verifyUpload)
+	if err != nil {
+		return err
+	}
+	mountDF, ok := mountBase.(*degoobackend.Fs)
+	if !ok || mountDF.RootFolderID() != df.RootFolderID() {
+		return errors.New("verification override did not preserve the configured Degoo vault remote")
+	}
+	stack, err := newStack(ctx, mountBase, c)
 	if err != nil {
 		return err
 	}
@@ -342,7 +481,6 @@ func mountVault(ctx context.Context, filename, mountpoint string) error {
 		}
 		return mountFn(v, mountpoint, opt)
 	}
-	options := vfscommon.Opt
 	options.CacheMode = vfscommon.CacheModeFull
 	options.PollInterval = 0
 	mnt := mountlib.NewMountPoint(guardedMount, mountpoint, stack, &mountlib.Opt, &options)

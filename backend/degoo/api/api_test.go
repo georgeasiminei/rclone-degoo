@@ -3,18 +3,22 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/backend/degoo/auth"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/stretchr/testify/require"
 )
@@ -506,6 +510,71 @@ func TestHTTPErrorDoesNotExposeBodyAndCarriesBoundedRetryAfter(t *testing.T) {
 	if !ok || delay != maxRetryAfter {
 		t.Fatalf("Retry-After = %v, %t; want bounded delay %v", delay, ok, maxRetryAfter)
 	}
+}
+
+func TestRefresh403ProducesSanitizedLoginDiagnostic(t *testing.T) {
+	const refreshSecret = "private-refresh-token-must-not-leak"
+	expiredToken := expiredTestJWT(t)
+	state, err := json.Marshal(map[string]string{"token": expiredToken, "refresh_token": refreshSecret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authFile := filepath.Join(privateDir, "auth.json")
+	if err := auth.WritePrivateFile(authFile, state); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.URL.Path != "/access-token/v2" {
+			t.Errorf("request path = %q, want /access-token/v2", request.URL.Path)
+		}
+		writer.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(writer, "provider echoed "+refreshSecret)
+	}))
+	defer server.Close()
+
+	tokens, err := auth.New(server.Client(), authFile, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = newTestClient(server, tokens).ListDir(context.Background(), "parent")
+	if err == nil {
+		t.Fatal("ListDir unexpectedly succeeded")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "cannot obtain access token") || !strings.Contains(message, "degoo login required") || !strings.Contains(message, "auth HTTP 403") {
+		t.Fatalf("error = %q, want actionable sanitized auth classification and status", message)
+	}
+	if strings.Contains(message, refreshSecret) || strings.Contains(message, "provider echoed") {
+		t.Fatalf("error disclosed refresh credentials or response body: %q", message)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("refresh requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestAPIErrorDoesNotExposeArbitraryWrappedCause(t *testing.T) {
+	const secret = "arbitrary-token-response-secret"
+	err := &Error{operation: "GetFileChildren5", message: "cannot obtain access token", err: fmt.Errorf("provider detail %s", secret)}
+	message := err.Error()
+	if strings.Contains(message, secret) || strings.Contains(message, "provider detail") {
+		t.Fatalf("API error disclosed arbitrary wrapped cause: %q", message)
+	}
+}
+
+func expiredTestJWT(t *testing.T) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	claims, err := json.Marshal(map[string]int64{"exp": time.Now().Add(-time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
 }
 
 func TestMutationDoesNotReturnAutomaticRetryAfter(t *testing.T) {

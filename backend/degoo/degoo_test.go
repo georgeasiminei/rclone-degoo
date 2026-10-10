@@ -37,10 +37,12 @@ type mockDegoo struct {
 	mu                         sync.Mutex
 	items                      map[string]mockItem
 	uploads                    map[string][]byte
+	downloadCalls              int
 	nextID                     int
 	failRegister               bool
 	failInitialMkdirAck        bool
 	corruptUpload              bool
+	registeredSizeDelta        int64
 	promoteOnMarker            bool
 	initialPlaceholderCategory int
 	renameRoutesViaAlias       bool
@@ -123,6 +125,7 @@ func (mock *mockDegoo) upload(writer http.ResponseWriter, request *http.Request)
 func (mock *mockDegoo) download(writer http.ResponseWriter, request *http.Request) {
 	id := strings.TrimPrefix(request.URL.Path, "/download/")
 	mock.mu.Lock()
+	mock.downloadCalls++
 	item, ok := mock.items[id]
 	content := append([]byte(nil), item.content...)
 	mock.mu.Unlock()
@@ -208,6 +211,7 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 		}
 		item := mockItem{id: id, name: name, parentID: parentID, category: category, size: size, created: time.UnixMilli(createdMS)}
 		if checksum != "" {
+			item.size += mock.registeredSizeDelta
 			item.content = append([]byte(nil), mock.uploads[name]...)
 		} else if mock.promoteOnMarker && strings.HasPrefix(name, directoryMarkerPrefix) {
 			placeholder, ok := mock.items[parentID]
@@ -328,7 +332,7 @@ func newTestFsAtRoot(t *testing.T, mock *mockDegoo, root string) (fs.Fs, *httpte
 	return newTestFsAtRootID(t, mock, root, "vault")
 }
 
-func newTestFsAtRootID(t *testing.T, mock *mockDegoo, root, rootID string) (fs.Fs, *httptest.Server, error) {
+func newTestFsAtRootID(t *testing.T, mock *mockDegoo, root, rootID string, extras ...configmap.Simple) (fs.Fs, *httptest.Server, error) {
 	t.Helper()
 	server := httptest.NewServer(mock)
 	claims := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix())))
@@ -343,10 +347,16 @@ func newTestFsAtRootID(t *testing.T, mock *mockDegoo, root, rootID string) (fs.F
 		server.Close()
 		t.Fatal(err)
 	}
-	f, err := NewFs(context.Background(), "test", root, configmap.Simple{
+	options := configmap.Simple{
 		"auth_file": authPath, "root_folder_id": rootID, "api_key": "test-key",
 		"api_url": server.URL, "rest_url": server.URL,
-	})
+	}
+	for _, extra := range extras {
+		for key, value := range extra {
+			options[key] = value
+		}
+	}
+	f, err := NewFs(context.Background(), "test", root, options)
 	return f, server, err
 }
 
@@ -486,6 +496,62 @@ func TestUploadVerificationFailureLeavesPriorObjectReachable(t *testing.T) {
 	if err != nil || string(got) != string(original) {
 		t.Fatalf("old content = %q, %v; want %q", got, err, original)
 	}
+}
+
+func TestSkipUploadVerificationSkipsPayloadReadbackButChecksMetadata(t *testing.T) {
+	t.Run("payload readback skipped", func(t *testing.T) {
+		mock := newMockDegoo()
+		mock.corruptUpload = true
+		f, server, err := newTestFsAtRootID(t, mock, "", "vault", configmap.Simple{"skip_upload_verification": "true"})
+		if err != nil {
+			server.Close()
+			t.Fatalf("NewFs: %v", err)
+		}
+		defer server.Close()
+		data := []byte("generated encrypted payload")
+		obj, err := f.Put(context.Background(), strings.NewReader(string(data)), object.NewStaticObjectInfo("cipher", time.Now(), int64(len(data)), true, nil, f))
+		if err != nil {
+			t.Fatalf("Put with skip_upload_verification: %v", err)
+		}
+		published, err := f.NewObject(context.Background(), "cipher")
+		if err != nil {
+			t.Fatalf("NewObject after publication: %v", err)
+		}
+		if published.(*Object).ID() != obj.(*Object).ID() || published.(*Object).ParentID() != "vault" || published.Size() != int64(len(data)) {
+			t.Fatalf("published metadata = (id %q, parent %q, size %d), want registered item metadata", published.(*Object).ID(), published.(*Object).ParentID(), published.Size())
+		}
+		mock.mu.Lock()
+		downloadCalls := mock.downloadCalls
+		mock.mu.Unlock()
+		if downloadCalls != 0 {
+			t.Fatalf("download calls = %d, want no payload readback", downloadCalls)
+		}
+	})
+
+	t.Run("registered metadata still required", func(t *testing.T) {
+		mock := newMockDegoo()
+		mock.registeredSizeDelta = 1
+		f, server, err := newTestFsAtRootID(t, mock, "", "vault", configmap.Simple{"skip_upload_verification": "true"})
+		if err != nil {
+			server.Close()
+			t.Fatalf("NewFs: %v", err)
+		}
+		defer server.Close()
+		data := []byte("generated encrypted payload")
+		_, err = f.Put(context.Background(), strings.NewReader(string(data)), object.NewStaticObjectInfo("cipher", time.Now(), int64(len(data)), true, nil, f))
+		if err == nil || !strings.Contains(err.Error(), "registered upload size mismatch") {
+			t.Fatalf("Put error = %v, want registered metadata size mismatch", err)
+		}
+		if _, err := f.NewObject(context.Background(), "cipher"); !errors.Is(err, fs.ErrorObjectNotFound) {
+			t.Fatalf("NewObject after bad metadata = %v, want object not found", err)
+		}
+		mock.mu.Lock()
+		downloadCalls := mock.downloadCalls
+		mock.mu.Unlock()
+		if downloadCalls != 0 {
+			t.Fatalf("download calls = %d, want no payload readback", downloadCalls)
+		}
+	})
 }
 
 func TestEmptyUploadAndMarkerDirectory(t *testing.T) {

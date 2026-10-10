@@ -20,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 )
 
@@ -105,6 +106,101 @@ func TestVaultConfigurationAndCacheProtection(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(metadataDir, "pending"), []byte(`{"Dirty":true,"Size":1}`), 0600))
 	require.NoError(t, os.Remove(filepath.Join(cfg.CacheDir, cfg.cacheName()+".identity")))
 	require.Error(t, bindCache(&bad, base), "missing identity must not allow pending plaintext to be rebound")
+}
+
+func TestMountSettingsValidationAndFlagPrecedence(t *testing.T) {
+	writeSettings := func(t *testing.T, content string) string {
+		t.Helper()
+		filename := filepath.Join(t.TempDir(), "private", "mount.json")
+		require.NoError(t, auth.WritePrivateFile(filename, []byte(content)))
+		return filename
+	}
+
+	filename := writeSettings(t, `{"cache_max_size":"20G","cache_min_free_space":"20G","cache_max_age":"10m","cache_poll_interval":"5s","verify_upload":false}`)
+	settings, err := readMountSettings(filename)
+	require.NoError(t, err)
+	options := vfscommon.Options{
+		CacheMaxSize:      30 * fs.Gibi,
+		CacheMinFreeSpace: fs.Gibi,
+		CacheMaxAge:       fs.Duration(2 * time.Hour),
+		CachePollInterval: fs.Duration(time.Minute),
+	}
+	flags := pflag.NewFlagSet("mount", pflag.ContinueOnError)
+	flags.String("vfs-cache-max-size", "", "")
+	flags.String("vfs-cache-min-free-space", "", "")
+	flags.String("vfs-cache-max-age", "", "")
+	flags.String("vfs-cache-poll-interval", "", "")
+	flags.Bool("verify-upload", true, "")
+	require.NoError(t, flags.Set("vfs-cache-max-size", "30G"))
+	require.NoError(t, flags.Set("verify-upload", "true"))
+	verifyUpload, err := settings.apply(&options, flags, true)
+	require.NoError(t, err)
+	require.True(t, verifyUpload, "explicit command-line value should override settings JSON")
+	require.Equal(t, 30*fs.Gibi, options.CacheMaxSize, "explicit command-line value should override settings JSON")
+	require.Equal(t, 20*fs.Gibi, options.CacheMinFreeSpace)
+	require.Equal(t, fs.Duration(10*time.Minute), options.CacheMaxAge)
+	require.Equal(t, fs.Duration(5*time.Second), options.CachePollInterval)
+
+	empty, err := readMountSettings("")
+	require.NoError(t, err)
+	defaults := vfscommon.Options{CacheMaxAge: fs.Duration(time.Hour), CachePollInterval: fs.Duration(time.Minute)}
+	verifyUpload, err = empty.apply(&defaults, nil, false)
+	require.NoError(t, err)
+	require.True(t, verifyUpload, "verification defaults on when settings and flags are absent")
+	require.Equal(t, fs.Duration(time.Hour), defaults.CacheMaxAge)
+	require.Equal(t, fs.Duration(time.Minute), defaults.CachePollInterval)
+}
+
+func TestMountSettingsRejectUnknownAndInvalidValues(t *testing.T) {
+	writeSettings := func(content string) string {
+		filename := filepath.Join(t.TempDir(), "private", "mount.json")
+		require.NoError(t, auth.WritePrivateFile(filename, []byte(content)))
+		return filename
+	}
+
+	_, err := readMountSettings(writeSettings(`{"unknown":true}`))
+	require.Error(t, err, "unknown fields are rejected")
+	_, err = readMountSettings(writeSettings(`{} {}`))
+	require.Error(t, err, "trailing JSON is rejected")
+
+	flags := pflag.NewFlagSet("mount", pflag.ContinueOnError)
+	flags.String("vfs-cache-max-size", "", "")
+	require.NoError(t, flags.Set("vfs-cache-max-size", "30G"))
+	for _, content := range []string{
+		`{"cache_max_size":"not-a-size"}`,
+		`{"cache_max_age":"not-a-duration"}`,
+		`{"cache_poll_interval":"not-a-duration"}`,
+	} {
+		settings, readErr := readMountSettings(writeSettings(content))
+		require.NoError(t, readErr)
+		_, err = settings.apply(&vfscommon.Options{}, flags, true)
+		require.Error(t, err, "invalid settings are rejected even when a CLI flag overrides the field")
+	}
+}
+
+func TestMountRawConfigScopesUploadVerification(t *testing.T) {
+	remote := ":degoo,auth_file=/tmp/degoo-auth.json,root_folder_id=vault,skip_upload_verification=true:dir"
+	for _, test := range []struct {
+		verify bool
+		want   string
+	}{{verify: true, want: "false"}, {verify: false, want: "true"}} {
+		fsInfo, configName, fsPath, config, err := mountRawConfig(remote, test.verify)
+		require.NoError(t, err)
+		require.Equal(t, "degoo", fsInfo.Name)
+		require.Equal(t, ":degoo", configName)
+		require.Equal(t, "dir", fsPath)
+		got, ok := config.Get("skip_upload_verification")
+		require.True(t, ok)
+		require.Equal(t, test.want, got)
+		authFile, ok := config.Get("auth_file")
+		require.True(t, ok)
+		require.Equal(t, "/tmp/degoo-auth.json", authFile)
+	}
+}
+
+func TestLoginPasswordPromptShowsCachedEmailRecovery(t *testing.T) {
+	require.Equal(t, "Degoo account password for user@example.com: ", loginPasswordPrompt("user@example.com", false))
+	require.Equal(t, "Degoo account password for user@example.com (cached email; clear with ~/.local/share/rclone-degoo/login.sh --clear-email): ", loginPasswordPrompt("user@example.com", true))
 }
 
 func TestVaultEncryptsChunksNamesAndManifests(t *testing.T) {

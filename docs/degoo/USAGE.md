@@ -9,12 +9,16 @@ Linux FUSE -> VFS full cache -> chunker -> crypt -> Degoo
 
 The implementation is experimental. Offline tests exercise the request shapes
 and vault behavior. A disposable live vault passed encrypted publication,
-fresh-cache readback, and CDN range reads. Account renewal, larger live files,
-and the provider object-size limit remain acceptance gates; see
+fresh-cache readback, and CDN range reads. A live access token expired after an
+hour and refresh returned HTTP 403; fresh interactive login is required for
+that session. Long-term renewal, larger live files, and the provider object-size
+limit remain acceptance gates; see
 [VALIDATION.md](VALIDATION.md) for the tested scope.
 
-For a contained installation and cleanup, see
-[INSTALLATION.md](INSTALLATION.md).
+For the recommended contained installer, persistent user service, cached-email
+login, mount settings, and complete local cleanup, see
+[INSTALLATION.md](INSTALLATION.md). The manual steps below are an alternative
+for users who manage their own paths and services.
 
 ## Setup
 
@@ -85,6 +89,18 @@ inside owner-private directories. The vault configuration deliberately stores
 the password as plaintext on the trusted local machine. Host compromise can
 expose it and the plaintext cache.
 
+The salt is optional. With no custom salt, use the same password and keep that
+setting absent on other machines. If a custom salt was used, it must also be
+preserved exactly. Mounting the same folder with different encryption settings
+does not migrate or decrypt its existing files.
+
+Pass `--settings /private/path/mount.json` for persistent cache and verification
+settings; the file must be owner-private, just like the vault configuration.
+Explicit mount flags override corresponding settings. `--verify-upload=false`
+skips full SHA-256 download verification before publication while retaining
+metadata and publication checks. It defaults to true and is independent of
+the encryption password and cache identity.
+
 ## Persistence and recovery
 
 `fsync` syncs the local VFS cache. Close queues an asynchronous upload. Neither
@@ -120,6 +136,12 @@ fusermount -u ~/degoo-vault
 Logout removes only the token file. It leaves the vault password, cache,
 configuration, and remote objects intact. A running process may still hold
 its access token until it exits; logout does not revoke tokens at Degoo.
+
+An expired or rejected token prompts the auth client to check for a newer
+private token file. Logging in again can therefore restore a running mount
+without changing its vault secret or discarding pending writes. Rejected
+refresh errors report `degoo login required` and a sanitized HTTP status;
+passwords and provider response bodies stay out of logs.
 
 ## Remote format and limits
 

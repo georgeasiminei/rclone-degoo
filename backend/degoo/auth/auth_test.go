@@ -111,6 +111,126 @@ func TestTokenRefreshesExpiredJWTAndPersistsState(t *testing.T) {
 	assert.Equal(t, "saved-refresh-token", saved.RefreshToken)
 }
 
+func TestTokenReloadsLoginStateAfterClientCreation(t *testing.T) {
+	dir := privateTempDir(t)
+	authFile := filepath.Join(dir, "auth.json")
+	require.NoError(t, saveState(authFile, tokenState{
+		Token:        testJWT(time.Now().Add(-time.Hour)),
+		RefreshToken: "old-refresh-token",
+	}))
+	var refreshCalls atomic.Int32
+	freshToken := testJWT(time.Now().Add(time.Hour))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]string
+		if r.URL.Path == loginPath {
+			var login map[string]any
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&login))
+			writeJSON(t, w, http.StatusOK, map[string]string{"RefreshToken": "new-refresh-token"})
+			return
+		}
+		assert.Equal(t, refreshPath, r.URL.Path)
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		assert.Equal(t, "new-refresh-token", request["RefreshToken"])
+		refreshCalls.Add(1)
+		writeJSON(t, w, http.StatusOK, map[string]string{"Token": freshToken})
+	}))
+	defer server.Close()
+
+	client, err := New(server.Client(), authFile, server.URL)
+	require.NoError(t, err)
+	require.NoError(t, Login(context.Background(), server.Client(), server.URL, authFile, "person@example.test", "password"))
+
+	token, err := client.Token(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, freshToken, token)
+	assert.Equal(t, int32(1), refreshCalls.Load(), "only the login exchange should refresh")
+}
+
+func TestRefreshReloadsLoginStateAfterClientCreation(t *testing.T) {
+	dir := privateTempDir(t)
+	authFile := filepath.Join(dir, "auth.json")
+	oldToken := testJWT(time.Now().Add(time.Hour))
+	newToken := testJWT(time.Now().Add(2 * time.Hour))
+	require.NoError(t, saveState(authFile, tokenState{Token: oldToken, RefreshToken: "old-refresh-token"}))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == loginPath {
+			writeJSON(t, w, http.StatusOK, map[string]string{"RefreshToken": "new-refresh-token"})
+			return
+		}
+		if r.URL.Path != refreshPath {
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(t, w, http.StatusOK, map[string]string{"Token": newToken})
+	}))
+	defer server.Close()
+
+	client, err := New(server.Client(), authFile, server.URL)
+	require.NoError(t, err)
+	require.NoError(t, Login(context.Background(), server.Client(), server.URL, authFile, "person@example.test", "password"))
+
+	token, err := client.Refresh(context.Background(), oldToken)
+	require.NoError(t, err)
+	assert.Equal(t, newToken, token)
+}
+
+func TestRefreshRejectionReloadsConcurrentLoginState(t *testing.T) {
+	dir := privateTempDir(t)
+	authFile := filepath.Join(dir, "auth.json")
+	require.NoError(t, saveState(authFile, tokenState{
+		Token:        testJWT(time.Now().Add(-time.Hour)),
+		RefreshToken: "old-refresh-token",
+	}))
+	freshToken := testJWT(time.Now().Add(time.Hour))
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != refreshPath {
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if err := saveState(authFile, tokenState{Token: freshToken, RefreshToken: "new-refresh-token"}); err != nil {
+			t.Errorf("save concurrent login state: %v", err)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"response body must remain private"}`))
+	}))
+	defer server.Close()
+
+	client, err := New(server.Client(), authFile, server.URL)
+	require.NoError(t, err)
+	token, err := client.Token(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, freshToken, token)
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestRefreshDoesNotReplaceValidCurrentTokenWithStaleFile(t *testing.T) {
+	dir := privateTempDir(t)
+	authFile := filepath.Join(dir, "auth.json")
+	current := testJWT(time.Now().Add(time.Hour))
+	require.NoError(t, saveState(authFile, tokenState{Token: current, RefreshToken: "current-refresh"}))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request to %s", r.URL.Path)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client, err := New(server.Client(), authFile, server.URL)
+	require.NoError(t, err)
+	require.NoError(t, saveState(authFile, tokenState{Token: testJWT(time.Now().Add(-time.Hour)), RefreshToken: "stale-refresh"}))
+
+	token, err := client.Refresh(context.Background(), "rejected-older-token")
+	require.NoError(t, err)
+	assert.Equal(t, current, token)
+	token, err = client.Token(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, current, token)
+}
+
 func TestConcurrentTokenCallsShareOneRefresh(t *testing.T) {
 	dir := privateTempDir(t)
 	authFile := filepath.Join(dir, "auth.json")
@@ -177,6 +297,9 @@ func TestRejectedRefreshRequiresLogin(t *testing.T) {
 	require.NoError(t, err)
 	_, err = client.Token(context.Background())
 	assert.ErrorIs(t, err, ErrLoginRequired)
+	var loginErr *LoginRequiredError
+	assert.ErrorAs(t, err, &loginErr)
+	assert.Equal(t, http.StatusUnauthorized, loginErr.StatusCode())
 	assert.NotContains(t, err.Error(), "refresh token rejected")
 }
 
