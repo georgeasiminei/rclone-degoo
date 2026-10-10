@@ -5,7 +5,7 @@ filesystem. File data, names, and chunk manifests are encrypted before upload.
 You can list, read, write, rename, move, and delete files within the vault.
 Copies download and upload data; server-side copying is unavailable.
 
-## Install and mount
+## Install
 
 The installer needs Python 3.10 or newer. To mount, Linux also needs FUSE 3 or
 a compatible `fusermount` helper, a readable and writable `/dev/fuse`, and
@@ -13,21 +13,38 @@ a compatible `fusermount` helper, a readable and writable `/dev/fuse`, and
 only for the background service. The wizard checks mount dependencies and can
 offer to install missing `fuse3` and `util-linux` packages through a detected
 `apt-get`, `dnf`, `pacman`, or `zypper`. Go 1.26 or newer is needed only to
-build from source.
+build from source. No GitHub release archive has been uploaded yet.
 
-From this repository, build and start the guided installer:
+To build from the `staging` source branch and start the guided installer:
 
 ```sh
-go build -o rclone .
-./contrib/degoo/install.sh --wizard --binary ./rclone
+git clone --branch staging https://github.com/georgeasiminei/rclone-degoo.git
+cd rclone-degoo
+mkdir -p build
+go build -o build/rclone .
+./contrib/degoo/install.sh --wizard --binary ./build/rclone
 ```
 
-From the matching prebuilt Linux archive, extract it and run `./install.sh`.
-With no arguments in a terminal, either launcher opens the wizard. For a staged
-install, keep the noninteractive `--binary` option and add `--no-wizard`:
+If you have the matching prebuilt Linux amd64 archive, place
+`rclone-degoo-linux-amd64.tar.gz` in `~/Downloads`. No archive is currently
+available as a GitHub release download. Extract it into a new temporary
+directory, then run the packaged launcher:
 
 ```sh
-./contrib/degoo/install.sh --binary ./rclone --no-wizard
+extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
+tar -xzf "$HOME/Downloads/rclone-degoo-linux-amd64.tar.gz" -C "$extract_dir"
+cd "$extract_dir/rclone-degoo"
+./install.sh
+```
+
+The archive can be shared with other Linux amd64 users; it includes the
+prebuilt client and installer files but no account credentials or vault secret.
+The prebuilt path does not require Go. With no arguments in a terminal, either
+launcher opens the wizard. For a staged install, use the noninteractive
+`--binary` option and add `--no-wizard`:
+
+```sh
+./contrib/degoo/install.sh --binary ./build/rclone --no-wizard
 ```
 
 The private install defaults to `~/.local/share/rclone-degoo`. The wizard
@@ -49,6 +66,8 @@ available:
 For manual foreground mounting, run `mount.sh`. The service starts at login.
 Enable account lingering separately if you need it to start before login and
 remain active after logout; the installer does not change lingering.
+
+## Mount and use
 
 See [installation and cleanup](docs/degoo/INSTALLATION.md) for existing vaults,
 dependency setup, service operation, settings, and recovery.

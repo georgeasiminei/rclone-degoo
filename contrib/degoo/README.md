@@ -1,5 +1,9 @@
 # Degoo vault installer for Linux
 
+The prebuilt archive's top-level README is built from
+[DISTRIBUTION.md](DISTRIBUTION.md). This page documents the installer from the
+source checkout.
+
 This installer provides a private, writable, encrypted Degoo mount. It keeps
 the account credentials, vault secret, cache, logs, and command helpers under
 `~/.local/share/rclone-degoo`; it does not change a normal rclone installation.
@@ -26,34 +30,43 @@ or system policy must be fixed separately.
 
 ## Install
 
-From a source checkout, start the installer. If no binary is present, the
-wizard offers to build from the checkout when a compatible Go toolchain is
-installed:
+To build from the `staging` source branch and start the wizard:
 
 ```sh
-./contrib/degoo/install.sh
-```
-
-In a terminal, no arguments starts the guided wizard. To explicitly start the
-wizard while specifying the binary:
-
-```sh
-./contrib/degoo/install.sh --wizard --binary ./rclone
-```
-
-From a prebuilt archive, extract it and use its top-level launcher:
-
-```sh
-tar -xzf rclone-degoo-linux-ARCH.tar.gz
+git clone --branch staging https://github.com/georgeasiminei/rclone-degoo.git
 cd rclone-degoo
+mkdir -p build
+go build -o build/rclone .
+./contrib/degoo/install.sh --wizard --binary ./build/rclone
+```
+
+Go 1.26 or newer is needed only for this source-build path. In a terminal, no
+arguments also starts the guided wizard. To explicitly start the wizard while
+specifying a different binary:
+
+```sh
+./contrib/degoo/install.sh --wizard --binary /path/to/rclone
+```
+
+From the matching prebuilt Linux amd64 archive, put
+`rclone-degoo-linux-amd64.tar.gz` in `~/Downloads`. Extract it into a new
+temporary directory and use its top-level launcher:
+
+```sh
+extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
+tar -xzf "$HOME/Downloads/rclone-degoo-linux-amd64.tar.gz" -C "$extract_dir"
+cd "$extract_dir/rclone-degoo"
 ./install.sh
 ```
 
-The wizard checks dependencies, installs or upgrades the contained client,
-logs into Degoo, and offers to use an existing dedicated folder or create a
-new one. It suggests the first discovered device folder and names a new vault
-`rclone-degoo-vault` by default. Root ID `0` is used to list device folders;
-it cannot be used as the vault folder or as the parent of a live create request.
+The archive can be shared with other Linux amd64 users; it contains no Degoo
+account credentials or vault secret. No GitHub release archive has been
+uploaded yet. The wizard checks dependencies, installs or upgrades the
+contained client, logs into Degoo, and offers to use an existing dedicated
+folder or create a new one. It suggests the first discovered device folder
+and names a new vault `rclone-degoo-vault` by default. Root ID `0` is used to
+list device folders; it cannot be used as the vault folder or as the parent of
+a live create request.
 The wizard suggests enabling the user service by default when the systemd user
 manager is available. Otherwise, mount manually in the foreground.
 
@@ -61,7 +74,7 @@ To stage an install without opening the wizard, pass `--binary` and
 `--no-wizard`:
 
 ```sh
-./contrib/degoo/install.sh --binary ./rclone --no-wizard
+./contrib/degoo/install.sh --binary ./build/rclone --no-wizard
 ```
 
 Then log in and create a dedicated child folder under an actual device ID:
@@ -112,7 +125,8 @@ file data or calculate remote size.
 
 See [installation and cleanup](../../docs/degoo/INSTALLATION.md) for the full
 dependency, mount, cache, upgrade, and recovery guide. See
-[the quick start](../../DEGOO.md) for a compact overview.
+[the quick start](../../DEGOO.md) and [usage](../../docs/degoo/USAGE.md) for
+configuration and commands.
 
 ## Uninstall
 

@@ -21,6 +21,56 @@
 Rclone *("rsync for cloud storage")* is a command-line program to sync files and
 directories to and from different cloud storage providers.
 
+## Degoo encrypted mount for Linux
+
+This fork includes an encrypted, writable Degoo mount for Linux. Install it
+from the `staging` source branch or from the matching prebuilt Linux amd64
+archive. The archive is a distributable installer package that can be shared
+with other Linux amd64 users; it does not contain account credentials or a
+vault secret. No GitHub release archive has been uploaded yet.
+
+### Install from source
+
+```sh
+git clone --branch staging https://github.com/georgeasiminei/rclone-degoo.git
+cd rclone-degoo
+mkdir -p build
+go build -o build/rclone .
+./contrib/degoo/install.sh --wizard --binary ./build/rclone
+```
+
+Go 1.26 or newer is needed to build from source. The wizard then installs the
+contained client, checks mount dependencies, logs into Degoo, and helps select
+or create a dedicated vault folder.
+
+### Install from the prebuilt archive
+
+If you have the matching `rclone-degoo-linux-amd64.tar.gz` archive, place it in
+`~/Downloads`. No archive is currently available as a GitHub release download.
+The checksum sidecar should be alongside the tarball. Verify it, then extract
+the tarball into a new temporary directory and start its wizard:
+
+```sh
+cd "$HOME/Downloads"
+sha256sum -c rclone-degoo-linux-amd64.tar.gz.sha256
+extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
+tar -xzf "$HOME/Downloads/rclone-degoo-linux-amd64.tar.gz" -C "$extract_dir"
+cd "$extract_dir/rclone-degoo"
+./install.sh
+```
+
+The prebuilt archive does not need Go. Both install paths need Python 3.10 or
+newer for the installer. Mounting also needs FUSE 3 or a compatible
+`fusermount` helper, readable and writable `/dev/fuse`, and `mountpoint` from
+`util-linux`. The wizard can offer to install missing `fuse3` and `util-linux`
+packages using a detected package manager. A systemd user manager is optional;
+without it, mount in the foreground.
+
+See [the Degoo installation guide](docs/degoo/INSTALLATION.md) and
+[the quick start](DEGOO.md). Live support above 20 GiB, long-term token renewal,
+and several recovery cases remain unverified; see
+[validation status](docs/degoo/VALIDATION.md) before relying on the vault.
+
 ## Storage providers
 
 - 1Fichier [:page_facing_up:](https://rclone.org/fichier/)

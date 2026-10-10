@@ -56,8 +56,9 @@ Cleanup leaves remote data untouched.
    boundaries; reject wrong secrets and damaged/missing chunks. Run an opt-in
    generated 21 GiB encrypted round trip against local storage, then build,
    run the full offline test suite, and lint the changed packages/documents.
-7. Commit and push a fork PR targeting `master`. This fork has no `staging`;
-   leave merge of this PR to the user under the repository's Git instructions.
+7. Commit and push a fork PR targeting `staging`, the integration branch.
+   Leave merging and deleting the source branch to the user under the
+   repository's Git instructions.
 
 Defaults are 1 GiB plaintext chunks and a provisional 19 GiB encrypted object
 safety cap. Configuration validation includes crypt overhead and manifest

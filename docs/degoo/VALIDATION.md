@@ -34,6 +34,37 @@ create a remote vault. Package-manager commands and provider responses were
 mocked. Live wizard login, package installation, and FUSE mounting remain
 environment-dependent checks.
 
+## Distribution layout repair
+
+The previous handoff archive was rebuilt from an older checkout without the
+wizard launchers. Its extracted folder therefore had `INSTALL.txt`, a
+top-level binary, and source-shaped `contrib/` and `backend/` directories, but
+no `install.sh`. The repair starts from the current `staging` implementation
+and makes the archive layout independent of the source layout:
+
+- Root: `README.md`, executable `install.sh`, and executable `uninstall.sh`.
+- `bin/rclone`, `scripts/python/`, flat `docs/`, and `licenses/`.
+- `docs/BUILD.json` records the source revision, dirty state, and binary hash.
+  A `.tar.gz.sha256` sidecar verifies the archive bytes.
+
+The wizard now discovers both packaged `bin/rclone` and a source build at
+`build/rclone`. Both regression tests failed before the fix; all 65 installer
+and cleanup tests passed afterward. A fresh `go build -o build/rclone .`
+passed. Archive checks extract the package before running launcher help;
+missing required launchers prevent replacing an existing output archive.
+Install examples use fresh extraction directories to prevent stale files
+from surviving an overlay extraction.
+
+The repaired Linux amd64 archive passed a second extracted install, inventory,
+and local cleanup with the actual binary in a temporary home. Automatic
+binary discovery and all 18 relative Markdown links passed. Changed Markdown
+files passed lint. Packaging self-checks verified deterministic archive and
+checksum bytes, preservation of an existing archive after a rejected build,
+and rejection of outputs that would replace package sources or special files.
+The production archive and checksum also passed verification. These checks
+performed no account login, remote changes, system package installation, or
+live mounting.
+
 ## Offline checks
 
 The completed offline checks use HTTP fixtures for Degoo and local storage for
