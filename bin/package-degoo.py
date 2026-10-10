@@ -39,7 +39,7 @@ DOC_FILES = (
     "VALIDATION.md",
 )
 SHELL_LAUNCHERS = (
-    "degoo-rc", "install.sh", "uninstall.sh", "trash.sh",
+    "degoo-rc",
     "scripts/install.sh", "scripts/uninstall.sh", "scripts/trash.sh",
 )
 CLI_COMMANDS = (
@@ -49,9 +49,6 @@ CLI_COMMANDS = (
 PACKAGE_ENTRIES = (
     ("contrib/degoo/degoo-rc", "degoo-rc"),
     *((f"contrib/degoo/{name}", name) for name in SHELL_LAUNCHERS if name.startswith("scripts/")),
-    ("contrib/degoo/install.sh", "install.sh"),
-    ("contrib/degoo/uninstall.sh", "uninstall.sh"),
-    ("contrib/degoo/trash.sh", "trash.sh"),
     ("contrib/degoo/DISTRIBUTION.md", "README.md"),
     *((f"contrib/degoo/scripts/python/{name}", f"scripts/python/{name}") for name in PYTHON_HELPERS),
     *((f"docs/degoo/{name}", f"docs/{name}") for name in DOC_FILES),
@@ -469,13 +466,13 @@ def self_check(root: Path) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
 
-        launcher_source = fixture_root / "contrib/degoo/install.sh"
+        launcher_source = fixture_root / "contrib/degoo/degoo-rc"
         hidden_launcher = launcher_source.with_suffix(".missing")
         launcher_source.rename(hidden_launcher)
         try:
             package_sources(fixture_root)
         except PackageError as exc:
-            if "contrib/degoo/install.sh" not in str(exc):
+            if "contrib/degoo/degoo-rc" not in str(exc):
                 raise PackageError("self-check did not identify a missing install launcher") from None
         else:
             raise PackageError("self-check did not reject a missing install launcher")
@@ -596,6 +593,13 @@ def self_check(root: Path) -> None:
             names = archive.getnames()
             if set(names) != expected or len(names) != len(expected):
                 raise PackageError("self-check found an unexpected or missing archive path")
+            root_files = {
+                PurePosixPath(name).name
+                for name in names
+                if PurePosixPath(name).parent == PurePosixPath(ROOT_NAME)
+            }
+            if root_files != {"degoo-rc", "README.md"}:
+                raise PackageError("self-check requires degoo-rc as the only archive root command")
             binary_info = archive.getmember(f"{ROOT_NAME}/bin/rclone")
             if not binary_info.mode & 0o111:
                 raise PackageError("self-check found a non-executable packaged binary")

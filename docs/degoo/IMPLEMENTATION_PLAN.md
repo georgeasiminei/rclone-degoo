@@ -29,10 +29,11 @@ documenting the detailed parameters. The command dispatches to shell helpers in
 places `degoo-rc` in the private install root and creates
 `~/.local/bin/degoo-rc` as a link, without editing shell profiles. It prints a
 `PATH` export when that directory is not available; uninstall removes the link
-only when it still points to that installation. Fresh installed roots have
-`degoo-rc` as their only root-level command; upgrades retain any existing root
-`.sh` shims. Source and archive roots may include the legacy install, uninstall,
-and trash shims.
+only when it still points to that installation. The Degoo package in a source
+checkout and the extracted archive use `degoo-rc` as their sole installer and
+maintenance entrypoint. Fresh installed roots also have only `degoo-rc` as a
+root-level Degoo command; in-place upgrades may retain root-level `.sh` shims
+already present in an older install.
 
 `degoo-rc install` starts the setup wizard in a terminal; `--binary` retains
 the noninteractive install path, and `--no-wizard` supports staging before
@@ -84,7 +85,8 @@ remote paths because the operation is account-wide and crypt/chunker would
 otherwise propagate a dangerous folder-shaped feature. No restore operation is
 provided. The unified `degoo-rc trash` command lists trash and `degoo-rc
 empty-trash` invokes deletion. Both pass the private auth path without reading
-it; the legacy `trash.sh` wrapper remains for compatibility.
+it; `degoo-rc` dispatches trash operations to the internal `scripts/trash.sh`
+helper.
 
 1. Implement the provider request contracts from the pinned Python reference
    in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and

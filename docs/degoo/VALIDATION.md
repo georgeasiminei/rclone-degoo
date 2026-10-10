@@ -17,7 +17,9 @@ The current frontend and packaging checks for the unified command passed:
   56 info/wizard/logs, and 5 CLI tests. Coverage includes actual PATH lookup,
   paths with spaces, and fresh installs without root-level shell wrappers.
 - The package self-check passed, including help output for every packaged
-  command.
+  command. Its follow-up assertion requires the archive root to contain only
+  `README.md` and `degoo-rc`; it failed on the previous wrapper layout and
+  passed after the root wrappers were removed.
 - Building the archive with `build/rclone` and checking it from isolated homes
   passed, including native CLI help for every command.
 - `sh -n` passed for all entrypoints and helper scripts.
@@ -57,19 +59,22 @@ environment-dependent checks.
 The previous handoff archive was rebuilt from an older checkout without the
 wizard launchers. Its extracted folder therefore had `INSTALL.txt`, a
 top-level binary, and source-shaped `contrib/` and `backend/` directories, but
-no `install.sh`. The repair starts from the current `staging` implementation
-and makes the archive layout independent of the source layout:
+no unified installer entrypoint. The repair starts from the current `staging`
+implementation and makes the archive layout independent of the source layout.
+The current package root contains:
 
-- Root: `README.md`, executable `install.sh`, and executable `uninstall.sh`.
+- Root: `README.md` and executable `degoo-rc`.
 - `bin/rclone`, `scripts/python/`, flat `docs/`, and `licenses/`.
+- Internal shell helpers, including `scripts/trash.sh`, remain under `scripts/`.
 - `docs/BUILD.json` records the source revision, dirty state, and binary hash.
   A `.tar.gz.sha256` sidecar verifies the archive bytes.
 
-The wizard now discovers both packaged `bin/rclone` and a source build at
+The wizard discovers both packaged `bin/rclone` and a source build at
 `build/rclone`. Both regression tests failed before the fix; all 65 installer
 and cleanup tests passed afterward. A fresh `go build -o build/rclone .`
-passed. Archive checks extract the package before running launcher help;
-missing required launchers prevent replacing an existing output archive.
+passed. Archive checks extract the package before running entrypoint help;
+missing `degoo-rc` prevents packaging, and the packaging self-check rejects
+unexpected root-level commands.
 Install examples use fresh extraction directories to prevent stale files
 from surviving an overlay extraction.
 
