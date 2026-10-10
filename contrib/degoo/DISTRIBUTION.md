@@ -79,6 +79,24 @@ Then log in and finish setup using the contained helpers:
 
 ## Mount, upgrade, and recover
 
+At the end of setup, the wizard prints the install directory, mount path,
+actual mount state, helper commands, and log locations. Your helper scripts
+live under `~/.local/share/rclone-degoo/`. The default mount path is
+`~/.local/share/rclone-degoo/mount`; open that directory in your file manager
+or use it like any other directory while it is mounted.
+
+```sh
+~/.local/share/rclone-degoo/info.sh
+~/.local/share/rclone-degoo/logs.sh
+~/.local/share/rclone-degoo/logs.sh --follow
+```
+
+`logs.sh` shows recent mount, login, setup, and status logs. Use `--follow` to
+watch new messages. If authentication cannot renew, `info.sh` shows a login-required
+warning with the login command. Run `~/.local/share/rclone-degoo/login.sh`
+again; the mount can reload the saved credentials. An expired access token
+alone does not establish a failure when automatic renewal is still possible.
+
 The private install root is `~/.local/share/rclone-degoo`. The wizard offers
 to enable a systemd user service when a user manager is available. Otherwise,
 use `~/.local/share/rclone-degoo/mount.sh` for a foreground mount. The

@@ -154,9 +154,9 @@ func promptPassword(prompt string) (string, error) {
 	if !term.IsTerminal(fd) {
 		return "", errors.New("password entry requires an interactive terminal")
 	}
-	_, _ = fmt.Fprint(os.Stderr, prompt)
+	_, _ = fmt.Fprint(config.PasswordPromptOutput, prompt)
 	password, err := term.ReadPassword(fd)
-	_, _ = fmt.Fprintln(os.Stderr)
+	_, _ = fmt.Fprintln(config.PasswordPromptOutput)
 	if err != nil {
 		return "", errors.New("could not read password")
 	}

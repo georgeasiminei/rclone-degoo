@@ -66,6 +66,26 @@ newer for the installer. Mounting also needs FUSE 3 or a compatible
 packages using a detected package manager. A systemd user manager is optional;
 without it, mount in the foreground.
 
+### Use the installed vault
+
+The wizard finishes with the install directory, mount location, current mount
+state, helper commands, and log locations. The default mount is
+`~/.local/share/rclone-degoo/mount`. Open that folder in your file manager
+while it is mounted, or use it like any other directory from the terminal.
+The installed helpers live in `~/.local/share/rclone-degoo/`:
+
+```sh
+~/.local/share/rclone-degoo/info.sh
+~/.local/share/rclone-degoo/logs.sh
+~/.local/share/rclone-degoo/logs.sh --follow
+```
+
+`info.sh` shows mount/service state and authentication warnings. `logs.sh`
+shows recent mount, login, setup, and status logs; `--follow` watches new
+messages. If a token cannot be renewed, run
+`~/.local/share/rclone-degoo/login.sh` again. Keep the cache and vault
+configuration while uploads are pending.
+
 See [the Degoo installation guide](docs/degoo/INSTALLATION.md) and
 [the quick start](DEGOO.md). Live support above 20 GiB, long-term token renewal,
 and several recovery cases remain unverified; see

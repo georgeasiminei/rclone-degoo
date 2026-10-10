@@ -25,6 +25,7 @@ PYTHON_HELPERS = (
     "setup.py",
     "service.py",
     "info.py",
+    "logs.py",
     "uninstall.py",
     "wizard.py",
 )

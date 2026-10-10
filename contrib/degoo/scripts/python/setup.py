@@ -102,6 +102,7 @@ def _run_create(root: Path, parent_id: str, name: str) -> str:
             env=env,
             timeout=600,
             check=False,
+            umask=0o077,
         )
     except (OSError, subprocess.TimeoutExpired):
         raise SetupError("Degoo could not create the dedicated vault folder") from None

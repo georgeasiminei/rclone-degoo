@@ -92,6 +92,10 @@ the separate vault secret, automatic renewal, and simple local-file setup.
   Suggest defaults for settings that can be inferred; account email and
   password have no invented defaults.
 - List dependencies even when installed, and offer to install missing ones.
+- Show a visible password prompt even when logging to a file. Finish setup
+  with the install and mount paths, actual mount state, helper commands, and
+  log access. Make rejected authentication renewal visible with an actionable
+  login-required message while preserving pending local changes.
 - Offer to keep selected local state during uninstall. Preserve pending
   changes and the configuration needed to recover them; remote removal is
   separate from removing the local installation.
