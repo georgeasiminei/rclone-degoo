@@ -199,8 +199,10 @@ entrypoint. It does not edit the normal rclone config or shell profile files.
 If `~/.local/bin` is not on `PATH`, it prints an export command for the current
 shell or for you to add yourself. Uninstall removes the link only when it
 still points to this installation. A fresh install has `degoo-rc` as its only
-root-level command; upgrades retain existing root-level `.sh` shims. Source
-and archive roots may include the legacy install, uninstall, and trash shims.
+root-level Degoo command. Upgrades may retain root-level `.sh` shims already
+present in an older install. The Degoo package in a source checkout and the
+extracted archive use `degoo-rc` as their sole installer and maintenance
+entrypoint.
 Runtime Python bytecode and temporary upload files stay contained or are
 disabled.
 
@@ -452,7 +454,7 @@ helper options remain supported; the command-specific help is authoritative.
 `trash` lists account trash. `empty-trash` is a separate account-wide deletion
 command with its own confirmation behavior.
 
-Upgrades retain existing root-level `.sh` shims, and source or archive roots
-may include the legacy install, uninstall, and trash shims. Fresh installs use
-`degoo-rc` as their only root-level command. New commands and examples should
-use `degoo-rc`.
+Source checkouts and extracted archives use `degoo-rc` as the sole root-level
+Degoo installer and maintenance entrypoint. Fresh installs also use only
+`degoo-rc`; in-place upgrades may retain root-level `.sh` shims already present
+in an older install. New commands and examples should use `degoo-rc`.

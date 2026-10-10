@@ -23,9 +23,10 @@ places the command at `~/.local/share/rclone-degoo/degoo-rc` and links it from
 `~/.local/bin/degoo-rc`; it does not edit shell profiles and prints a `PATH`
 export if that directory is missing from `PATH`. Uninstall removes the link
 only when it still points to this install. A fresh installed root has
-`degoo-rc` as its only root-level command; upgrades retain existing root-level
-`.sh` shims. Source and archive roots may include legacy install, uninstall,
-and trash shims. Examples here use `degoo-rc`.
+`degoo-rc` as its only root-level Degoo command. Upgrades may retain root-level
+`.sh` shims already present in an older install. The Degoo package in a source
+checkout and the extracted archive use `degoo-rc` as their sole installer and
+maintenance entrypoint. Examples here use `degoo-rc`.
 
 The command set is `install`, `uninstall`, `login`, `setup`, `mount`, `stop`,
 `status`, `location`, `folders`, `service`, `info`, `logs`, `trash`, and
@@ -192,8 +193,8 @@ degoo-rc empty-trash --auth ~/.config/rclone-degoo/auth.json --yes
 
 The auth file defaults to the contained installation's `config/auth.json`.
 Pass `--auth` to select another private file. The command passes the auth path
-through without reading or displaying its contents. The legacy `trash.sh`
-wrapper remains available for compatibility.
+through without reading or displaying its contents. `degoo-rc` dispatches the
+trash operation to its internal `scripts/trash.sh` helper.
 
 Trash is not confined to one Degoo folder or vault. Listing can expose
 account-wide metadata, and emptying can destroy unrelated trash. Generic

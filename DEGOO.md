@@ -75,10 +75,11 @@ options. Commands include `install`, `uninstall`, `login`, `setup`, `mount`,
 `stop`, `status`, `location`, `folders`, `service`, `info`, `logs`, `trash`,
 and `empty-trash`. `service` accepts `enable`, `disable`, `start`, `stop`,
 `restart`, and `status`. Existing command options remain available. Uninstall
-removes the PATH link only when it still points to this installation.
-A fresh installed root has `degoo-rc` as its only root-level command. Upgrades
-retain existing root-level `.sh` shims, and source or archive roots may include
-the legacy install, uninstall, and trash shims.
+removes the PATH link only when it still points to this installation. A fresh
+installed root has `degoo-rc` as its only root-level Degoo command. Upgrades
+may retain root-level `.sh` shims already present in an older install. The
+Degoo package in a source checkout and the extracted archive use `degoo-rc` as
+their sole installer and maintenance entrypoint.
 
 ## Mount and use
 

@@ -199,25 +199,23 @@ limits.
 ```text
 rclone-degoo/
   README.md
-  degoo-rc
+  degoo-rc                 unified Degoo entrypoint
   bin/rclone
-  scripts/*.sh
+  scripts/*.sh             internal shell helpers
   scripts/python/*.py
-  install.sh                 legacy compatibility wrapper
-  uninstall.sh               legacy compatibility wrapper
-  trash.sh                   legacy compatibility wrapper
   docs/*.md
   docs/BUILD.json
   licenses/COPYING
   licenses/degoo-NOTICE
 ```
 
-The unified command dispatches to shell helpers in `scripts/` and Python
-implementations in `scripts/python/`. The source and archive roots may include
-legacy install, uninstall, and trash shims. A fresh installed root has
-`degoo-rc` as its only root-level command; upgrades retain existing root-level
-`.sh` shims. New examples use `degoo-rc`. The command list is available with
-`degoo-rc help`, and `degoo-rc COMMAND help` shows that command's options.
+The archive root has one Degoo command: `degoo-rc`. It dispatches to shell
+helpers in `scripts/` and Python implementations in `scripts/python/`, including
+the internal `scripts/trash.sh` helper. Fresh installs also have `degoo-rc` as
+their only root-level Degoo command. In-place upgrades may retain root-level
+`.sh` shims already present in an older install. New examples use `degoo-rc`.
+The command list is available with `degoo-rc help`, and `degoo-rc COMMAND help`
+shows that command's options.
 `service` accepts `enable`, `disable`, `start`, `stop`, `restart`, and `status`;
 existing command options remain available. `trash` lists account trash, while
 `empty-trash` is the separate deletion command. The six Markdown files in

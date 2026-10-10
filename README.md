@@ -73,9 +73,10 @@ The installer puts `degoo-rc` at `~/.local/share/rclone-degoo/degoo-rc` and
 links `~/.local/bin/degoo-rc` to it. It does not edit shell profiles; if that
 directory is missing from `PATH`, it prints an export command. Use
 `degoo-rc help` for the command list and `degoo-rc COMMAND help` for detailed
-options. A fresh install has `degoo-rc` as its only root-level command;
-upgrades retain existing root-level `.sh` shims, and source/archive roots may
-include the legacy install, uninstall, and trash shims. New examples use
+options. A fresh install has `degoo-rc` as its only root-level Degoo command.
+Upgrades may retain root-level `.sh` shims already present in an older install.
+The Degoo package in a source checkout and the extracted archive use
+`degoo-rc` as their sole installer and maintenance entrypoint. New examples use
 `degoo-rc`.
 
 ### Use the installed vault

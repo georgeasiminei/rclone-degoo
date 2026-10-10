@@ -234,6 +234,7 @@ current shell or to copy into a profile yourself. Uninstall removes the link
 only when it still points to this installation. The installed command dispatches
 to private helpers in `scripts/`, with Python implementation files in
 `scripts/python/`. A fresh install keeps `degoo-rc` as its only root-level
-command. Upgrades retain existing root-level `.sh` shims; source and archive
-roots may include the legacy install, uninstall, and trash shims. Use
+Degoo command. Upgrades may retain root-level `.sh` shims already present in an
+older install. The Degoo package in a source checkout and the extracted archive
+use `degoo-rc` as their sole installer and maintenance entrypoint. Use
 `degoo-rc` in new commands and examples.
