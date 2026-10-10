@@ -572,7 +572,26 @@ def _mount_state(root: Path, points: set[str]) -> bool:
 
 
 def _service_paths(root: Path, manifest: dict[str, Any]) -> tuple[Path, Path]:
-    config_text = manifest.get("service_config_home") or os.environ.get("XDG_CONFIG_HOME") or str(home_directory() / ".config")
+    config_text = manifest.get("service_config_home") or ""
+    if not config_text:
+        config_text = os.environ.get("XDG_CONFIG_HOME") or ""
+        if config_text:
+            candidate = Path(config_text)
+            if not candidate.is_absolute() or ".." in candidate.parts:
+                raise CleanupError("the user service config path is invalid")
+            candidate = Path(os.path.normpath(str(candidate)))
+            try:
+                wrapper_override = os.path.commonpath((str(root), str(candidate))) == str(root)
+            except ValueError:
+                raise CleanupError("the user service config path is invalid") from None
+            # Install wrappers redirect XDG paths into the root; an unset
+            # service path in the manifest still refers to the user's config.
+            if wrapper_override:
+                config_text = str(home_directory() / ".config")
+            else:
+                config_text = str(candidate)
+        else:
+            config_text = str(home_directory() / ".config")
     config_home = Path(config_text)
     if not config_home.is_absolute() or ".." in config_home.parts:
         raise CleanupError("the user service config path is invalid")
@@ -619,17 +638,18 @@ def _service_link_target(path: Path, unit: Path) -> bool:
     return Path(os.path.normpath(str(target))) == unit
 
 
-def _validate_service_links(root: Path, manifest: dict[str, Any]) -> list[Path]:
+def _owned_service_links(root: Path, manifest: dict[str, Any]) -> tuple[list[Path], set[str]]:
     direct, wanted = _service_paths(root, manifest)
     unit = root / "rclone-degoo.service"
     recorded = set(manifest.get("service_links", []))
     links: list[Path] = []
     for path in (direct, wanted):
-        if str(path) not in recorded:
-            continue
-        if _service_link_target(path, unit):
+        matches = _service_link_target(path, unit)
+        if str(path) in recorded and os.path.lexists(path) and not matches:
+            raise CleanupError("a recorded user service link changed before cleanup")
+        if matches:
             links.append(path)
-    return links
+    return links, recorded
 
 
 def _systemctl_user(*arguments: str) -> subprocess.CompletedProcess[bytes]:
@@ -654,47 +674,102 @@ def _systemctl_user(*arguments: str) -> subprocess.CompletedProcess[bytes]:
         raise CleanupError("the owned user service could not be stopped safely") from None
 
 
-def _stop_owned_service(root: Path, manifest: dict[str, Any]) -> bool:
-    links = _validate_service_links(root, manifest)
-    if not links:
-        return False
-    unit = root / "rclone-degoo.service"
-    result = _systemctl_user("show", "--property=FragmentPath", "--value", "rclone-degoo.service")
+def _systemctl_service_state() -> dict[str, str]:
+    result = _systemctl_user(
+        "show",
+        "--property=LoadState",
+        "--property=ActiveState",
+        "--property=FragmentPath",
+        "rclone-degoo.service",
+    )
     if result.returncode != 0:
         raise CleanupError("the owned user service could not be identified safely")
     try:
-        fragment = Path(result.stdout.decode("utf-8").strip())
+        output = result.stdout.decode("utf-8")
     except UnicodeDecodeError:
-        raise CleanupError("systemd returned an invalid service path") from None
-    allowed_fragments = {str(unit)}
+        raise CleanupError("systemd returned invalid service state") from None
+    state: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in {"LoadState", "ActiveState", "FragmentPath"}:
+            state[key] = value
+    if set(state) != {"LoadState", "ActiveState", "FragmentPath"}:
+        raise CleanupError("systemd returned incomplete service state")
+    return state
+
+
+def _check_service_fragment(state: dict[str, str], allowed: set[str]) -> None:
+    fragment = state["FragmentPath"]
+    load_state = state["LoadState"]
+    active_state = state["ActiveState"]
+    if fragment:
+        if not Path(fragment).is_absolute() or os.path.normpath(fragment) not in allowed:
+            raise CleanupError("systemd resolved the service name to another unit")
+        if load_state == "loaded":
+            raise CleanupError("systemd still has the owned service loaded after cleanup")
+        raise CleanupError("systemd returned an unexpected state for the owned service")
+    if load_state != "not-found":
+        raise CleanupError("systemd could not verify ownership of the loaded service")
+    if active_state in {"active", "activating", "deactivating", "reloading"}:
+        raise CleanupError("the owned user service is still active after cleanup")
+    if active_state != "inactive":
+        raise CleanupError("systemd could not verify that the owned service is inactive")
+
+
+def _stop_owned_service(root: Path, manifest: dict[str, Any]) -> set[str]:
+    links, recorded = _owned_service_links(root, manifest)
+    if not links and not recorded:
+        return set()
+    unit = root / "rclone-degoo.service"
+    allowed_fragments = {str(unit), *recorded}
     for path in links:
         allowed_fragments.add(str(path))
-    if not fragment.is_absolute() or os.path.normpath(str(fragment)) not in allowed_fragments:
-        raise CleanupError("systemd resolved the service name to another unit")
-    result = _systemctl_user("disable", "--now", "rclone-degoo.service")
-    if result.returncode != 0:
-        raise CleanupError("the owned user service could not be stopped and disabled")
-    result = _systemctl_user("daemon-reload")
-    if result.returncode != 0:
-        raise CleanupError("systemd could not reload after disabling the owned service")
-    return True
+    state = _systemctl_service_state()
+    fragment = state["FragmentPath"]
+    if fragment:
+        if not Path(fragment).is_absolute() or os.path.normpath(fragment) not in allowed_fragments:
+            raise CleanupError("systemd resolved the service name to another unit")
+        if state["LoadState"] != "loaded":
+            raise CleanupError("systemd returned an unexpected state for the owned service")
+        if state["ActiveState"] not in {"active", "activating", "deactivating", "reloading", "inactive", "failed"}:
+            raise CleanupError("systemd could not identify the state of the owned service")
+        result = _systemctl_user("stop", "rclone-degoo.service")
+        if result.returncode != 0:
+            raise CleanupError("the owned user service could not be stopped safely")
+        if links:
+            result = _systemctl_user("disable", "rclone-degoo.service")
+            if result.returncode != 0:
+                raise CleanupError("the owned user service could not be disabled safely")
+    elif state["LoadState"] != "not-found" or state["ActiveState"] not in {"inactive", "failed"}:
+        raise CleanupError("systemd could not verify that the owned service is inactive")
+    return allowed_fragments
 
 
-def _remove_owned_service_links(root: Path, manifest: dict[str, Any]) -> None:
+def _remove_owned_service_links(root: Path, manifest: dict[str, Any], previously_owned: set[str]) -> bool:
     direct, wanted = _service_paths(root, manifest)
     unit = root / "rclone-degoo.service"
-    recorded = set(manifest.get("service_links", []))
+    links, recorded = _owned_service_links(root, manifest)
+    if not links and not recorded and not previously_owned:
+        return False
+    # Validate every candidate before unlinking any of them. Exact owned links
+    # also cover a crash after link creation but before the manifest update.
     for path in (wanted, direct):
-        if str(path) not in recorded:
-            continue
-        if _service_link_target(path, unit):
+        if path in links:
             try:
                 os.unlink(path)
             except OSError:
                 raise CleanupError("an owned user service link could not be removed") from None
-    for path in (direct, wanted):
-        if str(path) in recorded and os.path.lexists(path):
+    for path in links:
+        if os.path.lexists(path):
             raise CleanupError("an owned user service link remains after cleanup")
+
+    result = _systemctl_user("daemon-reload")
+    if result.returncode != 0:
+        raise CleanupError("systemd could not reload after removing the owned service links")
+    state = _systemctl_service_state()
+    allowed_fragments = {str(unit), *recorded, *previously_owned, *(str(path) for path in links)}
+    _check_service_fragment(state, allowed_fragments)
+    return True
 
 
 def _validate_helper_link(path: Path, *, require_executable: bool) -> Path:
@@ -1000,7 +1075,9 @@ def _wizard(args: argparse.Namespace) -> int:
 
     root, layout, _, _ = _inspect_install(args.root)
     print("This removes local Degoo mount files only. Degoo remote data will be left untouched.")
-    print("Selected items are copied to a new private directory before local removal.")
+    print("A new owner-only backup outside the install is created only if at least one keep option is answered Yes.")
+    print("Configuration includes the vault encryption key, Degoo account tokens, and mount settings.")
+    print("The local cache may contain pending uploads; keep both configuration and cache to recover them.")
     keep_config = _prompt_yes_no("Keep vault, account login, and mount configuration?")
     keep_cache = _prompt_yes_no("Keep the local cache?")
     keep_logs = _prompt_yes_no("Keep local logs?")
@@ -1008,8 +1085,19 @@ def _wizard(args: argparse.Namespace) -> int:
     retention_directory: Path | None = None
     if keep_config or keep_cache or keep_logs:
         default_directory = _default_retention_directory()
-        typed_directory = input(f"Private backup directory [{default_directory}]: ").strip()
-        retention_directory = _validate_retention_directory(typed_directory or default_directory, root)
+        while retention_directory is None:
+            typed_directory = input(
+                f"Backup directory path [{default_directory}] "
+                "(press Enter for the default; this is not a yes/no question): "
+            ).strip()
+            try:
+                retention_directory = _validate_retention_directory(typed_directory or default_directory, root)
+            except CleanupError as exc:
+                print(f"That backup path cannot be used: {exc}")
+                print(
+                    "Your selected retention still needs a valid private backup path. "
+                    "Enter another path, or press Ctrl+C to cancel and restart the wizard to change what is kept."
+                )
         print(f"Selected local state will be copied to {retention_directory}.")
 
     discard_secret = False
@@ -1066,7 +1154,7 @@ def uninstall(args: argparse.Namespace) -> int:
             raise CleanupError("pending local uploads remain; the install and cache were preserved")
 
     # Check once before stopping a service, then check again under the cache lock.
-    _stop_owned_service(root, layout["manifest"])
+    previously_owned_service = _stop_owned_service(root, layout["manifest"])
     if _mount_state(root, read_mountpoints()):
         _unmount(root)
     # Recheck the whole mount namespace after unmounting and before touching the cache.
@@ -1109,6 +1197,8 @@ def uninstall(args: argparse.Namespace) -> int:
                 keep_logs=keep_logs,
                 pending=pending_state,
             )
+        # Reload and verify systemd while the install layout is still retryable.
+        service_cleanup = _remove_owned_service_links(root, latest["manifest"], previously_owned_service)
         # Removing the empty mountpoint first makes a concurrent re-mount fail
         # before recursive deletion can traverse a mounted filesystem.
         try:
@@ -1117,7 +1207,6 @@ def uninstall(args: argparse.Namespace) -> int:
             raise CleanupError("the isolated mountpoint could not be safely removed") from None
         if _mount_state(root, read_mountpoints()):
             raise CleanupError("a mount became active during cleanup")
-        _remove_owned_service_links(root, latest["manifest"])
         _remove_root(root)
     finally:
         os.close(lock_fd)
@@ -1133,6 +1222,27 @@ def uninstall(args: argparse.Namespace) -> int:
         )
     else:
         print("Removed the isolated local Degoo install. Remote encrypted files were left untouched.")
+    if retention_directory is not None:
+        retained: list[str] = []
+        if keep_config:
+            retained.append("configuration (vault key, account tokens, and mount settings)")
+        if keep_cache:
+            retained.append("local cache")
+        if keep_logs:
+            retained.append("local logs")
+        print(f"Private backup created at {retention_directory}; retained: {', '.join(retained)} plus install metadata.")
+        removed = [name for name, keep in (("configuration", keep_config), ("cache", keep_cache), ("logs", keep_logs)) if not keep]
+        if removed:
+            print(f"Unselected local state removed: {', '.join(removed)}.")
+    else:
+        print(
+            "No retention directory was created. The local configuration (including any vault key, account tokens, "
+            "and mount settings), cache, and logs were removed."
+        )
+    if service_cleanup:
+        print("The owned user service is confirmed inactive; its links were removed and systemd was reloaded.")
+    else:
+        print("No owned user service links were configured.")
     return 0
 
 

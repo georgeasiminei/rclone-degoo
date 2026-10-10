@@ -160,8 +160,18 @@ Inspect the install without changing it:
 
 In a terminal, running `uninstall.sh` with no arguments or with `--wizard`
 starts guided cleanup. It offers to retain the vault/account configuration,
-cache, and logs in a private backup directory; each choice defaults to No. If
-uploads are pending, cleanup refuses to discard the cache. To recover those
+cache, and logs in a private backup directory; each choice defaults to No.
+
+A private backup is an owner-only folder outside the install, created only
+when you choose to keep something. At its path prompt, press Enter for the
+suggested path or type an absolute path; `N` is not a path. To remove all local
+state without a backup, choose No for configuration, cache, and logs, then
+confirm `DISCARD` and `REMOVE`. Start cleanup from outside the install
+(`cd ~` first). Deleting the encryption settings means a fresh setup should
+create a new dedicated vault folder with a new name.
+Leave the existing folder ID and vault-config import prompts blank.
+
+If uploads are pending, cleanup refuses to discard the cache. To recover those
 changes, retain both the cache and its matching configuration. Restore the
 backup to `~/.local/share/rclone-degoo`, then run the package launcher with
 `--binary ~/.local/share/rclone-degoo/bin/rclone --upgrade --no-wizard` to
@@ -170,7 +180,8 @@ recreate the installed launchers.
 If you choose not to retain the vault configuration, type `DISCARD` to confirm
 losing the local secret. Type `REMOVE` to confirm local cleanup. Uninstall
 stops the service linked to this install and removes its owned local files and
-systemd links. It never deletes remote encrypted files or Degoo account data.
+systemd links, then reloads the user manager and verifies removal. It never
+deletes remote encrypted files or Degoo account data.
 
 See [installation and cleanup](docs/INSTALLATION.md) for full setup,
 permissions, service, cache, upgrade, and recovery details. See

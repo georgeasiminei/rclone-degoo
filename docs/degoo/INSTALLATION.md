@@ -325,7 +325,12 @@ confirmation before discarding a vault secret and before removing the local
 install. If the cache has pending uploads, cleanup refuses to discard them;
 keep both the cache and its matching configuration in the backup or resume
 cleanup after uploads finish. A default backup directory is suggested and
-selected state is copied there with private permissions. The backup includes
+selected state is copied there with private permissions. This is a new external
+folder created only when you choose to keep something: the directory is
+owner-only (`0700`) and secret files are owner-only (`0600`). At the backup
+path prompt, press Enter to accept the default or enter an absolute path.
+It is not a yes/no question; entering `N` does not turn retention off.
+Choose No for every retention option to create no backup. The backup includes
 the binary and install identity when pending uploads are retained, so local
 changes can be recovered. If you choose not to retain a vault config, type
 `DISCARD` to confirm losing the local secret. Type `REMOVE` to confirm local
@@ -339,11 +344,59 @@ To resume uploads, restore the retained backup contents into
   --binary ~/.local/share/rclone-degoo/bin/rclone --upgrade --no-wizard
 ```
 
-The cleanup is local only: it removes this installation and its owned systemd
-links, but leaves remote encrypted files and Degoo account data untouched. It
-does not disable account-wide lingering. If you enabled lingering solely for
+The cleanup stops the owned service before disabling it, removes its systemd
+links, reloads the user manager, and removes the contained configuration,
+cache, logs, binary, and scripts. Only explicitly retained state remains in
+the chosen external backup directory. Remote encrypted files and Degoo
+account data are untouched. Shared dependencies, parent systemd directories,
+and historical entries in the shared system journal are not installation
+files and remain. Cleanup does not disable account-wide lingering. If you
+enabled lingering solely for
 this service, you can disable it separately with
 `loginctl disable-linger "$USER"` after considering your other user services.
+
+### Verify removal and reinstall from the archive
+
+Run cleanup from outside the installation directory (`cd ~` first). After
+uninstalling, check the three installation paths and systemd state:
+
+```sh
+for path in \
+  "$HOME/.local/share/rclone-degoo" \
+  "$HOME/.config/systemd/user/rclone-degoo.service" \
+  "$HOME/.config/systemd/user/default.target.wants/rclone-degoo.service"
+do
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    printf 'REMAINS: %s\n' "$path"
+  else
+    printf 'Removed: %s\n' "$path"
+  fi
+done
+systemctl --user show rclone-degoo.service \
+  -p LoadState -p ActiveState -p FragmentPath
+```
+
+For the default installation, all three paths should be removed; the unit
+should report `LoadState=not-found`, `ActiveState=inactive`, and an empty
+`FragmentPath`. A custom `XDG_CONFIG_HOME` uses that directory instead of
+`~/.config` for service links. The pre-cleanup inventory reports the link
+paths. If you selected no retention, no backup is created.
+
+Verify and extract the distributable into a new folder, then run its wizard:
+
+```sh
+cd "$HOME/Downloads"
+sha256sum -c rclone-degoo-linux-amd64.tar.gz.sha256
+extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
+tar -xzf rclone-degoo-linux-amd64.tar.gz -C "$extract_dir"
+cd "$extract_dir/rclone-degoo"
+./install.sh
+```
+
+If you discarded the old vault encryption settings, create a new dedicated
+vault folder with a new name. Reusing the old encrypted folder requires its
+original encryption settings. Leave the existing folder ID and configuration
+import prompts blank to create a new vault.
 
 The noninteractive cleanup command remains available through the Python helper
 at `contrib/degoo/scripts/python/uninstall.py`. Use `--keep-config`,

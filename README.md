@@ -95,6 +95,14 @@ messages. If a token cannot be renewed, run
 `~/.local/share/rclone-degoo/login.sh` again. Keep the cache and vault
 configuration while uploads are pending.
 
+For a fresh reinstall, run the uninstall wizard from outside the install
+(`cd ~` first). Choose No for all three keep options to create no backup;
+confirm `DISCARD` (when a vault secret exists) and `REMOVE`. If you keep
+anything, the private backup
+prompt asks for an absolute directory path; press Enter for the default.
+Discarding the encryption settings requires creating a new vault afterward.
+The installation guide includes removal checks and fresh archive instructions.
+
 See [the Degoo installation guide](docs/degoo/INSTALLATION.md) and
 [the quick start](DEGOO.md). Live support above 20 GiB, long-term token renewal,
 and several recovery cases remain unverified; see

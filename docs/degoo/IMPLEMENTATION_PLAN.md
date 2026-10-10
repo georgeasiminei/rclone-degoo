@@ -33,7 +33,10 @@ child name to `rclone-degoo-vault`. Root ID `0` is not accepted as a vault ID or
 creation parent. The uninstaller's `--inventory` mode is read-only; its wizard
 can retain config, cache, and logs in a new owner-private directory. Pending
 uploads can proceed only when both the matching config and cache are retained.
-Cleanup leaves remote data untouched.
+Cleanup leaves remote data untouched. Explain external backup directories
+before retention prompts and distinguish their path input from yes/no
+choices. Stop the linked unit before disabling it; reload and verify systemd
+after removing its links so local cleanup includes service registration.
 
 The completion summary must appear after either the service or manual-start
 choice. It reports the configured mount path and actual kernel mount state,

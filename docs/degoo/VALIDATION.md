@@ -65,6 +65,45 @@ The production archive and checksum also passed verification. These checks
 performed no account login, remote changes, system package installation, or
 live mounting.
 
+## Complete uninstall and fresh installation
+
+The cleanup follow-up on 2026-10-10 exercised the actual installed client:
+
+- The user chose to delete all local state without a retention backup.
+  Pending uploads were zero. The initial uninstall exposed that
+  `systemctl disable --now` removes a linked unit before trying to stop it,
+  then can fail with the unit missing. Links were gone but the install root
+  remained. A retry completed deletion; a final user-manager reload confirmed
+  `LoadState=not-found`, `ActiveState=inactive`, and an empty `FragmentPath`.
+- The complete original install root, including vault/account configuration,
+  cache, binaries, scripts, and private logs, was absent. Both service links
+  and the kernel mount were absent, no contained rclone process remained,
+  and no retention directory was created. Remote files were not modified.
+- The fix stops the owned unit before disabling it, handles recorded links
+  already removed by a partial teardown, removes exact owned unrecorded
+  links, and reloads after link removal. It refuses final root deletion if
+  the unit is still loaded, active, or unresolved. Reload failure leaves the
+  root and mount directory available for retry.
+- A generated temporary client was installed in the real contained root and
+  enabled with the real user manager. Its mount command ran only `sleep`,
+  with no FUSE mount, account credentials, or network operations. Corrected
+  uninstall removed that active service and the entire fixture; independent
+  checks again showed the unit not-found/inactive and both links absent.
+- All 116 offline Python tests, the package self-check, `go build`,
+  `make quicktest BRANCH=degoo-uninstall-handoff`, changed Markdown lint,
+  and `git diff --check` passed.
+- Wizard tests cover explaining retention before prompts, retrying the `N`
+  path entry, no-backup removal, and accurate retention/service summaries.
+  The backup is created only when at least one keep option is selected.
+- The extracted distributable passed an offline staged installation, status,
+  log viewer, inventory, and complete uninstall with a temporary home.
+  All relative Markdown links in the archive resolved to packaged files.
+
+The distributable and source installation instructions include post-cleanup
+checks and extraction into a new directory for a fresh wizard run. Shared
+system dependencies, user lingering, parent systemd directories, and historical
+entries in the shared journal remain outside the contained install footprint.
+
 ## Upgrade preflight and mount readiness
 
 The follow-up installer checks on 2026-10-10 address the live transcript where
