@@ -153,6 +153,98 @@ func TestMountSettingsValidationAndFlagPrecedence(t *testing.T) {
 	require.Equal(t, fs.Duration(time.Minute), defaults.CachePollInterval)
 }
 
+func TestMountSettingsWriteBack(t *testing.T) {
+	writeSettings := func(t *testing.T, content string) string {
+		t.Helper()
+		filename := filepath.Join(t.TempDir(), "private", "mount.json")
+		require.NoError(t, auth.WritePrivateFile(filename, []byte(content)))
+		return filename
+	}
+
+	t.Run("settings value is parsed", func(t *testing.T) {
+		settings, err := readMountSettings(writeSettings(t, `{"write_back":"17s"}`))
+		require.NoError(t, err)
+		options := vfscommon.Options{WriteBack: fs.Duration(5 * time.Second)}
+		verifyUpload, err := settings.apply(&options, nil, true)
+		require.NoError(t, err)
+		require.True(t, verifyUpload)
+		require.Equal(t, fs.Duration(17*time.Second), options.WriteBack)
+	})
+
+	t.Run("explicit VFS flag takes precedence", func(t *testing.T) {
+		settings, err := readMountSettings(writeSettings(t, `{"write_back":"17s"}`))
+		require.NoError(t, err)
+		options := vfscommon.Options{WriteBack: fs.Duration(9 * time.Second)}
+		flags := pflag.NewFlagSet("mount", pflag.ContinueOnError)
+		flags.String("vfs-write-back", "", "")
+		require.NoError(t, flags.Set("vfs-write-back", "9s"))
+		_, err = settings.apply(&options, flags, true)
+		require.NoError(t, err)
+		require.Equal(t, fs.Duration(9*time.Second), options.WriteBack)
+	})
+
+	t.Run("positive VFS flag overrides invalid saved value", func(t *testing.T) {
+		for _, test := range []struct {
+			name    string
+			content string
+		}{
+			{name: "zero", content: `{"write_back":"0s"}`},
+			{name: "off", content: `{"write_back":"off"}`},
+			{name: "malformed", content: `{"write_back":"not-a-duration"}`},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				settings, err := readMountSettings(writeSettings(t, test.content))
+				require.NoError(t, err)
+				options := vfscommon.Options{WriteBack: fs.Duration(9 * time.Second)}
+				flags := pflag.NewFlagSet("mount", pflag.ContinueOnError)
+				flags.String("vfs-write-back", "", "")
+				require.NoError(t, flags.Set("vfs-write-back", "9s"))
+				_, err = settings.apply(&options, flags, true)
+				require.NoError(t, err)
+				require.Equal(t, fs.Duration(9*time.Second), options.WriteBack)
+				require.NoError(t, validateWriteBack(options.WriteBack))
+			})
+		}
+	})
+
+	t.Run("missing setting preserves defaults", func(t *testing.T) {
+		settings, err := readMountSettings(writeSettings(t, `{}`))
+		require.NoError(t, err)
+		options := vfscommon.Options{
+			WriteBack:         fs.Duration(5 * time.Second),
+			CacheMaxAge:       fs.Duration(time.Hour),
+			CachePollInterval: fs.Duration(time.Minute),
+		}
+		_, err = settings.apply(&options, nil, true)
+		require.NoError(t, err)
+		require.Equal(t, fs.Duration(5*time.Second), options.WriteBack)
+		require.Equal(t, fs.Duration(time.Hour), options.CacheMaxAge)
+		require.Equal(t, fs.Duration(time.Minute), options.CachePollInterval)
+	})
+}
+
+func TestMountWriteBackMustBePositiveAndFinite(t *testing.T) {
+	for _, value := range []fs.Duration{
+		fs.Duration(0),
+		fs.Duration(-time.Second),
+		fs.DurationOff,
+	} {
+		require.Error(t, validateWriteBack(value))
+	}
+	require.NoError(t, validateWriteBack(fs.Duration(5*time.Second)))
+
+	options := vfscommon.Options{WriteBack: fs.Duration(0)}
+	flags := pflag.NewFlagSet("mount", pflag.ContinueOnError)
+	flags.String("vfs-write-back", "", "")
+	require.NoError(t, flags.Set("vfs-write-back", "0s"))
+	settings := &mountSettings{WriteBack: stringPointer("17s")}
+	_, err := settings.apply(&options, flags, true)
+	require.NoError(t, err, "an explicit flag should still take precedence over settings")
+	require.Error(t, validateWriteBack(options.WriteBack), "the effective VFS value must remain positive")
+}
+
+func stringPointer(value string) *string { return &value }
+
 func TestMountSettingsRejectUnknownAndInvalidValues(t *testing.T) {
 	writeSettings := func(content string) string {
 		filename := filepath.Join(t.TempDir(), "private", "mount.json")
@@ -172,6 +264,10 @@ func TestMountSettingsRejectUnknownAndInvalidValues(t *testing.T) {
 		`{"cache_max_size":"not-a-size"}`,
 		`{"cache_max_age":"not-a-duration"}`,
 		`{"cache_poll_interval":"not-a-duration"}`,
+		`{"write_back":"not-a-duration"}`,
+		`{"write_back":"0s"}`,
+		`{"write_back":"-1s"}`,
+		`{"write_back":"off"}`,
 	} {
 		settings, readErr := readMountSettings(writeSettings(content))
 		require.NoError(t, readErr)

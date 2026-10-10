@@ -63,3 +63,22 @@ these differences from the original offline fixtures:
 No credentials, signed URLs, account filenames, or folder identifiers are
 recorded here. Current object caps and long-lived token behavior remain live
 acceptance gates; see [VALIDATION.md](VALIDATION.md) for the tested scope.
+
+## Registration diagnostics and recovery (2026-10-11)
+
+Live generated-data probes encountered negative boolean acknowledgements for
+registration and deletion. Successful encrypted 33-byte logical payload probes
+received registration acknowledgements in about one second and appeared in
+listings within another second. These samples do not establish why other
+registration attempts fail or whether a negative response can have side
+effects.
+
+The API reports false, null, and omitted acknowledgements separately, without
+logging response bodies. Each remains an error; a negative acknowledgement has
+a typed marker for selecting the shorter confirmation window. The backend
+confirms the exact staged object's metadata before publication. Offline tests
+simulate a lost acknowledgement followed by delayed visibility, and verify
+that reconciliation uses one byte transfer and one registration request.
+They also cover an unconfirmed negative acknowledgement and cancellation of
+blocked or throttled listing requests. These fixtures are failure simulations,
+not claims about live provider rejection semantics.

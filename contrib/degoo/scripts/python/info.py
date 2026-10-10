@@ -27,9 +27,10 @@ MAX_JSON_SIZE = 1024 * 1024
 MAX_STATUS_OUTPUT = 4096
 MAX_REMOTE_OUTPUT = 64 * 1024
 MAX_REMOTE_ERROR = 16 * 1024
+RCLONE_DEFAULT_WRITE_BACK = "5s"
 STATUS_PATTERN = re.compile(rb"Pending local uploads: ([0-9]+) files, ([0-9]+) bytes\s*\Z")
 SIZE_PATTERN = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?)(?:[KMGTPE](?:iB?|B)?|B)?\Z", re.IGNORECASE)
-DURATION_PATTERN = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|ms|s|m|h))+\Z")
+DURATION_PATTERN = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|μs|ms|s|m|h))+\Z")
 MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
 
 
@@ -563,7 +564,7 @@ def _settings_summary(root: Path) -> list[str]:
     minimum = _safe_setting(settings.get("cache_min_free_space"))
     age = _safe_setting(settings.get("cache_max_age"), duration=True)
     poll = _safe_setting(settings.get("cache_poll_interval"), duration=True)
-    write_back = _safe_setting(settings.get("write_back"), duration=True)
+    write_back = _safe_setting(settings.get("write_back", RCLONE_DEFAULT_WRITE_BACK), duration=True)
     verify = settings.get("verify_upload")
     verify_text = "enabled" if verify is True else "disabled" if verify is False else "unknown"
     return [

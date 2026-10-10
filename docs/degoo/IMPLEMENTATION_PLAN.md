@@ -12,6 +12,20 @@ lifetime are unverified, so the vault is not yet accepted for normal use.
 
 ## Implementation decisions and validation plan
 
+Upload timing separates the local close delay from transfer, registration,
+verification, and publication. The installer exposes a positive `write_back`
+duration and uses one second for new installs; legacy settings keep rclone's
+five-second default until explicitly changed. Nonpositive and disabled values
+are refused because they bypass background retry scheduling.
+
+Registration recovery performs bounded metadata reads against the same
+temporary object without replaying the mutation. Missing, null, or lost
+acknowledgements receive a twenty-second visibility window; negative boolean
+acknowledgements retain a two-second window. The reads honor cancellation and
+provider retry delays. Failure leaves the logical write pending for VFS retry;
+the visibility window does not establish provider mutation idempotency or
+eliminate orphan storage from later retries.
+
 The original offline implementation checks are complete. A dedicated live test
 folder is now available and has been used for limited provider probes. The
 original sequence below remains the release acceptance guide; live gates

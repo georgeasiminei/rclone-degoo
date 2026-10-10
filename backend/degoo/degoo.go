@@ -44,7 +44,9 @@ const (
 	temporaryPrefix        = ".rclone-degoo-upload-"
 	backupPrefix           = ".rclone-degoo-backup-"
 
-	directoryPromotionTimeout = 3 * time.Minute
+	directoryPromotionTimeout   = 3 * time.Minute
+	uploadRegistrationTimeout   = 20 * time.Second
+	negativeRegistrationTimeout = 2 * time.Second
 
 	minPacerSleep = 100 * time.Millisecond
 	maxPacerSleep = 30 * time.Second
@@ -363,13 +365,26 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 }
 
 func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout time.Duration) (api.Item, error) {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var lastErr error
+	retryDelay := 250 * time.Millisecond
 	for {
-		items, err := f.listDir(ctx, parentID)
+		if lookupCtx.Err() != nil {
+			if ctx.Err() != nil {
+				return api.Item{}, ctx.Err()
+			}
+			if lastErr != nil {
+				return api.Item{}, lastErr
+			}
+			return api.Item{}, fs.ErrorDirNotFound
+		}
+		// The shared pacer can wait between retries without honoring lookupCtx.
+		items, err := f.api.ListDir(lookupCtx, parentID)
+		delay := 250 * time.Millisecond
 		if err == nil {
+			lastErr = nil
+			retryDelay = 250 * time.Millisecond
 			matches := make([]api.Item, 0, 1)
 			for _, item := range items {
 				if item.Name == name {
@@ -382,16 +397,41 @@ func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout tim
 			if len(matches) > 1 {
 				return api.Item{}, fmt.Errorf("degoo returned %d items named %q", len(matches), name)
 			}
-		}
-		select {
-		case <-ctx.Done():
-			return api.Item{}, ctx.Err()
-		case <-deadline.C:
-			if err != nil {
+		} else {
+			if ctx.Err() != nil {
+				return api.Item{}, ctx.Err()
+			}
+			if !api.Retryable(err) {
 				return api.Item{}, err
 			}
+			lastErr = err
+			delay = retryDelay
+			if retryDelay < maxPacerSleep {
+				retryDelay *= 2
+				if retryDelay > maxPacerSleep {
+					retryDelay = maxPacerSleep
+				}
+			}
+		}
+
+		if retryAfter, ok := pacer.IsRetryAfter(err); ok && retryAfter > delay {
+			delay = retryAfter
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return api.Item{}, ctx.Err()
+		case <-lookupCtx.Done():
+			timer.Stop()
+			if ctx.Err() != nil {
+				return api.Item{}, ctx.Err()
+			}
+			if lastErr != nil {
+				return api.Item{}, lastErr
+			}
 			return api.Item{}, fs.ErrorDirNotFound
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
@@ -1606,14 +1646,19 @@ func (f *Fs) uploadAndCommit(ctx context.Context, remote string, old *Object, in
 	created := time.Now()
 	_, registerErr := f.api.Register(ctx, parentID, tempName, providerChecksum, stagedSize, created)
 	if registerErr != nil {
-		item, resolveErr := f.waitForItem(ctx, parentID, tempName, 2*time.Second)
-		if resolveErr != nil {
-			return nil, fmt.Errorf("degoo: register uploaded data; result is ambiguous and pending storage may remain: %w", registerErr)
-		}
-		return f.finishUpload(ctx, remote, leaf, parentID, item, old, stagedSize, localDigest)
+		fs.Debugf(f, "degoo: reconciling encrypted upload after unacknowledged registration")
 	}
-	item, err := f.waitForItem(ctx, parentID, tempName, 20*time.Second)
+	// An unacknowledged mutation can become visible after a delayed listing.
+	// Reconcile the exact temporary name before returning this attempt.
+	lookupTimeout := uploadRegistrationTimeout
+	if errors.Is(registerErr, api.ErrNegativeAcknowledgement) {
+		lookupTimeout = negativeRegistrationTimeout
+	}
+	item, err := f.waitForItem(ctx, parentID, tempName, lookupTimeout)
 	if err != nil {
+		if registerErr != nil {
+			return nil, fmt.Errorf("degoo: register uploaded data; result is ambiguous and pending storage may remain: %w; metadata confirmation failed: %v", registerErr, err)
+		}
 		return nil, fmt.Errorf("degoo: uploaded bytes are not yet registered; pending storage retained: %w", err)
 	}
 	return f.finishUpload(ctx, remote, leaf, parentID, item, old, stagedSize, localDigest)

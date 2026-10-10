@@ -120,6 +120,20 @@ class UninstallTest(unittest.TestCase):
         self.assertNotIn("generated-test-folder-id", stdout)
         self.assertTrue(self.root.exists())
 
+    def test_layout_accepts_legacy_mount_settings_without_write_back(self) -> None:
+        settings = {
+            "cache_max_size": "20G",
+            "cache_min_free_space": "20G",
+            "cache_max_age": "10m",
+            "cache_poll_interval": "5s",
+            "verify_upload": True,
+        }
+        self.write_private(self.root / "config/mount.json", json.dumps(settings).encode() + b"\n")
+
+        layout = uninstall._validate_layout(self.root)
+
+        self.assertEqual(layout["manifest"]["version"], 1)
+
     def test_default_root_is_the_contained_install(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()

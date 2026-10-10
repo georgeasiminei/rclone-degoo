@@ -1,6 +1,7 @@
 package degoo
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -21,44 +22,55 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/object"
+	"github.com/rclone/rclone/lib/pacer"
 )
 
 type mockItem struct {
-	id       string
-	name     string
-	parentID string
-	category int
-	size     int64
-	created  time.Time
-	content  []byte
+	id           string
+	name         string
+	parentID     string
+	category     int
+	size         int64
+	created      time.Time
+	content      []byte
+	visibleAfter time.Time
 }
 
 type mockDegoo struct {
-	mu                         sync.Mutex
-	items                      map[string]mockItem
-	uploads                    map[string][]byte
-	downloadCalls              int
-	nextID                     int
-	failRegister               bool
-	failInitialMkdirAck        bool
-	corruptUpload              bool
-	registeredSizeDelta        int64
-	promoteOnMarker            bool
-	initialPlaceholderCategory int
-	renameRoutesViaAlias       bool
-	listLagForName             string
-	listLagID                  string
-	listLagOldName             string
-	listLagFinalName           string
-	listLagResponses           int
-	listLagRemaining           int
-	getItemSawFinalName        bool
-	overlayParentZero          bool
-	backupID                   string
-	backupDeletedBeforeVisible bool
-	deleteCalls                []deleteCall
-	failDeleteIDs              map[string]bool
-	registerSeen               chan struct{}
+	mu                           sync.Mutex
+	items                        map[string]mockItem
+	uploads                      map[string][]byte
+	downloadCalls                int
+	nextID                       int
+	failRegister                 bool
+	nullRegisterAcknowledgement  bool
+	falseRegisterAcknowledgement bool
+	applyFalseRegisterAck        bool
+	registrationVisibilityLag    time.Duration
+	registerCalls                int
+	blockListing                 bool
+	listRetryAfter               string
+	listStatusCode               int
+	listCalls                    int
+	failInitialMkdirAck          bool
+	corruptUpload                bool
+	registeredSizeDelta          int64
+	promoteOnMarker              bool
+	initialPlaceholderCategory   int
+	renameRoutesViaAlias         bool
+	listLagForName               string
+	listLagID                    string
+	listLagOldName               string
+	listLagFinalName             string
+	listLagResponses             int
+	listLagRemaining             int
+	getItemSawFinalName          bool
+	overlayParentZero            bool
+	backupID                     string
+	backupDeletedBeforeVisible   bool
+	deleteCalls                  []deleteCall
+	failDeleteIDs                map[string]bool
+	registerSeen                 chan struct{}
 }
 
 type deleteCall struct {
@@ -167,10 +179,24 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 			data = map[string]any{"getOverlay4": mock.itemJSON(overlayItem, request)}
 		}
 	case "GetFileChildren5":
+		mock.listCalls++
+		if mock.blockListing {
+			<-request.Context().Done()
+			return
+		}
+		if mock.listRetryAfter != "" {
+			writer.Header().Set("Retry-After", mock.listRetryAfter)
+			writer.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if mock.listStatusCode != 0 {
+			writer.WriteHeader(mock.listStatusCode)
+			return
+		}
 		parentID, _ := input.Variables["ParentID"].(string)
 		items := make([]map[string]any, 0)
 		for _, item := range mock.items {
-			if item.parentID == parentID {
+			if item.parentID == parentID && !time.Now().Before(item.visibleAfter) {
 				listedItem := item
 				if item.id == mock.listLagID && mock.listLagRemaining > 0 {
 					listedItem.name = mock.listLagOldName
@@ -201,6 +227,11 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 			writeTestJSON(writer, map[string]any{"errors": []any{map[string]string{"message": "simulated registration rejection"}}})
 			return
 		}
+		if checksum != "" && mock.falseRegisterAcknowledgement && !mock.applyFalseRegisterAck {
+			mock.registerCalls++
+			data = map[string]any{"setUploadFile3": false}
+			break
+		}
 		mock.nextID++
 		id := fmt.Sprintf("item-%d", mock.nextID)
 		size, _ := strconv.ParseInt(fmt.Sprint(info["Size"]), 10, 64)
@@ -211,8 +242,10 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 		}
 		item := mockItem{id: id, name: name, parentID: parentID, category: category, size: size, created: time.UnixMilli(createdMS)}
 		if checksum != "" {
+			mock.registerCalls++
 			item.size += mock.registeredSizeDelta
 			item.content = append([]byte(nil), mock.uploads[name]...)
+			item.visibleAfter = time.Now().Add(mock.registrationVisibilityLag)
 		} else if mock.promoteOnMarker && strings.HasPrefix(name, directoryMarkerPrefix) {
 			placeholder, ok := mock.items[parentID]
 			if ok {
@@ -233,6 +266,10 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 		}
 		if checksum == "" {
 			data = map[string]any{"setUploadFile3": true}
+		} else if mock.falseRegisterAcknowledgement {
+			data = map[string]any{"setUploadFile3": false}
+		} else if mock.nullRegisterAcknowledgement {
+			data = map[string]any{"setUploadFile3": nil}
 		} else {
 			data = map[string]any{"setUploadFile3": "OK"}
 		}
@@ -406,6 +443,186 @@ func TestUploadAndReplacementKeepPreviousDataUntilCommit(t *testing.T) {
 	mock.mu.Unlock()
 	if oldStillExists {
 		t.Fatal("prior provider item was not removed after verified publication")
+	}
+}
+
+func TestRegistrationReconcilesDelayedNullAcknowledgement(t *testing.T) {
+	mock := newMockDegoo()
+	mock.nullRegisterAcknowledgement = true
+	mock.registrationVisibilityLag = 2500 * time.Millisecond
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	content := []byte("generated encrypted payload")
+	obj, err := f.Put(ctx, bytes.NewReader(content), object.NewStaticObjectInfo("cipher", time.Now(), int64(len(content)), true, nil, f))
+	if err != nil {
+		t.Fatalf("Put after unacknowledged registration: %v", err)
+	}
+	body, err := obj.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(body)
+	closeTestBody(t, body)
+	if err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("readback mismatch: %v", err)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.registerCalls != 1 || len(mock.uploads) != 1 {
+		t.Fatalf("registration replayed: %d registrations, %d uploads", mock.registerCalls, len(mock.uploads))
+	}
+}
+
+func TestNegativeRegistrationAcknowledgementStaysPendingWhenItemIsAbsent(t *testing.T) {
+	mock := newMockDegoo()
+	mock.falseRegisterAcknowledgement = true
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	content := []byte("generated encrypted payload")
+	start := time.Now()
+	obj, err := f.Put(ctx, bytes.NewReader(content), object.NewStaticObjectInfo("cipher", time.Now(), int64(len(content)), true, nil, f))
+	if obj != nil {
+		if published, ok := obj.(*Object); !ok || published != nil {
+			t.Fatalf("Put returned object %v after a negative registration acknowledgement", obj)
+		}
+	}
+	if err == nil || !errors.Is(err, api.ErrNegativeAcknowledgement) {
+		t.Fatalf("Put error = %v, want pending negative acknowledgement", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("negative acknowledgement lookup exceeded its bounded timeout: %v", elapsed)
+	}
+	if _, err := f.NewObject(ctx, "cipher"); !errors.Is(err, fs.ErrorObjectNotFound) {
+		t.Fatalf("NewObject after negative acknowledgement = %v, want object not found", err)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.registerCalls != 1 || len(mock.uploads) != 1 || len(mock.items) != 1 {
+		t.Fatalf("negative acknowledgement state = %d registrations, %d uploads, %d metadata items; want 1, 1, 1", mock.registerCalls, len(mock.uploads), len(mock.items))
+	}
+}
+
+func TestNegativeRegistrationAcknowledgementReconcilesAppliedItem(t *testing.T) {
+	mock := newMockDegoo()
+	mock.falseRegisterAcknowledgement = true
+	mock.applyFalseRegisterAck = true
+	mock.registrationVisibilityLag = 250 * time.Millisecond
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	content := []byte("generated encrypted payload")
+	obj, err := f.Put(ctx, bytes.NewReader(content), object.NewStaticObjectInfo("cipher", time.Now(), int64(len(content)), true, nil, f))
+	if err != nil {
+		t.Fatalf("Put after false acknowledgement with an applied registration: %v", err)
+	}
+	if obj == nil {
+		t.Fatal("Put returned a nil object after reconciling the applied registration")
+	}
+	body, err := obj.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open reconciled object: %v", err)
+	}
+	got, err := io.ReadAll(body)
+	closeTestBody(t, body)
+	if err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("verified object content = %q, want %q (read error: %v)", got, content, err)
+	}
+	visible, err := f.NewObject(ctx, "cipher")
+	if err != nil {
+		t.Fatalf("published object lookup: %v", err)
+	}
+	if visible == nil || visible.Remote() != "cipher" {
+		t.Fatalf("published object = %v, want cipher", visible)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.registerCalls != 1 || len(mock.uploads) != 1 {
+		t.Fatalf("reconciled registration replayed: %d registrations, %d uploads; want 1, 1", mock.registerCalls, len(mock.uploads))
+	}
+	if len(mock.items) != 2 {
+		t.Fatalf("metadata item count = %d, want vault and one published item", len(mock.items))
+	}
+	for _, item := range mock.items {
+		if item.name == "cipher" && (item.parentID != "vault" || item.size != int64(len(content))) {
+			t.Fatalf("published metadata = parent %q, size %d; want parent vault and size %d", item.parentID, item.size, len(content))
+		}
+	}
+}
+
+func TestWaitForItemTimeoutDoesNotWaitOnQueuedPacerRetry(t *testing.T) {
+	mock := newMockDegoo()
+	mock.listRetryAfter = "1"
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	f.pacer.SetRetries(1)
+	mock.mu.Lock()
+	initialListCalls := mock.listCalls
+	mock.mu.Unlock()
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := f.listDir(ctx, "vault"); err == nil {
+			t.Fatal("throttled listing unexpectedly succeeded")
+		}
+	}
+
+	started := time.Now()
+	_, err := f.waitForItem(ctx, "vault", "missing", 400*time.Millisecond)
+	if err == nil {
+		t.Fatal("lookup succeeded for a missing item")
+	}
+	if delay, ok := pacer.IsRetryAfter(err); !ok || delay != time.Second {
+		t.Fatalf("lookup error retry-after = %v, %t; want 1s, true", delay, ok)
+	}
+	if elapsed := time.Since(started); elapsed > 800*time.Millisecond {
+		t.Fatalf("lookup waited for queued pacer retry: %v", elapsed)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.listCalls != initialListCalls+3 {
+		t.Fatalf("listing requests = %d, want %d (two pacer setup calls and one bounded lookup)", mock.listCalls, initialListCalls+3)
+	}
+}
+
+func TestWaitForItemBacksOffRetryableListingErrors(t *testing.T) {
+	mock := newMockDegoo()
+	mock.listStatusCode = http.StatusInternalServerError
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	mock.mu.Lock()
+	initialListCalls := mock.listCalls
+	mock.mu.Unlock()
+	_, err := f.waitForItem(context.Background(), "vault", "missing", 1500*time.Millisecond)
+	if api.HTTPStatus(err) != http.StatusInternalServerError {
+		t.Fatalf("lookup error status = %d, want %d (error: %v)", api.HTTPStatus(err), http.StatusInternalServerError, err)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if got := mock.listCalls - initialListCalls; got != 3 {
+		t.Fatalf("retryable listing requests = %d, want 3 with increasing backoff", got)
+	}
+}
+
+func TestRegistrationLookupTimeoutCancelsBlockedRequest(t *testing.T) {
+	mock := newMockDegoo()
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	mock.mu.Lock()
+	mock.blockListing = true
+	mock.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := f.waitForItem(ctx, "vault", "missing", 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("lookup succeeded for a missing item")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("lookup exceeded its timeout: %v", elapsed)
 	}
 }
 

@@ -873,12 +873,15 @@ def _current_vault_settings(root: Path) -> dict[str, Any] | None:
 
 def _prompt_cache_settings(settings: dict[str, Any], *, input_fn: Callable[[str], str]) -> dict[str, Any]:
     defaults = installer.DEFAULT_MOUNT_SETTINGS
+    write_back = settings.get("write_back")
+    if not installer.is_valid_write_back_duration(write_back):
+        write_back = defaults["write_back"]
     result = {
         "cache_max_size": _read_text_setting(settings, "cache_max_size", defaults["cache_max_size"]),
         "cache_min_free_space": _read_text_setting(settings, "cache_min_free_space", defaults["cache_min_free_space"]),
         "cache_max_age": _read_text_setting(settings, "cache_max_age", defaults["cache_max_age"], duration=True),
         "cache_poll_interval": _read_text_setting(settings, "cache_poll_interval", defaults["cache_poll_interval"], duration=True),
-        "write_back": _read_text_setting(settings, "write_back", defaults["write_back"], duration=True),
+        "write_back": write_back,
         "verify_upload": settings.get("verify_upload") if type(settings.get("verify_upload")) is bool else defaults["verify_upload"],
     }
     result["cache_max_size"] = _prompt("Maximum local cache size", result["cache_max_size"], input_fn=input_fn)
@@ -890,9 +893,11 @@ def _prompt_cache_settings(settings: dict[str, Any], *, input_fn: Callable[[str]
     for key in ("cache_max_size", "cache_min_free_space"):
         if not SIZE_PATTERN.fullmatch(result[key]):
             raise WizardError(f"{key} must be a size such as 20G")
-    for key in ("cache_max_age", "cache_poll_interval", "write_back"):
+    for key in ("cache_max_age", "cache_poll_interval"):
         if not DURATION_PATTERN.fullmatch(result[key]):
             raise WizardError(f"{key} must be a duration such as 10m or 5s")
+    if not installer.is_valid_write_back_duration(result["write_back"]):
+        raise WizardError("write_back must be a positive duration such as 1s")
     return result
 
 

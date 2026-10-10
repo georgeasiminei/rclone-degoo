@@ -1,4 +1,4 @@
-# Degoo validation status — 2026-10-10
+# Degoo validation status — 2026-10-11
 
 Offline implementation checks are recorded separately from live acceptance.
 Live smoke checks passed against a dedicated disposable Degoo folder. A full
@@ -7,6 +7,39 @@ remount, but the remaining live gates mean this does not establish general
 provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
+
+## Upload timing and registration recovery
+
+The 2026-10-11 upload-delay investigation found two registration failures in
+the installed mount log, followed by VFS retry delays. Its settings already
+disabled upload readback verification. The five-second default close delay
+alone did not explain the reported interval.
+
+The follow-up validates positive, finite write-back values, preserves the
+five-second default for legacy settings, and reports that default in inventory.
+Offline regressions cover the added wizard prompt, setting validation and flag
+precedence, delayed registration visibility, negative acknowledgements,
+blocked requests, and provider `Retry-After` delays. Unconfirmed writes remain
+pending; an acknowledgement is never substituted for metadata and publication
+checks.
+
+The full `make quicktest BRANCH=degoo-upload-review` passed with the current
+test binary and contained FUSE helper first on `PATH`. An initial run without
+those prerequisites failed in archive, mount, and Docker mount tests; the
+affected packages and then the full suite passed after correcting `PATH`.
+The full Python helper suite passed all 136 tests. The final binary build,
+`go test -race ./cmd/degoo/... ./backend/degoo/...`, scoped `go vet`, and scoped
+golangci-lint v2.14.0 passed with zero lint issues. Changed Markdown lint and
+`git diff --check` passed.
+
+Live probes used only generated encrypted data in a separate disposable test
+folder. Two direct API uploads registered in about one second, became visible
+within another second, and matched encrypted readback hashes. A complete
+backend upload then received a false registration acknowledgement and could
+not confirm its temporary object. This remains a live provider failure, not a
+validated latency improvement. Deletion also returned false, so cleanup of the
+generated test folder is unconfirmed; private local recovery state was retained.
+No customer file or installed mount configuration was changed.
 
 ## Unified `degoo-rc` entrypoint follow-up
 

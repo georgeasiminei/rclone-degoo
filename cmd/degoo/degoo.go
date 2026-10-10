@@ -245,8 +245,11 @@ func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, 
 		}
 	}
 	var writeBack rfs.Duration
-	if s.WriteBack != nil {
+	if s.WriteBack != nil && !flagChanged(flags, "vfs-write-back") {
 		if err := writeBack.Set(*s.WriteBack); err != nil {
+			return false, fmt.Errorf("invalid write_back: %w", err)
+		}
+		if err := validateWriteBack(writeBack); err != nil {
 			return false, fmt.Errorf("invalid write_back: %w", err)
 		}
 	}
@@ -273,6 +276,13 @@ func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, 
 		verifyUpload = verifyUploadFlag
 	}
 	return verifyUpload, nil
+}
+
+func validateWriteBack(writeBack rfs.Duration) error {
+	if writeBack <= 0 || writeBack == rfs.DurationOff {
+		return errors.New("must be a positive finite duration")
+	}
+	return nil
 }
 
 func flagChanged(flags *pflag.FlagSet, name string) bool {
@@ -448,6 +458,9 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, 
 	verifyUpload, err := settings.apply(&options, flags, verifyUploadFlag)
 	if err != nil {
 		return err
+	}
+	if err := validateWriteBack(options.WriteBack); err != nil {
+		return fmt.Errorf("invalid vfs-write-back: %w", err)
 	}
 	lock, err := lockCache(c)
 	if err != nil {

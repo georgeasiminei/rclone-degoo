@@ -31,6 +31,10 @@ const maxRetryAfter = 5 * time.Minute
 // ErrAlreadyExists indicates that Degoo already has the requested content.
 var ErrAlreadyExists = errors.New("degoo content already exists")
 
+// ErrNegativeAcknowledgement indicates that Degoo returned false for a mutation.
+// The response alone does not establish whether the mutation had side effects.
+var ErrNegativeAcknowledgement = errors.New("degoo mutation returned a false acknowledgement")
+
 const itemFields = `
 		ID
 		Name
@@ -857,8 +861,12 @@ func mutationAcknowledgement(operation string, raw json.RawMessage) (string, err
 	switch strings.TrimSpace(string(raw)) {
 	case "true":
 		return "", nil
-	case "", "null", "false":
-		return "", &Error{operation: operation, message: "mutation was not acknowledged"}
+	case "":
+		return "", &Error{operation: operation, message: "response omitted the mutation acknowledgement; outcome is ambiguous"}
+	case "null":
+		return "", &Error{operation: operation, message: "mutation acknowledgement was null; outcome is ambiguous"}
+	case "false":
+		return "", &Error{operation: operation, message: "mutation acknowledgement was false; outcome is ambiguous", err: ErrNegativeAcknowledgement}
 	}
 	var result string
 	if err := json.Unmarshal(raw, &result); err != nil {

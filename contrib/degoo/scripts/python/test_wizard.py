@@ -19,6 +19,25 @@ import wizard
 
 
 class WizardTest(unittest.TestCase):
+    def test_write_back_prompt_rejects_nonpositive_and_invalid_durations(self) -> None:
+        for value in ("0s", "-1s", "off", "1S", "9223372036854775807ns", "9223372036854775808ns"):
+            with self.subTest(value=value):
+                answers = iter(("", "", "", "", value, ""))
+                with self.assertRaises(wizard.WizardError):
+                    wizard._prompt_cache_settings({}, input_fn=lambda _: next(answers))
+
+    def test_write_back_prompt_uses_one_second_default_for_legacy_settings(self) -> None:
+        answers = iter(("", "", "", "", "", ""))
+        legacy = {
+            key: value
+            for key, value in wizard.installer.DEFAULT_MOUNT_SETTINGS.items()
+            if key != "write_back"
+        }
+
+        settings = wizard._prompt_cache_settings(legacy, input_fn=lambda _: next(answers))
+
+        self.assertEqual(settings["write_back"], "1s")
+
     def test_default_binary_uses_distribution_bin_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -124,7 +143,7 @@ class WizardTest(unittest.TestCase):
     def _run_default_flow(self, *, login_code: int = 0, setup_code: int = 0) -> tuple[int, mock.Mock, mock.Mock, str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
-            answers = iter([""] * 8)
+            answers = iter([""] * 9)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             with (
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
@@ -191,7 +210,7 @@ class WizardTest(unittest.TestCase):
     def test_service_enable_times_out_without_claiming_mount_or_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install root"
-            answers = iter([""] * 9)
+            answers = iter([""] * 10)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
             with (
@@ -225,7 +244,7 @@ class WizardTest(unittest.TestCase):
     def test_failed_service_start_keeps_nonzero_result_and_explains_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
-            answers = iter([""] * 9)
+            answers = iter([""] * 10)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
             failure = wizard.service.ServiceError("the service is linked, but could not start")

@@ -126,8 +126,12 @@ the encryption password and cache identity.
 operation promises that Degoo has already received the file. Keep the cache
 directory across restarts and login failures. Dirty files are reloaded by VFS
 and uploaded when the same vault is mounted again with working credentials.
-New installs set `write_back` to one second, which queues a closed file sooner
-than rclone's five-second default. Upload verification downloads and hashes
+New installs set `write_back` to one second, which starts a closed file's upload
+sooner than rclone's five-second default when a transfer slot is available.
+Existing settings without this field retain the five-second default. The value
+must be positive and finite; `0s`, negative durations, and `off` are refused to
+preserve background uploads and retries. Failed attempts double their retry
+delay, starting from `write_back`. Upload verification downloads and hashes
 each encrypted object before publishing it;
 set `verify_upload` to `false` in the private mount settings to skip that extra
 readback while retaining metadata and publication checks.
@@ -141,6 +145,9 @@ Degoo or displaying file contents. Counts can change during uploads. Upload
 errors are also reported in the normal rclone logs. Zero pending uploads means
 the local cache has no outstanding dirty files; it is not an independent
 provider integrity audit.
+Pending files may be queued, actively uploading, or waiting to retry a failed
+attempt. A registration failure happens after byte transfer; check the logs
+before attributing a long pending interval to the close delay or verification.
 
 A process lock prevents two mounts from sharing a cache. Use one writer for
 each vault; separate machines or cache directories cannot coordinate through
@@ -228,6 +235,14 @@ Failed uploads leave the cached logical write pending. Crashes can leave
 unreferenced remote transaction objects; automatic orphan garbage collection
 and distributed atomic rename are not provided. Provider metadata operations
 can fail ambiguously and must be reconciled rather than blindly retried.
+Upload registration with a missing, null, or lost acknowledgement allows up to
+twenty seconds for the exact temporary object's metadata to appear. A `false`
+acknowledgement uses a shorter two-second confirmation window. These read
+requests obey the window and any provider `Retry-After` delay. A matching object
+still must pass the configured verification and publication checks. If it
+cannot be confirmed, the write remains pending; a later VFS retry can start a
+new upload. No acknowledgement variant is assumed to prove that the provider
+performed or rejected the mutation.
 
 Remote sizes, object counts, directory topology, timing, and access patterns
 remain visible. Existing native Degoo files are outside the encrypted vault

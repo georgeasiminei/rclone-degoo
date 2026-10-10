@@ -319,6 +319,7 @@ class InstallTest(unittest.TestCase):
         config_before = (self.root / "config/rclone.conf").read_bytes()
         settings_path = self.root / "config/mount.json"
         settings = install.DEFAULT_MOUNT_SETTINGS | {"cache_max_age": "10s", "verify_upload": False}
+        settings.pop("write_back")
         settings_path.write_text(json.dumps(settings, sort_keys=True) + "\n", encoding="utf-8")
         settings_path.chmod(0o600)
         settings_before = settings_path.read_bytes()
@@ -350,9 +351,26 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(cache_file.read_bytes(), cache_before)
         self.assertEqual((self.root / "config/login.json").read_text(encoding="utf-8"), '{"email":"owner@example.test"}\n')
         self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["verify_upload"], False)
+        self.assertNotIn("write_back", json.loads(settings_path.read_text(encoding="utf-8")))
         self.assertIn('exec "$BASE/scripts/mount.sh" "$@"', legacy_mount.read_text(encoding="utf-8"))
         self.assertEqual(os.readlink(self.home / ".local/bin/degoo-rc"), str(self.root / "degoo-rc"))
         self.assertEqual(json.loads((self.root / "install.json").read_text(encoding="utf-8"))["path_link"], str(self.home / ".local/bin/degoo-rc"))
+
+    def test_mount_settings_require_valid_positive_write_back_duration(self) -> None:
+        legacy = install.DEFAULT_MOUNT_SETTINGS.copy()
+        legacy.pop("write_back")
+        install.validate_mount_settings(json.dumps(legacy).encode())
+
+        for value in ("0s", "-1s", "off", "1S", "9223372036854775807ns", "9223372036854775808ns"):
+            with self.subTest(value=value):
+                settings = install.DEFAULT_MOUNT_SETTINGS | {"write_back": value}
+                with self.assertRaises(install.InstallError):
+                    install.validate_mount_settings(json.dumps(settings).encode())
+
+        settings = install.DEFAULT_MOUNT_SETTINGS | {"write_back": "1h30m"}
+        install.validate_mount_settings(json.dumps(settings).encode())
+        settings = install.DEFAULT_MOUNT_SETTINGS | {"write_back": "9223372036854775806ns"}
+        install.validate_mount_settings(json.dumps(settings).encode())
 
     def test_upgrade_privateizes_legacy_logs_without_changing_contents(self) -> None:
         code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")

@@ -254,12 +254,14 @@ func TestMutationRefreshRequiresOnlyUnauthorizedErrorsAndNoData(t *testing.T) {
 func TestMutationAcknowledgements(t *testing.T) {
 	operations := []struct {
 		name          string
+		operation     string
 		field         string
 		returnsString bool
 		invoke        func(*Client) (string, error)
 	}{
 		{
 			name:          "Register",
+			operation:     "SetUploadFile3",
 			field:         "setUploadFile3",
 			returnsString: true,
 			invoke: func(client *Client) (string, error) {
@@ -268,6 +270,7 @@ func TestMutationAcknowledgements(t *testing.T) {
 		},
 		{
 			name:          "Mkdir",
+			operation:     "SetUploadFile3",
 			field:         "setUploadFile3",
 			returnsString: true,
 			invoke: func(client *Client) (string, error) {
@@ -275,45 +278,52 @@ func TestMutationAcknowledgements(t *testing.T) {
 			},
 		},
 		{
-			name:  "Rename",
-			field: "setRenameFile",
+			name:      "Rename",
+			operation: "SetRenameFile",
+			field:     "setRenameFile",
 			invoke: func(client *Client) (string, error) {
 				return "", client.Rename(context.Background(), "id", "new-name")
 			},
 		},
 		{
-			name:  "Move",
-			field: "setMoveFile",
+			name:      "Move",
+			operation: "SetMoveFile",
+			field:     "setMoveFile",
 			invoke: func(client *Client) (string, error) {
 				return "", client.Move(context.Background(), "id", "new-parent")
 			},
 		},
 		{
-			name:  "Delete",
-			field: "setDeleteFile5",
+			name:      "Delete",
+			operation: "SetDeleteFile5",
+			field:     "setDeleteFile5",
 			invoke: func(client *Client) (string, error) {
 				return "", client.Delete(context.Background(), "id", false)
 			},
 		},
 	}
 	cases := []struct {
-		name       string
-		value      any
-		omit       bool
-		wantErr    bool
-		wantString string
+		name          string
+		value         any
+		omit          bool
+		wantErr       bool
+		negativeAck   bool
+		wantErrorText string
+		wantString    string
 	}{
 		{name: "boolean true", value: true},
 		{name: "legacy string", value: "legacy result", wantString: "legacy result"},
-		{name: "false", value: false, wantErr: true},
-		{name: "null", value: nil, wantErr: true},
-		{name: "wrong type", value: 42, wantErr: true},
-		{name: "missing", omit: true, wantErr: true},
+		{name: "false", value: false, wantErr: true, negativeAck: true, wantErrorText: "mutation acknowledgement was false; outcome is ambiguous"},
+		{name: "null", value: nil, wantErr: true, wantErrorText: "mutation acknowledgement was null; outcome is ambiguous"},
+		{name: "wrong type", value: 42, wantErr: true, wantErrorText: "response contained an invalid mutation acknowledgement"},
+		{name: "missing", omit: true, wantErr: true, wantErrorText: "response omitted the mutation acknowledgement; outcome is ambiguous"},
 	}
 	for _, operation := range operations {
 		for _, test := range cases {
 			t.Run(operation.name+"/"+test.name, func(t *testing.T) {
+				var requests atomic.Int32
 				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+					requests.Add(1)
 					data := map[string]any{}
 					if !test.omit {
 						data[operation.field] = test.value
@@ -326,6 +336,15 @@ func TestMutationAcknowledgements(t *testing.T) {
 				if test.wantErr {
 					if err == nil {
 						t.Fatalf("%s unexpectedly succeeded with %v acknowledgement", operation.name, test.name)
+					}
+					if got, want := err.Error(), operation.operation+": "+test.wantErrorText; got != want {
+						t.Fatalf("%s error = %q, want %q", operation.name, got, want)
+					}
+					if got := errors.Is(err, ErrNegativeAcknowledgement); got != test.negativeAck {
+						t.Fatalf("%s negative acknowledgement = %t, want %t", operation.name, got, test.negativeAck)
+					}
+					if got := requests.Load(); got != 1 {
+						t.Fatalf("%s sent %d requests for an unacknowledged mutation, want one", operation.name, got)
 					}
 					return
 				}

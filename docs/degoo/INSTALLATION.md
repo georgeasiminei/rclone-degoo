@@ -177,15 +177,25 @@ are:
 | `cache_min_free_space` | `20G` | Keep this much free space on the filesystem holding the cache when evicting clean data. |
 | `cache_max_age` | `10m` | Maximum age for clean cached data before it becomes eligible for eviction. |
 | `cache_poll_interval` | `5s` | How often the local cache cleaner checks for stale clean files. |
-| `write_back` | `1s` | Delay after a file closes before its upload is queued. |
+| `write_back` | `1s` | Wait after a file closes before attempting its upload. Must be positive. |
 | `verify_upload` | `true` | Download each encrypted upload and compare its size and SHA-256 before publication. |
 
 Change these values in `config/mount.json` and restart the mount or service to
 apply them. Set `write_back` to a shorter duration to queue closed files sooner.
+Zero, negative, and `off` values are refused so writes keep using the background
+upload and retry queue. This setting also controls the initial retry delay;
+rclone doubles the delay after each failed attempt. Ordinary upgrades preserve
+existing settings. Older files without `write_back` retain rclone's five-second
+default; add `"write_back": "1s"` explicitly to shorten it.
 Set `verify_upload` to `false` to skip the full download and SHA-256 check;
 metadata and publication checks still run. Cache limits are targets: open files
 and pending writes remain in the cache. A newly written logical file is staged
 locally in full even when remote storage splits it into chunks.
+
+Pending status includes queued, active, and failed uploads awaiting retry.
+Inspect `degoo-rc logs` for failures. A failed registration can occur after the
+encrypted bytes have reached storage; reducing the close delay or disabling
+readback verification does not resolve a provider registration rejection.
 
 ## Files and permissions
 
