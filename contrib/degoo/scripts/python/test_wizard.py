@@ -595,8 +595,11 @@ class WizardTest(unittest.TestCase):
     def test_requested_folder_id_cannot_change_existing_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
+            home.mkdir(mode=0o700)
             root = home / ".local/share/rclone-degoo"
             root.mkdir(parents=True, mode=0o700)
+            (home / ".local").chmod(0o700)
+            (home / ".local/share").chmod(0o700)
             args = type("Args", (), {"binary": None, "folder_id": "other-id", "folder_name": None, "vault_config": None, "upgrade": True})()
             with (
                 mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
@@ -607,6 +610,25 @@ class WizardTest(unittest.TestCase):
                 wizard._run(args, input_fn=lambda _: "")
             check_runtime.assert_not_called()
 
+
+    def test_preflight_refuses_unsafe_local_bin_before_dependency_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            home.mkdir(mode=0o700)
+            local = home / ".local"
+            local.mkdir(mode=0o755)
+            local_bin = local / "bin"
+            local_bin.mkdir(mode=0o775)
+            local_bin.chmod(0o775)
+            args = type("Args", (), {"binary": None, "folder_id": None, "folder_name": None, "vault_config": None, "upgrade": False})()
+            with (
+                mock.patch.object(wizard.installer, "home_directory", return_value=home),
+                self.assertRaises(wizard.WizardError) as context,
+            ):
+                wizard._run(args, input_fn=lambda _: self.fail("no prompt expected"))
+        self.assertIn(str(local_bin), str(context.exception))
+        self.assertIn("chmod go-w", str(context.exception))
+        self.assertIn("group or other", str(context.exception))
 
 if __name__ == "__main__":
     unittest.main()

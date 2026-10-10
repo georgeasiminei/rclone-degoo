@@ -208,6 +208,36 @@ def ensure_parent_directories(root: Path) -> None:
             )
 
 
+def preflight_install_safety() -> None:
+    """Fail early if the install's ancestor directories are unsafe.
+
+    The installer creates missing ~/.local and ~/.local/share directories,
+    but it cannot safely use existing directories that are writable by group
+    or other, or not owned by the current user. ~/.local/bin is created by
+    the installer if missing; if it already exists it must also be safe.
+    """
+    home = home_directory()
+    paths = [home, home / ".local", home / ".local/share", home / ".local/bin"]
+    for candidate in paths:
+        if not candidate.exists():
+            continue
+        try:
+            info = os.lstat(candidate)
+        except OSError:
+            raise InstallError(f"{candidate} could not be inspected for safe install") from None
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise InstallError(f"{candidate} is not a safe directory and cannot be used for install")
+        if info.st_uid != os.getuid():
+            raise InstallError(
+                f"{candidate} is not owned by the current user; review ownership before installing"
+            )
+        if info.st_mode & 0o022:
+            raise InstallError(
+                f"{candidate} is writable by group or other and cannot be used for a private install; "
+                f"run chmod go-w {shlex.quote(str(candidate))}"
+            )
+
+
 def read_private_file(path: Path, maximum: int = MAX_CONFIG_SIZE, *, missing_ok: bool = False) -> bytes | None:
     check_components(path, missing_ok=missing_ok)
     try:
@@ -974,6 +1004,7 @@ def install(args: argparse.Namespace) -> int:
         raise InstallError("the setup-created folder marker requires --folder-id")
     args.binary = str(_binary_source(args.binary))
     validate_binary(Path(args.binary))
+    preflight_install_safety()
     if not args.upgrade:
         return _install(args)
     root = expected_root()

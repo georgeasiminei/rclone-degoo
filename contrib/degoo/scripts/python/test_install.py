@@ -266,6 +266,19 @@ class InstallTest(unittest.TestCase):
         self.assertIn("chmod go-w", stderr)
         self.assertFalse(self.root.exists())
 
+    def test_unsafe_local_bin_is_rejected_before_prompts_with_fix_command(self) -> None:
+        local = self.home / ".local"
+        local.mkdir(mode=0o755)
+        local_bin = local / "bin"
+        local_bin.mkdir(mode=0o775)
+        local_bin.chmod(0o775)
+        code, _, stderr = self.invoke()
+        self.assertEqual(code, 2)
+        self.assertIn(str(local_bin), stderr)
+        self.assertIn("chmod go-w", stderr)
+        self.assertIn("group or other", stderr)
+        self.assertFalse(self.root.exists())
+
     def test_staged_install_defers_vault_secret_until_folder_setup(self) -> None:
         code, stdout, stderr = self.invoke()
         self.assertEqual(code, 0, stderr)
