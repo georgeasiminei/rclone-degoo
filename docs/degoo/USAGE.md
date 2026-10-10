@@ -126,6 +126,11 @@ the encryption password and cache identity.
 operation promises that Degoo has already received the file. Keep the cache
 directory across restarts and login failures. Dirty files are reloaded by VFS
 and uploaded when the same vault is mounted again with working credentials.
+New installs set `write_back` to one second, which queues a closed file sooner
+than rclone's five-second default. Upload verification downloads and hashes
+each encrypted object before publishing it;
+set `verify_upload` to `false` in the private mount settings to skip that extra
+readback while retaining metadata and publication checks.
 
 ```sh
 ./rclone degoo status ~/.config/rclone-degoo/vault.json

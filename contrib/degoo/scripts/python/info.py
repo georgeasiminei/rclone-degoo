@@ -563,6 +563,7 @@ def _settings_summary(root: Path) -> list[str]:
     minimum = _safe_setting(settings.get("cache_min_free_space"))
     age = _safe_setting(settings.get("cache_max_age"), duration=True)
     poll = _safe_setting(settings.get("cache_poll_interval"), duration=True)
+    write_back = _safe_setting(settings.get("write_back"), duration=True)
     verify = settings.get("verify_upload")
     verify_text = "enabled" if verify is True else "disabled" if verify is False else "unknown"
     return [
@@ -570,6 +571,7 @@ def _settings_summary(root: Path) -> list[str]:
         f"  Minimum free-space target: {minimum} (soft target; dirty or open files are retained).",
         f"  Cache maximum age: {age} (eligible closed, clean files use last-access age; cleanup runs on polling cadence).",
         f"  Cache polling interval: {poll}.",
+        f"  Delay before uploading closed files: {write_back}.",
         f"  Upload verification: {verify_text}.",
     ]
 

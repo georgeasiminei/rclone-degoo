@@ -242,10 +242,11 @@ def _validate_layout(root: Path) -> dict[str, Any]:
         mount_settings_bytes = None
     if mount_settings_bytes is not None:
         mount_settings = _decode_json(mount_settings_bytes)
-        expected_settings = {"cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval", "verify_upload"}
-        if set(mount_settings) != expected_settings or type(mount_settings.get("verify_upload")) is not bool:
+        expected_settings = {"cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval", "write_back", "verify_upload"}
+        legacy_settings = expected_settings - {"write_back"}
+        if set(mount_settings) not in (expected_settings, legacy_settings) or type(mount_settings.get("verify_upload")) is not bool:
             raise CleanupError("the mount settings are invalid")
-        if any(not isinstance(mount_settings.get(field), str) or not mount_settings[field] for field in expected_settings - {"verify_upload"}):
+        if any(not isinstance(mount_settings.get(field), str) or not mount_settings[field] for field in set(mount_settings) - {"verify_upload"}):
             raise CleanupError("the mount settings are invalid")
 
     rclone_config = root / "config/rclone.conf"

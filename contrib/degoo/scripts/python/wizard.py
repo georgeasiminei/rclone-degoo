@@ -878,17 +878,19 @@ def _prompt_cache_settings(settings: dict[str, Any], *, input_fn: Callable[[str]
         "cache_min_free_space": _read_text_setting(settings, "cache_min_free_space", defaults["cache_min_free_space"]),
         "cache_max_age": _read_text_setting(settings, "cache_max_age", defaults["cache_max_age"], duration=True),
         "cache_poll_interval": _read_text_setting(settings, "cache_poll_interval", defaults["cache_poll_interval"], duration=True),
+        "write_back": _read_text_setting(settings, "write_back", defaults["write_back"], duration=True),
         "verify_upload": settings.get("verify_upload") if type(settings.get("verify_upload")) is bool else defaults["verify_upload"],
     }
     result["cache_max_size"] = _prompt("Maximum local cache size", result["cache_max_size"], input_fn=input_fn)
     result["cache_min_free_space"] = _prompt("Minimum free-space target", result["cache_min_free_space"], input_fn=input_fn)
     result["cache_max_age"] = _prompt("Maximum cache age", result["cache_max_age"], input_fn=input_fn)
     result["cache_poll_interval"] = _prompt("Cache polling interval", result["cache_poll_interval"], input_fn=input_fn)
+    result["write_back"] = _prompt("Delay before uploading a closed file", result["write_back"], input_fn=input_fn)
     result["verify_upload"] = _yes_no("Verify completed uploads", default=result["verify_upload"], input_fn=input_fn)
     for key in ("cache_max_size", "cache_min_free_space"):
         if not SIZE_PATTERN.fullmatch(result[key]):
             raise WizardError(f"{key} must be a size such as 20G")
-    for key in ("cache_max_age", "cache_poll_interval"):
+    for key in ("cache_max_age", "cache_poll_interval", "write_back"):
         if not DURATION_PATTERN.fullmatch(result[key]):
             raise WizardError(f"{key} must be a duration such as 10m or 5s")
     return result

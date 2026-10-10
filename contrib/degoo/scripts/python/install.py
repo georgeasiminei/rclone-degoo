@@ -34,6 +34,7 @@ DEFAULT_MOUNT_SETTINGS = {
     "cache_min_free_space": "20G",
     "cache_max_age": "10m",
     "cache_poll_interval": "5s",
+    "write_back": "1s",
     "verify_upload": True,
 }
 FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount2.9", "fusermount3"}
@@ -489,9 +490,11 @@ def create_vault_config(root: Path, imported: bytes | None) -> bytes:
 def validate_mount_settings(raw: bytes) -> None:
     settings = parse_json_object(raw, "config/mount.json is invalid")
     expected_fields = set(DEFAULT_MOUNT_SETTINGS)
-    if set(settings) != expected_fields:
+    if set(settings) not in (expected_fields, expected_fields - {"write_back"}):
         raise InstallError("config/mount.json must contain the supported cache and upload settings")
-    for field in ("cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval"):
+    for field in ("cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval", "write_back"):
+        if field == "write_back" and field not in settings:
+            continue
         if not isinstance(settings[field], str) or not settings[field] or any(character in settings[field] for character in "\r\n\x00"):
             raise InstallError(f"config/mount.json has an invalid {field}")
     if type(settings["verify_upload"]) is not bool:

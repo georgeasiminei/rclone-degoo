@@ -176,13 +176,16 @@ are:
 | `cache_max_size` | `20G` | Soft target for the amount of cached data. Open and dirty files are not evicted to meet it. |
 | `cache_min_free_space` | `20G` | Keep this much free space on the filesystem holding the cache when evicting clean data. |
 | `cache_max_age` | `10m` | Maximum age for clean cached data before it becomes eligible for eviction. |
-| `cache_poll_interval` | `5s` | Interval for checking remote changes while the vault is mounted. |
+| `cache_poll_interval` | `5s` | How often the local cache cleaner checks for stale clean files. |
+| `write_back` | `1s` | Delay after a file closes before its upload is queued. |
 | `verify_upload` | `true` | Download each encrypted upload and compare its size and SHA-256 before publication. |
 
 Change these values in `config/mount.json` and restart the mount or service to
-apply them. Cache limits are targets: open files and pending writes remain in
-the cache. A newly written logical file is staged locally in full even when
-remote storage splits it into chunks.
+apply them. Set `write_back` to a shorter duration to queue closed files sooner.
+Set `verify_upload` to `false` to skip the full download and SHA-256 check;
+metadata and publication checks still run. Cache limits are targets: open files
+and pending writes remain in the cache. A newly written logical file is staged
+locally in full even when remote storage splits it into chunks.
 
 ## Files and permissions
 

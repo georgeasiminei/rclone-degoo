@@ -103,13 +103,16 @@ cap. Live Degoo limits above 20 GiB have not been verified. Initial
 | `cache_max_size` | `20G` | Soft cache-size target; open and pending files stay cached. |
 | `cache_min_free_space` | `20G` | Free disk space to preserve on the cache filesystem when evicting clean data. |
 | `cache_max_age` | `10m` | Age after which clean cache data becomes eligible for eviction. |
-| `cache_poll_interval` | `5s` | Interval for checking remote changes. |
+| `cache_poll_interval` | `5s` | How often the local cache cleaner checks for stale clean files. |
+| `write_back` | `1s` | Delay after a file closes before its upload is queued. |
 | `verify_upload` | `true` | Read back each encrypted upload and compare its size and SHA-256 before publishing it. |
 
 Run `degoo-rc mount` for a foreground mount, or `degoo-rc service enable` to
 start the user service. Edit `config/mount.json` and restart the mount or
 service to apply settings. Cache bounds are soft targets; open and dirty files
-are not evicted.
+are not evicted. Reduce `write_back` to queue closed files sooner. Setting
+`verify_upload` to `false` skips the full download and hash check while keeping
+metadata and publication checks enabled.
 Keep the cache until `degoo-rc status` reports zero pending uploads unless the
 uninstall wizard is making a complete private recovery copy of both config and
 cache.
