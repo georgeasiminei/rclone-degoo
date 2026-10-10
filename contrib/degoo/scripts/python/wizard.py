@@ -947,6 +947,10 @@ def _save_settings(root: Path, mount_settings: dict[str, Any], vault_sizes: dict
 
 
 def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
+    try:
+        installer.preflight_install_safety()
+    except installer.InstallError as exc:
+        raise WizardError(str(exc)) from None
     requested_folder_id = getattr(args, "folder_id", None)
     if requested_folder_id:
         requested_folder_id = installer.validate_folder_id(requested_folder_id)
