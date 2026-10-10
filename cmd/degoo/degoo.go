@@ -63,6 +63,7 @@ type mountSettings struct {
 	CacheMinFreeSpace *string `json:"cache_min_free_space,omitempty"`
 	CacheMaxAge       *string `json:"cache_max_age,omitempty"`
 	CachePollInterval *string `json:"cache_poll_interval,omitempty"`
+	WriteBack         *string `json:"write_back,omitempty"`
 	VerifyUpload      *bool   `json:"verify_upload,omitempty"`
 }
 
@@ -126,7 +127,7 @@ asynchronously. Keep the cache until pending uploads complete. Use degoo status
 to count locally pending files. Only one process may use a vault cache at a time.
 Live Degoo behavior is experimental; use a disposable vault first. Upload readback
 verification is enabled by default. The private --settings file may set cache
-limits and verify_upload; explicit command-line flags take precedence.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
+limits, write_back, and verify_upload; explicit command-line flags take precedence.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
 		return mountVault(c.Context(), args[0], args[1], settingsFile, c.Flags(), verifyUpload)
 	}}
 	mountlib.AddFlags(mount.Flags())
@@ -243,6 +244,15 @@ func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, 
 			return false, fmt.Errorf("invalid cache_poll_interval: %w", err)
 		}
 	}
+	var writeBack rfs.Duration
+	if s.WriteBack != nil && !flagChanged(flags, "vfs-write-back") {
+		if err := writeBack.Set(*s.WriteBack); err != nil {
+			return false, fmt.Errorf("invalid write_back: %w", err)
+		}
+		if err := validateWriteBack(writeBack); err != nil {
+			return false, fmt.Errorf("invalid write_back: %w", err)
+		}
+	}
 	if s.CacheMaxSize != nil && !flagChanged(flags, "vfs-cache-max-size") {
 		options.CacheMaxSize = cacheMaxSize
 	}
@@ -255,6 +265,9 @@ func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, 
 	if s.CachePollInterval != nil && !flagChanged(flags, "vfs-cache-poll-interval") {
 		options.CachePollInterval = cachePollInterval
 	}
+	if s.WriteBack != nil && !flagChanged(flags, "vfs-write-back") {
+		options.WriteBack = writeBack
+	}
 	verifyUpload := true
 	if s.VerifyUpload != nil {
 		verifyUpload = *s.VerifyUpload
@@ -263,6 +276,13 @@ func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, 
 		verifyUpload = verifyUploadFlag
 	}
 	return verifyUpload, nil
+}
+
+func validateWriteBack(writeBack rfs.Duration) error {
+	if writeBack <= 0 || writeBack == rfs.DurationOff {
+		return errors.New("must be a positive finite duration")
+	}
+	return nil
 }
 
 func flagChanged(flags *pflag.FlagSet, name string) bool {
@@ -438,6 +458,9 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, 
 	verifyUpload, err := settings.apply(&options, flags, verifyUploadFlag)
 	if err != nil {
 		return err
+	}
+	if err := validateWriteBack(options.WriteBack); err != nil {
+		return fmt.Errorf("invalid vfs-write-back: %w", err)
 	}
 	lock, err := lockCache(c)
 	if err != nil {

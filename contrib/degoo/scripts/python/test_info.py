@@ -117,6 +117,26 @@ class InfoTest(unittest.TestCase):
         self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", lines[2])
         self.assertIn("log in before cloud operations", lines[2])
 
+    def test_legacy_mount_settings_report_effective_write_back_default(self) -> None:
+        settings = install.DEFAULT_MOUNT_SETTINGS.copy()
+        settings.pop("write_back")
+        self.write_private(self.root / "config/mount.json", settings)
+
+        summary = "\n".join(info._settings_summary(self.root))
+
+        self.assertIn("Delay before uploading closed files: 5s.", summary)
+        self.assertNotIn("Delay before uploading closed files: unknown", summary)
+
+    def test_write_back_microsecond_units_are_reported(self) -> None:
+        for value in ("1µs", "1μs"):
+            with self.subTest(value=value):
+                settings = install.DEFAULT_MOUNT_SETTINGS | {"write_back": value}
+                self.write_private(self.root / "config/mount.json", settings)
+
+                summary = "\n".join(info._settings_summary(self.root))
+
+                self.assertIn(f"Delay before uploading closed files: {value}.", summary)
+
     def test_report_promotes_expired_access_token_without_refresh(self) -> None:
         now = int(datetime.now().timestamp())
         self.write_private(self.root / "config/auth.json", {"token": self.jwt(now - 60)})

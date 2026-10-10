@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -34,14 +35,49 @@ DEFAULT_MOUNT_SETTINGS = {
     "cache_min_free_space": "20G",
     "cache_max_age": "10m",
     "cache_poll_interval": "5s",
+    "write_back": "1s",
     "verify_upload": True,
 }
+MAX_WRITE_BACK_DURATION_NS = (1 << 63) - 1
+WRITE_BACK_DURATION_UNITS_NS = {
+    "ns": 1,
+    "us": 1_000,
+    "µs": 1_000,
+    "μs": 1_000,
+    "ms": 1_000_000,
+    "s": 1_000_000_000,
+    "m": 60_000_000_000,
+    "h": 3_600_000_000_000,
+}
+WRITE_BACK_DURATION_COMPONENT = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|μs|ms|s|m|h)")
 FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount2.9", "fusermount3"}
 LEGACY_LOG_FILES = ("mount.log", "login.log", "setup.log", "status.log", "wizard-folders.log")
 
 
 class InstallError(Exception):
     """A safe, user-facing refusal from the contained installer."""
+
+
+def is_valid_write_back_duration(value: Any) -> bool:
+    """Report whether value is a positive delay other than Go's off sentinel."""
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return False
+    position = 0
+    total_ns = 0
+    for match in WRITE_BACK_DURATION_COMPONENT.finditer(value):
+        if match.start() != position:
+            return False
+        amount, unit = match.groups()
+        whole, _, fraction = amount.partition(".")
+        unit_ns = WRITE_BACK_DURATION_UNITS_NS[unit]
+        component_ns = int(whole) * unit_ns
+        if fraction:
+            component_ns += (int(fraction) * unit_ns) // (10 ** len(fraction))
+        total_ns += component_ns
+        if total_ns >= MAX_WRITE_BACK_DURATION_NS:
+            return False
+        position = match.end()
+    return position == len(value) and total_ns > 0
 
 
 def home_directory() -> Path:
@@ -489,11 +525,13 @@ def create_vault_config(root: Path, imported: bytes | None) -> bytes:
 def validate_mount_settings(raw: bytes) -> None:
     settings = parse_json_object(raw, "config/mount.json is invalid")
     expected_fields = set(DEFAULT_MOUNT_SETTINGS)
-    if set(settings) != expected_fields:
+    if set(settings) not in (expected_fields, expected_fields - {"write_back"}):
         raise InstallError("config/mount.json must contain the supported cache and upload settings")
     for field in ("cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval"):
         if not isinstance(settings[field], str) or not settings[field] or any(character in settings[field] for character in "\r\n\x00"):
             raise InstallError(f"config/mount.json has an invalid {field}")
+    if "write_back" in settings and not is_valid_write_back_duration(settings["write_back"]):
+        raise InstallError("config/mount.json has an invalid write_back setting")
     if type(settings["verify_upload"]) is not bool:
         raise InstallError("config/mount.json has an invalid verify_upload setting")
 
