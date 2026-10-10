@@ -1,15 +1,19 @@
 ---
 # Build and package the Linux amd64 Degoo vault distribution archive.
 # The archive and its SHA-256 sidecar are produced by bin/package-degoo.py,
-# uploaded as a workflow artifact, and attached to a GitHub release on tags.
+# uploaded as a workflow artifact after staging updates that change code.
 
 name: degoo-package
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - staging
+    paths-ignore:
+      - 'docs/**'
+      - 'graphics/**'
+      - '**/*.md'
+      - '**/*.rst'
 
 permissions:
   contents: read
@@ -19,10 +23,6 @@ jobs:
     name: package-linux-amd64
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Release publishing on tag pushes needs write access to contents.
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -41,6 +41,9 @@ jobs:
         run: python3 bin/package-degoo.py --self-check
 
       - name: Build rclone
+        env:
+          GOOS: linux
+          GOARCH: amd64
         run: |
           mkdir -p build
           go build -o build/rclone .
@@ -64,21 +67,3 @@ jobs:
             dist/rclone-degoo-linux-amd64.tar.gz
             dist/rclone-degoo-linux-amd64.tar.gz.sha256
           if-no-files-found: error
-
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "rclone-degoo ${tag}" \
-              --generate-notes
-          fi
-          gh release upload "$tag" \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber \
-            dist/rclone-degoo-linux-amd64.tar.gz \
-            dist/rclone-degoo-linux-amd64.tar.gz.sha256
