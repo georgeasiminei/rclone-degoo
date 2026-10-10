@@ -128,6 +128,28 @@ dependency, mount, cache, upgrade, and recovery guide. See
 [the quick start](../../DEGOO.md) and [usage](../../docs/degoo/USAGE.md) for
 configuration and commands.
 
+## Account trash
+
+From a source checkout, `trash.sh` gives the account-trash commands a concise
+interface. The auth file defaults to the contained installation's
+`config/auth.json`, and `--rclone PATH` can override the default binary lookup.
+The auth file is passed to rclone without being read or displayed by the
+wrapper:
+
+```sh
+./contrib/degoo/trash.sh list --auth ~/.config/rclone-degoo/auth.json
+./contrib/degoo/trash.sh list --auth ~/.config/rclone-degoo/auth.json --limit 10 --json
+./contrib/degoo/trash.sh empty --auth ~/.config/rclone-degoo/auth.json --dry-run
+./contrib/degoo/trash.sh empty --auth ~/.config/rclone-degoo/auth.json --yes
+```
+
+`list` maps to `rclone degoo trash`; `empty` maps to
+`rclone degoo empty-trash`. Trash is account-wide rather than vault-scoped.
+Emptying it is irreversible, prompts twice unless `--yes` is supplied, and can
+delete unrelated account trash. Dry-run only lists the candidates. Generic
+`rclone cleanup` and restore are deliberately unsupported. Use an isolated
+disposable account for destructive validation.
+
 ## Find your mount and logs
 
 The wizard ends with the install and mount paths, actual mount state, helper

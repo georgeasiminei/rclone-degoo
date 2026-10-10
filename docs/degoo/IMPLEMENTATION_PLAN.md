@@ -54,6 +54,17 @@ an advisory hint, and automatic renewal may still succeed. Recent failures
 from before an updated account-token file must not keep reporting a stale
 login-required warning.
 
+Account trash remains a separate, explicit command rather than a backend
+cleanup feature. `degoo trash` is read-only and paginated, with `--limit 0`
+meaning all items; `degoo empty-trash` is irreversible, lists all account
+trash, then sends a bulk `SetDeleteFile5` request with `IsInRecycleBin=true`.
+It prompts twice unless `--yes` is supplied, and `--dry-run` lists without
+mutating. This is deliberately not exposed through generic rclone cleanup or
+remote paths because the operation is account-wide and crypt/chunker would
+otherwise propagate a dangerous folder-shaped feature. No restore operation is
+provided. `contrib/degoo/trash.sh` wraps only these explicit commands and
+passes the private auth path without reading it.
+
 1. Implement the provider request contracts from the pinned Python reference
    in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and
    partial registration failures. See [API_EVIDENCE.md](API_EVIDENCE.md).

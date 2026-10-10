@@ -143,6 +143,49 @@ without changing its vault secret or discarding pending writes. Rejected
 refresh errors report `degoo login required` and a sanitized HTTP status;
 passwords and provider response bodies stay out of logs.
 
+## Account trash
+
+The trash commands are account-wide and take the private account-auth file
+directly. They do not use the vault configuration or a remote path:
+
+```sh
+./rclone degoo trash ~/.config/rclone-degoo/auth.json
+./rclone degoo trash ~/.config/rclone-degoo/auth.json --limit 20 --json
+./rclone degoo empty-trash ~/.config/rclone-degoo/auth.json --dry-run
+./rclone degoo empty-trash ~/.config/rclone-degoo/auth.json --yes
+```
+
+`trash` is read-only and paginated. Omitting `--limit`, or passing
+`--limit 0`, lists every trash item; a positive limit truncates the listing.
+`--json` requests machine-readable output.
+
+`empty-trash` first lists all trash items, then sends their IDs in a bulk
+`SetDeleteFile5` request with `IsInRecycleBin=true`. Deletion is irreversible.
+The command prompts twice unless `--yes` is supplied. `--dry-run` only lists
+what would be deleted and makes no account changes.
+
+The source-checkout wrapper provides friendly aliases and the same checks:
+
+```sh
+./contrib/degoo/trash.sh list --auth ~/.config/rclone-degoo/auth.json --limit 10 --json
+./contrib/degoo/trash.sh empty --auth ~/.config/rclone-degoo/auth.json --dry-run
+./contrib/degoo/trash.sh empty --auth ~/.config/rclone-degoo/auth.json --yes
+```
+
+`list` maps to `trash`, and `empty` maps to `empty-trash`. The wrapper defaults
+to the contained installation's `config/auth.json`, uses `build/rclone` from
+the checkout when present, and otherwise falls back to `rclone` on `PATH`. Set
+`RCLONE_DEGOO_AUTH` or `RCLONE_DEGOO_BIN`, or pass `--auth` or `--rclone`, to
+override either path. It passes the auth file through and never reads or
+displays its contents.
+
+Trash is not confined to one Degoo folder or vault. Listing can expose
+account-wide metadata, and emptying can destroy unrelated trash. Generic
+rclone cleanup is deliberately unsupported: the operation is account-wide,
+and exposing it as a backend feature would let crypt and chunker propagate
+a folder-shaped cleanup command across the vault stack. There is no restore
+operation.
+
 ## Remote format and limits
 
 The vault uses rclone crypt's authenticated data format and standard encrypted
