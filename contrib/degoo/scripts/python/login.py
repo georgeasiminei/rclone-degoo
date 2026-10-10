@@ -193,6 +193,7 @@ def run(root: Path, *, clear_email: bool) -> int:
             stdin=None,
             check=False,
             env=env,
+            umask=0o077,
         )
     except OSError:
         raise LoginError("the contained Degoo login command could not be started") from None

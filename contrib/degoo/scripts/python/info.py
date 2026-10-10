@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import install as installer
+import logs as log_reader
 import service as service_manager
 
 
@@ -250,13 +252,62 @@ def _expiry_claim(token: str) -> tuple[str, float | None]:
         return "JWT expiry claim unavailable", None
 
 
-def authentication_status(auth_path: Path, *, now: float | None = None) -> str:
-    """Describe cached token availability without exposing token contents."""
+def _login_command(auth_path: Path) -> str:
+    return shlex.quote(str(auth_path.parent.parent / "login.sh"))
+
+
+def authentication_error(
+    auth_path: Path,
+    *,
+    now: float | None = None,
+    logs_dir: Path | None = None,
+) -> str | None:
+    """Return an actionable auth error when local evidence requires a login."""
     auth = _read_json(auth_path, 64 * 1024)
+    command = _login_command(auth_path)
     if auth is None:
         if not os.path.lexists(auth_path):
-            return "No saved account token; log in before cloud operations."
+            return f"No saved account token; log in before cloud operations by running {command}."
+        return None
+    current = time.time() if now is None else now
+    try:
+        auth_info = os.lstat(auth_path)
+    except OSError:
+        auth_info = None
+    if (
+        logs_dir is not None
+        and auth_info is not None
+        and stat.S_ISREG(auth_info.st_mode)
+        and auth_info.st_uid == os.getuid()
+        and not auth_info.st_mode & 0o077
+        and not auth_info.st_mode & 0o6000
+        and log_reader.auth_required_after(logs_dir, auth_info.st_mtime, now=current)
+    ):
+        return f"A recent Degoo request was rejected as requiring login. Run {command} to sign in again."
+    token = auth.get("token")
+    refresh = auth.get("refresh_token")
+    has_refresh = isinstance(refresh, str) and bool(refresh)
+    if (not isinstance(token, str) or not token) and not has_refresh:
+        return f"No saved account token; log in before cloud operations by running {command}."
+    if isinstance(token, str) and token and not has_refresh:
+        _, expiry = _expiry_claim(token)
+        if expiry is not None and expiry <= current:
+            return (
+                "The saved access token has expired and no refresh token is available; "
+                f"log in before the next cloud request with {command}."
+            )
+    return None
+
+
+def authentication_status(auth_path: Path, *, now: float | None = None, logs_dir: Path | None = None) -> str:
+    """Describe cached token availability without exposing token contents."""
+    error = authentication_error(auth_path, now=now, logs_dir=logs_dir)
+    if error is not None:
+        return error
+    auth = _read_json(auth_path, 64 * 1024)
+    if auth is None:
         return "Saved account state is unavailable or unreadable; token details are hidden."
+    current = time.time() if now is None else now
     token = auth.get("token")
     refresh = auth.get("refresh_token")
     has_refresh = isinstance(refresh, str) and bool(refresh)
@@ -269,7 +320,6 @@ def authentication_status(auth_path: Path, *, now: float | None = None) -> str:
         if has_refresh:
             return "Access-token expiry is unknown; a saved refresh token may renew it on the next cloud request."
         return "Access-token expiry is unknown; saved state has no refresh token."
-    current = time.time() if now is None else now
     try:
         expires_at = datetime.fromtimestamp(expiry, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except (OverflowError, OSError, ValueError):
@@ -565,6 +615,10 @@ def _validate_root(value: str) -> tuple[Path, dict[str, Any]]:
 def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) -> str:
     """Build a bounded human-readable report without printing private state."""
     lines = ["Contained Degoo vault status", f"Install: {_display_path(root)}"]
+    auth_path = root / "config" / "auth.json"
+    auth_error = authentication_error(auth_path, logs_dir=root / "logs")
+    if auth_error:
+        lines.insert(2, f"AUTHENTICATION ERROR: {auth_error}")
     folder_id = manifest.get("root_folder_id")
     if isinstance(folder_id, str) and folder_id and folder_id != "0":
         lines.append(f"Vault folder ID: {_safe_text(folder_id, 128)}")
@@ -640,7 +694,7 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
         )
 
     lines.append("Saved account authentication (running mount credentials are not inspected):")
-    lines.append(f"  {authentication_status(root / 'config' / 'auth.json')}")
+    lines.append(f"  {authentication_status(auth_path, logs_dir=root / 'logs')}")
     lines.append("  This summary reads saved auth.json; a running mount may hold different in-memory token state.")
     lines.append("  This local check does not contact Degoo or validate the token with the server.")
     if check_remote:
@@ -650,6 +704,12 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
             lines.append(f"Remote check: succeeded; current folder ancestry: {location}.")
         else:
             lines.append(f"Remote check: {state}; no provider error details were printed.")
+            if state == "login required for remote check" and not auth_error:
+                command = _login_command(auth_path)
+                lines.insert(
+                    2,
+                    f"AUTHENTICATION ERROR: Degoo rejected the current account authentication. Run {command} to sign in again.",
+                )
     else:
         lines.append("Remote ancestry is cached local metadata; use --check-remote to query Degoo.")
     return "\n".join(lines) + "\n"

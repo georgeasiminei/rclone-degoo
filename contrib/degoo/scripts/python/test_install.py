@@ -157,6 +157,14 @@ class InstallTest(unittest.TestCase):
         self.assertTrue((self.root / "config/vault.json").exists())
         self.assertTrue((self.root / "config/rclone.conf").exists())
 
+    def test_setup_uses_private_umask_for_logged_command(self) -> None:
+        code, _, stderr = self.invoke()
+        self.assertEqual(code, 0, stderr)
+        result = subprocess.CompletedProcess([], 0, stdout=b"created-folder-123\n", stderr=b"")
+        with mock.patch.object(setup.subprocess, "run", return_value=result) as run:
+            self.assertEqual(setup._run_create(self.root, "device-container", "My Vault"), "created-folder-123")
+        self.assertEqual(run.call_args.kwargs["umask"], 0o077)
+
     def test_upgrade_preserves_vault_login_remote_settings_and_cache(self) -> None:
         code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
         self.assertEqual(code, 0, stderr)
@@ -193,6 +201,77 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(cache_file.read_bytes(), cache_before)
         self.assertEqual((self.root / "config/login.json").read_text(encoding="utf-8"), '{"email":"owner@example.test"}\n')
         self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["verify_upload"], False)
+
+    def test_upgrade_privateizes_legacy_logs_without_changing_contents(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        log_contents = {
+            "mount.log": b"mount bytes\n",
+            "login.log": b"login bytes with legacy mode\n",
+            "setup.log": b"setup bytes with legacy mode\n",
+            "status.log": b"status bytes\n",
+            "wizard-folders.log": b"wizard bytes\n",
+        }
+        for name, content in log_contents.items():
+            path = self.root / "logs" / name
+            path.write_bytes(content)
+            path.chmod(0o640 if name in {"login.log", "setup.log", "wizard-folders.log"} else 0o600)
+
+        code, _, stderr = self.invoke("--upgrade")
+
+        self.assertEqual(code, 0, stderr)
+        for name, content in log_contents.items():
+            path = self.root / "logs" / name
+            self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_upgrade_rejects_unsafe_log_before_binary_or_other_log_mutation(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        binary_before = (self.root / "bin/rclone").read_bytes()
+        legacy_log = self.root / "logs/login.log"
+        legacy_log.write_bytes(b"legacy private bytes\n")
+        legacy_log.chmod(0o640)
+        outside = self.base / "outside.log"
+        outside.write_bytes(b"do not follow\n")
+        outside.chmod(0o600)
+        (self.root / "logs/setup.log").symlink_to(outside)
+        self.write_binary(self.binary, "# version two\n")
+
+        code, _, stderr = self.invoke("--upgrade")
+
+        self.assertEqual(code, 2)
+        self.assertIn("log", stderr)
+        self.assertEqual((self.root / "bin/rclone").read_bytes(), binary_before)
+        self.assertEqual(stat.S_IMODE(legacy_log.stat().st_mode), 0o640)
+        self.assertEqual(os.readlink(self.root / "logs/setup.log"), str(outside))
+
+    def test_log_normalization_rejects_special_files_and_wrong_owners(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        fifo = self.root / "logs/status.log"
+        os.mkfifo(fifo, 0o600)
+        with self.assertRaises(install.InstallError):
+            install.normalize_legacy_logs(self.root / "logs")
+        fifo.unlink()
+
+        log_path = self.root / "logs/login.log"
+        log_path.write_bytes(b"owned by another uid\n")
+        log_path.chmod(0o640)
+        real_lstat = os.lstat
+
+        def wrong_owner_lstat(path: Path) -> os.stat_result:
+            result = real_lstat(path)
+            if path == log_path:
+                fields = list(result)
+                fields[4] += 1
+                return os.stat_result(fields)
+            return result
+
+        with mock.patch.object(install.os, "lstat", side_effect=wrong_owner_lstat):
+            with self.assertRaises(install.InstallError):
+                install.normalize_legacy_logs(self.root / "logs")
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o640)
 
     def test_upgrade_refuses_a_different_folder_or_active_cache(self) -> None:
         code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
@@ -260,6 +339,7 @@ class LoginTest(unittest.TestCase):
         self.assertIn("owner@example.test", command)
         self.assertIn("--cached-email", command)
         self.assertNotIn("test-password", command)
+        self.assertEqual(run.call_args.kwargs["umask"], 0o077)
 
     def test_first_email_is_cached_and_clear_only_removes_email(self) -> None:
         auth_path = self.root / "config/auth.json"

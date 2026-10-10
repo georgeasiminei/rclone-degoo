@@ -128,6 +128,25 @@ dependency, mount, cache, upgrade, and recovery guide. See
 [the quick start](../../DEGOO.md) and [usage](../../docs/degoo/USAGE.md) for
 configuration and commands.
 
+## Find your mount and logs
+
+The wizard ends with the install and mount paths, actual mount state, helper
+commands, and log locations. The default mount is
+`~/.local/share/rclone-degoo/mount`. Open that directory while it is mounted.
+Installed launchers live under `~/.local/share/rclone-degoo/`:
+
+```sh
+~/.local/share/rclone-degoo/info.sh
+~/.local/share/rclone-degoo/logs.sh
+~/.local/share/rclone-degoo/logs.sh --follow
+```
+
+If authentication cannot renew, status reports a login-required warning with
+the login command. Run `~/.local/share/rclone-degoo/login.sh` again. Its
+password prompt stays visible in the terminal while logs go to a file, and
+password characters remain hidden. Keep the cache and matching vault
+configuration while uploads are pending.
+
 ## Uninstall
 
 Use the explicit inventory mode to inspect the install without changing it:

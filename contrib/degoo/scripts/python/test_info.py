@@ -8,9 +8,11 @@ import os
 import shlex
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -98,8 +100,72 @@ class InfoTest(unittest.TestCase):
         status = info.authentication_status(auth_path, now=1_900_000_000)
         self.assertIn("may renew it", status)
         self.assertNotIn("do-not-show", status)
+        self.assertIsNone(info.authentication_error(auth_path, now=1_900_000_000, logs_dir=self.root / "logs"))
         self.write_private(auth_path, {"token": self.jwt(1_800_000_000)})
         self.assertIn("log in before", info.authentication_status(auth_path, now=1_900_000_000))
+
+    def test_report_places_missing_auth_error_and_login_command_near_the_top(self) -> None:
+        (self.root / "config/auth.json").unlink()
+        with (
+            mock.patch.object(info, "service_status", return_value="not configured for this install"),
+            mock.patch.object(info, "mounted_state", return_value="not mounted"),
+            mock.patch.object(info, "linger_status", return_value="unknown"),
+        ):
+            report = info.report(self.root, self.manifest)
+        lines = report.splitlines()
+        self.assertTrue(lines[2].startswith("AUTHENTICATION ERROR: No saved account token;"))
+        self.assertIn("login.sh", lines[2])
+        self.assertIn("log in before cloud operations", lines[2])
+
+    def test_report_promotes_expired_access_token_without_refresh(self) -> None:
+        now = int(datetime.now().timestamp())
+        self.write_private(self.root / "config/auth.json", {"token": self.jwt(now - 60)})
+        with (
+            mock.patch.object(info, "service_status", return_value="not configured for this install"),
+            mock.patch.object(info, "mounted_state", return_value="not mounted"),
+            mock.patch.object(info, "linger_status", return_value="unknown"),
+        ):
+            report = info.report(self.root, self.manifest)
+        error_line = report.splitlines()[2]
+        self.assertTrue(error_line.startswith("AUTHENTICATION ERROR: The saved access token has expired"))
+        self.assertIn("login.sh", error_line)
+
+    def test_remote_rejection_is_prominent_even_when_saved_jwt_looks_current(self) -> None:
+        self.write_private(
+            self.root / "config/auth.json",
+            {"token": self.jwt(2_000_000_000), "refresh_token": "keep-private"},
+        )
+        with (
+            mock.patch.object(info, "service_status", return_value="not configured for this install"),
+            mock.patch.object(info, "mounted_state", return_value="not mounted"),
+            mock.patch.object(info, "linger_status", return_value="unknown"),
+            mock.patch.object(info, "remote_location", return_value=("login required for remote check", None)),
+        ):
+            report = info.report(self.root, self.manifest, check_remote=True)
+        self.assertTrue(report.splitlines()[2].startswith("AUTHENTICATION ERROR: Degoo rejected the current account authentication."))
+        self.assertIn("login.sh", report.splitlines()[2])
+
+    def test_auth_status_only_requires_login_for_a_recent_post_auth_sentinel(self) -> None:
+        auth_path = self.root / "config/auth.json"
+        logs_dir = self.root / "logs"
+        now = 1_900_000_000
+        self.write_private(auth_path, {"token": self.jwt(now - 60), "refresh_token": "keep-private"})
+        os.utime(auth_path, (now - 120, now - 120))
+        failure_time = now - 60
+        failure_stamp = datetime.fromtimestamp(failure_time).strftime("%Y/%m/%d %H:%M:%S")
+        mount_log = logs_dir / "mount.log"
+        mount_log.write_text(f"{failure_stamp} ERROR : degoo login required (auth HTTP 403)\n", encoding="utf-8")
+        mount_log.chmod(0o600)
+
+        status = info.authentication_status(auth_path, now=now, logs_dir=logs_dir)
+        self.assertIn("rejected", status)
+        self.assertIn("login.sh", status)
+        self.assertNotIn("keep-private", status)
+
+        os.utime(auth_path, (now - 30, now - 30))
+        refreshed_status = info.authentication_status(auth_path, now=now, logs_dir=logs_dir)
+        self.assertIn("may renew it", refreshed_status)
+        self.assertNotIn("rejected", refreshed_status)
 
     def test_no_auth_is_actionable_without_disclosing_login_state(self) -> None:
         (self.root / "config/auth.json").unlink()
@@ -248,12 +314,27 @@ class InfoTest(unittest.TestCase):
             self.assertEqual(install.install(args), 0)
         installed = self.root / "scripts/python/info.py"
         self.assertTrue(installed.is_file())
+        self.assertTrue((self.root / "scripts/python/logs.py").is_file())
         wrapper = (self.root / "info.sh").read_text(encoding="utf-8")
         self.assertIn("exec python3", wrapper)
         self.assertIn("$@", wrapper)
         self.assertNotIn("XDG_CONFIG_HOME", wrapper)
         self.assertNotIn('HOME=', wrapper)
         self.assertEqual(stat.S_IMODE((self.root / "info.sh").stat().st_mode), 0o700)
+        logs_wrapper = (self.root / "logs.sh").read_text(encoding="utf-8")
+        self.assertIn("scripts/python/logs.py", logs_wrapper)
+        self.assertIn("--root", logs_wrapper)
+        self.assertEqual(stat.S_IMODE((self.root / "logs.sh").stat().st_mode), 0o700)
+        help_result = subprocess.run(
+            [str(self.root / "logs.sh"), "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr.decode("utf-8", errors="replace"))
+        self.assertIn(b"last 100 lines", help_result.stdout)
+        self.assertIn(b"--follow", help_result.stdout)
 
 
 def subprocess_result(stdout: bytes):

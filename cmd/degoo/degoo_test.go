@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func testConfig(t *testing.T) *VaultConfig {
@@ -201,6 +203,103 @@ func TestMountRawConfigScopesUploadVerification(t *testing.T) {
 func TestLoginPasswordPromptShowsCachedEmailRecovery(t *testing.T) {
 	require.Equal(t, "Degoo account password for user@example.com: ", loginPasswordPrompt("user@example.com", false))
 	require.Equal(t, "Degoo account password for user@example.com (cached email; clear with ~/.local/share/rclone-degoo/login.sh --clear-email): ", loginPasswordPrompt("user@example.com", true))
+}
+
+func TestPromptPasswordUsesPromptOutputWhenStderrRedirected(t *testing.T) {
+	master, slave := openPTY(t)
+	logFile, err := os.CreateTemp(t.TempDir(), "degoo-login.log")
+	require.NoError(t, err)
+
+	stdin, stdout, stderr, promptOutput := os.Stdin, os.Stdout, os.Stderr, config.PasswordPromptOutput
+	os.Stdin, os.Stdout, os.Stderr = slave, logFile, logFile
+	config.PasswordPromptOutput = slave
+	t.Cleanup(func() {
+		os.Stdin, os.Stdout, os.Stderr = stdin, stdout, stderr
+		config.PasswordPromptOutput = promptOutput
+		_ = logFile.Close()
+	})
+
+	const password = "generated test password"
+	type result struct {
+		password string
+		err      error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		password, err := promptPassword("Password: ")
+		resultCh <- result{password: password, err: err}
+	}()
+
+	const prompt = "Password: "
+	shownPrompt := make([]byte, len(prompt))
+	promptRead := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(master, shownPrompt)
+		promptRead <- err
+	}()
+	select {
+	case err := <-promptRead:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("password prompt was not written to the terminal")
+	}
+	require.Equal(t, prompt, string(shownPrompt))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		state, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+		require.NoError(t, err)
+		if state.Lflag&unix.ECHO == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("password input was not hidden")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, err = master.Write([]byte(password + "\n"))
+	require.NoError(t, err)
+
+	var got result
+	select {
+	case got = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("password input did not finish")
+	}
+	require.NoError(t, got.err)
+	require.True(t, got.password == password)
+
+	pending, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCINQ)
+	require.NoError(t, err)
+	terminalOutput := append([]byte(nil), shownPrompt...)
+	if pending > 0 {
+		trailing := make([]byte, pending)
+		_, err := io.ReadFull(master, trailing)
+		require.NoError(t, err)
+		terminalOutput = append(terminalOutput, trailing...)
+	}
+	require.NotContains(t, string(terminalOutput), password)
+
+	_, err = logFile.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	logOutput, err := io.ReadAll(logFile)
+	require.NoError(t, err)
+	require.NotContains(t, string(logOutput), prompt)
+	require.NotContains(t, string(logOutput), password)
+}
+
+func openPTY(t *testing.T) (master, slave *os.File) {
+	t.Helper()
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = master.Close() })
+	require.NoError(t, unix.IoctlSetPointerInt(int(master.Fd()), unix.TIOCSPTLCK, 0))
+	ptyNumber, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
+	require.NoError(t, err)
+	slave, err = os.OpenFile(filepath.Join("/dev/pts", strconv.Itoa(ptyNumber)), os.O_RDWR|unix.O_NOCTTY, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = slave.Close() })
+	return master, slave
 }
 
 func TestVaultEncryptsChunksNamesAndManifests(t *testing.T) {

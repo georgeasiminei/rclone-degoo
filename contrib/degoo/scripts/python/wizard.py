@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -16,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
+import info as local_info
 import install as installer
 import login
 import service
@@ -33,6 +35,10 @@ PACKAGE_MANAGERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("pacman", ("-S", "--needed", "--noconfirm")),
     ("zypper", ("--non-interactive", "install")),
 )
+MAX_MOUNTINFO_BYTES = 2 * 1024 * 1024
+MAX_MOUNTINFO_LINE_BYTES = 8192
+MAX_MOUNTINFO_LINES = 20000
+MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 
 
 class WizardError(Exception):
@@ -266,6 +272,89 @@ def _fuse_device_ready() -> bool:
     return stat.S_ISCHR(fuse_device.st_mode) and os.access("/dev/fuse", os.R_OK | os.W_OK)
 
 
+def _mounted_state(mountpoint: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> str:
+    """Read a bounded kernel mount-table snapshot for an exact mountpoint."""
+    target = os.path.normpath(str(mountpoint))
+    try:
+        with mountinfo.open("rb") as stream:
+            data = stream.read(MAX_MOUNTINFO_BYTES + 1)
+    except OSError:
+        return "unknown (mount table unavailable)"
+    if len(data) > MAX_MOUNTINFO_BYTES:
+        return "unknown (mount table exceeds local check limit)"
+    for index, line in enumerate(data.splitlines()):
+        if index >= MAX_MOUNTINFO_LINES or len(line) > MAX_MOUNTINFO_LINE_BYTES:
+            return "unknown (mount table exceeds local check limit)"
+        fields = line.split()
+        if len(fields) <= 4:
+            continue
+        raw_path = MOUNTINFO_ESCAPE.sub(lambda match: bytes((int(match.group(1), 8),)), fields[4])
+        if os.path.normpath(os.fsdecode(raw_path)) == target:
+            return "mounted"
+    return "not mounted"
+
+
+def _shell_path(path: Path) -> str:
+    return shlex.quote(str(path))
+
+
+def _completion_summary(
+    root: Path,
+    *,
+    mount_ready: bool,
+    systemd_available: bool,
+    note: str | None = None,
+    service_requested: bool = False,
+    service_result: int | None = None,
+    service_error: str | None = None,
+) -> None:
+    """Print actionable local paths and observed state without cloud access."""
+    mountpoint = root / "mount"
+    print("\nInstallation summary:")
+    print(f"  Install root: {_shell_path(root)}")
+    print(f"  Mount point: {_shell_path(mountpoint)} — {_mounted_state(mountpoint)}")
+    print("  Open the mount point in your file manager or terminal while it is mounted.")
+    print(f"  User service: {local_info.service_status(root, {})}")
+    if note:
+        print(f"  Setup: {note}")
+    if service_requested:
+        if service_error or (service_result is not None and service_result != 0):
+            if service_error and "linked, but could not start" in service_error:
+                print("  The service is configured but the mount did not start successfully.")
+            else:
+                print("  The service enable/start request did not complete successfully; its state is shown above.")
+            if service_error:
+                safe_error = "".join(character for character in service_error if character.isprintable())[:300]
+                print(f"  Service detail: {safe_error}")
+        else:
+            print(
+                "  systemd accepted the enable/start request; the mount status above comes from the kernel mount table."
+            )
+    elif not mount_ready:
+        print(
+            "  Mount dependencies are incomplete; install the FUSE helper and mountpoint utility, "
+            "then check /dev/fuse access."
+        )
+    elif not systemd_available:
+        print("  No systemd user manager is available; run the foreground mount command below when ready.")
+
+    print("  Commands:")
+    print(f"    Local status: {_shell_path(root / 'info.sh')}")
+    print(f"    Degoo account login or re-login: {_shell_path(root / 'login.sh')}")
+    print(f"    Vault folder setup: {_shell_path(root / 'setup.sh')} --help")
+    print(f"    Pending local upload count: {_shell_path(root / 'status.sh')}")
+    print(f"    Service state: {_shell_path(root / 'service.sh')} status")
+    print(f"    Enable/start service: {_shell_path(root / 'service.sh')} enable")
+    print(f"    Manual foreground mount: {_shell_path(root / 'mount.sh')}")
+    print(f"    Uninstall wizard: {_shell_path(root / 'uninstall.sh')}")
+    print(f"    Recent logs: {_shell_path(root / 'logs.sh')}")
+    print(f"    Follow logs: {_shell_path(root / 'logs.sh')} --follow")
+    print(f"    Log helper options: {_shell_path(root / 'logs.sh')} --help")
+    print(f"    Log files: {shlex.quote(str(root / 'logs') + os.sep)} (mount.log, login.log, setup.log, status.log)")
+    print("    User service journal: journalctl --user -u rclone-degoo.service -n 100 --no-pager")
+    print("    Follow user service journal: journalctl --user -fu rclone-degoo.service")
+
+
 def _print_dependency_report(*, systemd_available: bool, go_state: str | None = None) -> None:
     helper = None
     for name in FUSE_HELPERS:
@@ -422,6 +511,7 @@ def _load_folders(root: Path) -> list[dict[str, Any]]:
             env=env,
             timeout=120,
             check=False,
+            umask=0o077,
         )
     except (OSError, subprocess.TimeoutExpired):
         raise WizardError("Degoo could not list device folders; run login.sh and retry") from None
@@ -626,8 +716,23 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
     if configured_folder_id and installed_vault is None and import_path:
         staged_args.vault_config = import_path
     try:
-        result = installer.install(staged_args)
+        try:
+            result = installer.install(staged_args)
+        except installer.InstallError:
+            _completion_summary(
+                root,
+                mount_ready=mount_ready,
+                systemd_available=systemd_available,
+                note="Client installation did not complete.",
+            )
+            raise
         if result != 0:
+            _completion_summary(
+                root,
+                mount_ready=mount_ready,
+                systemd_available=systemd_available,
+                note=f"Client installation did not complete (exit code {result}).",
+            )
             return result
     finally:
         if build_temp is not None:
@@ -635,8 +740,23 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
     root = installer.expected_root()
 
     print("Step 4 of 6: Log in to Degoo.")
-    login_result = login.run(root, clear_email=False)
+    try:
+        login_result = login.run(root, clear_email=False)
+    except login.LoginError:
+        _completion_summary(
+            root,
+            mount_ready=mount_ready,
+            systemd_available=systemd_available,
+            note="Account login did not complete; retry with login.sh.",
+        )
+        raise
     if login_result != 0:
+        _completion_summary(
+            root,
+            mount_ready=mount_ready,
+            systemd_available=systemd_available,
+            note=f"Account login did not complete (exit code {login_result}); retry with login.sh.",
+        )
         return login_result
     if configured_folder_id:
         print(f"This installation is already bound to dedicated folder ID {configured_folder_id}; that binding is preserved.")
@@ -651,7 +771,16 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             if not folder_name:
                 folder_name = _prompt("Local name for this dedicated folder", "", input_fn=input_fn) or None
         else:
-            folders = _load_folders(root)
+            try:
+                folders = _load_folders(root)
+            except WizardError:
+                _completion_summary(
+                    root,
+                    mount_ready=mount_ready,
+                    systemd_available=systemd_available,
+                    note="Vault folder discovery did not complete; retry after checking login.sh and setup.sh.",
+                )
+                raise
             parent_id = _select_parent(folders, input_fn=input_fn)
             folder_name = folder_name or _prompt("Name for the new dedicated vault folder", DEFAULT_FOLDER_NAME, input_fn=input_fn)
             folder_id = None
@@ -672,22 +801,68 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 name=folder_name,
                 vault_config=import_path,
             )
-        setup_result = setup.run(setup_args)
+        try:
+            setup_result = setup.run(setup_args)
+        except setup.SetupError:
+            _completion_summary(
+                root,
+                mount_ready=mount_ready,
+                systemd_available=systemd_available,
+                note="Vault folder setup did not complete; inspect info.sh and retry with setup.sh.",
+            )
+            raise
         if setup_result != 0:
+            _completion_summary(
+                root,
+                mount_ready=mount_ready,
+                systemd_available=systemd_available,
+                note=(
+                    f"Vault folder setup did not complete (exit code {setup_result}); "
+                    "inspect info.sh and retry with setup.sh."
+                ),
+            )
             return setup_result
 
-    _save_settings(root, mount_settings, vault_sizes)
+    try:
+        _save_settings(root, mount_settings, vault_sizes)
+    except WizardError:
+        _completion_summary(
+            root,
+            mount_ready=mount_ready,
+            systemd_available=systemd_available,
+            note="Vault mount settings could not be saved; inspect info.sh before retrying setup.",
+        )
+        raise
 
     print("Step 6 of 6: Choose how to start the mount.")
     if systemd_available and mount_ready:
         if _yes_no("Enable and start the systemd user service?", default=True, input_fn=input_fn):
-            return service.run(root, "enable")
+            try:
+                service_result = service.run(root, "enable")
+            except service.ServiceError as exc:
+                _completion_summary(
+                    root,
+                    mount_ready=mount_ready,
+                    systemd_available=systemd_available,
+                    service_requested=True,
+                    service_result=2,
+                    service_error=str(exc),
+                )
+                return 2
+            _completion_summary(
+                root,
+                mount_ready=mount_ready,
+                systemd_available=systemd_available,
+                service_requested=True,
+                service_result=service_result,
+            )
+            return service_result
     else:
         if not systemd_available:
             print("A systemd user manager is unavailable; start the mount manually when ready.")
         elif not mount_ready:
             print("Mount dependencies are incomplete; enable the systemd service after FUSE access is ready.")
-    print(f"Installation complete. Start manually with {root / 'mount.sh'} or enable the service later with {root / 'service.sh'} enable.")
+    _completion_summary(root, mount_ready=mount_ready, systemd_available=systemd_available)
     return 0
 
 

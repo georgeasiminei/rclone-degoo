@@ -65,6 +65,46 @@ The production archive and checksum also passed verification. These checks
 performed no account login, remote changes, system package installation, or
 live mounting.
 
+## Wizard completion and diagnostics
+
+The completion handoff and diagnostics changes were checked on 2026-10-10:
+
+- The wizard summary appears after service enable, manual setup, missing mount
+  dependencies, and partial setup failures. It reports the actual mount table
+  state and local service state rather than treating a start request as mount
+  readiness. Regression tests cover these paths and shell-quoted commands.
+- A PTY regression and a built-binary terminal probe with `--log-file` showed
+  the password prompt in the terminal with input echo disabled. The generated
+  test password was absent from terminal output and the log. The probe used
+  a localhost-only endpoint, rather than logging into a real account.
+- Log and status tests cover bounded tails, private regular files, recognized
+  credential/URL redaction, follow mode before log creation, explicit recent
+  authentication rejection, expired access tokens with/without refresh state,
+  and suppression of old failures after account state is updated.
+- All 87 offline Python installer/cleanup tests and the packaging self-check
+  passed. Changed Markdown lint and `git diff --check` passed.
+- `make quicktest BRANCH=degoo-installer-handoff` passed with the built rclone
+  and FUSE helper first on `PATH`. The `cmd/degoo` race test and scoped
+  golangci-lint v2.14.0 passed with zero lint issues.
+- The rebuilt archive passed staged installation, diagnostics, simulated
+  authentication failure/recovery, summary output, all 18 relative Markdown
+  links, inventory, local cleanup, and checksum verification in a temporary
+  home.
+- A live upgrade preserved all five account/vault/mount configuration files
+  and the cache, and the owned user service restarted with the mount present
+  and zero pending uploads. It found legacy wizard log files with mode `0640`,
+  which the private log viewer correctly refused. Upgrade now normalizes
+  known owned log files without changing their contents; direct wizard
+  subprocesses create logs with a private umask. The repeated live upgrade
+  preserved the configuration, cache, and all five existing log files;
+  `logs.sh` then succeeded, and the restarted mount was present and active.
+
+No account password was collected by the agent, and no customer file was
+created, read through the mount, or deleted for these checks. The real service
+restart may perform normal metadata requests and token renewal. Rejected
+renewal visibility was tested with generated log/authentication fixtures;
+long-term live renewal remains unverified.
+
 ## Offline checks
 
 The completed offline checks use HTTP fixtures for Degoo and local storage for

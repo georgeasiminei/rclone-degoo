@@ -23,7 +23,7 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("install.py", "info.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py")
+SOURCE_FILES = ("install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py")
 MAX_CONFIG_SIZE = 1024 * 1024
 DEFAULT_MOUNT_SETTINGS = {
     "cache_max_size": "20G",
@@ -33,6 +33,7 @@ DEFAULT_MOUNT_SETTINGS = {
     "verify_upload": True,
 }
 FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount2.9", "fusermount3"}
+LEGACY_LOG_FILES = ("mount.log", "login.log", "setup.log", "status.log", "wizard-folders.log")
 
 
 class InstallError(Exception):
@@ -172,6 +173,72 @@ def read_private_file(path: Path, maximum: int = MAX_CONFIG_SIZE, *, missing_ok:
     if len(data) > maximum:
         raise InstallError("a private file is larger than the supported limit")
     return data
+
+
+def normalize_legacy_logs(log_dir: Path) -> None:
+    """Set known legacy log files to owner-only mode through validated file descriptors."""
+    check_directory(log_dir, private=True)
+    opened: list[tuple[str, Path, int, os.stat_result]] = []
+    try:
+        for name in LEGACY_LOG_FILES:
+            path = log_dir / name
+            try:
+                before = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise InstallError(f"{name} could not be inspected safely") from None
+            if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                raise InstallError(f"{name} is not a regular log file")
+            if before.st_uid != os.getuid():
+                raise InstallError(f"{name} is not owned by the current user")
+            if before.st_nlink != 1:
+                raise InstallError(f"{name} has unexpected hard links")
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            try:
+                fd = os.open(path, flags)
+            except OSError:
+                raise InstallError(f"{name} could not be opened safely") from None
+            opened.append((name, path, fd, before))
+            opened_info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened_info.st_mode)
+                or (opened_info.st_dev, opened_info.st_ino) != (before.st_dev, before.st_ino)
+                or opened_info.st_uid != os.getuid()
+                or opened_info.st_nlink != 1
+            ):
+                raise InstallError(f"{name} changed while being opened")
+
+        for name, path, fd, before in opened:
+            try:
+                current = os.lstat(path)
+            except OSError:
+                raise InstallError(f"{name} changed before its permissions could be fixed") from None
+            opened_info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                or (opened_info.st_dev, opened_info.st_ino) != (before.st_dev, before.st_ino)
+                or current.st_uid != os.getuid()
+                or opened_info.st_uid != os.getuid()
+            ):
+                raise InstallError(f"{name} changed before its permissions could be fixed")
+
+        for name, _, fd, _ in opened:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                raise InstallError(f"{name} could not be made owner-private") from None
+            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+                raise InstallError(f"{name} could not be made owner-private")
+    finally:
+        for _, _, fd, _ in opened:
+            os.close(fd)
 
 
 def write_private_file(path: Path, data: bytes, *, replace: bool = False, mode: int = 0o600) -> None:
@@ -345,6 +412,14 @@ def shell_wrapper(name: str, root: Path) -> bytes:
             f"ROOT={root_text}\n"
             "export PYTHONDONTWRITEBYTECODE=1\n"
             "exec python3 \"$ROOT/scripts/python/info.py\" --root \"$ROOT\" \"$@\"\n"
+        )
+        return content.encode("utf-8")
+    if name == "logs.sh":
+        content = (
+            "#!/bin/sh\nset -eu\n"
+            f"ROOT={root_text}\n"
+            "export PYTHONDONTWRITEBYTECODE=1\n"
+            "exec python3 \"$ROOT/scripts/python/logs.py\" --root \"$ROOT\" \"$@\"\n"
         )
         return content.encode("utf-8")
     if name == "service.sh":
@@ -624,6 +699,8 @@ def _install(args: argparse.Namespace) -> int:
     else:
         settings_bytes = (json.dumps(DEFAULT_MOUNT_SETTINGS, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
+    if args.upgrade:
+        normalize_legacy_logs(root / "logs")
     copy_binary(args.binary, root / "bin/rclone")
     validate_binary(root / "bin/rclone")
     for source_name in SOURCE_FILES:
@@ -644,7 +721,7 @@ def _install(args: argparse.Namespace) -> int:
         else:
             validate_rclone_config(existing_rclone_config, root, folder_id)
 
-    for wrapper in ("install.sh", "uninstall.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh", "info.sh"):
+    for wrapper in ("install.sh", "uninstall.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh", "info.sh", "logs.sh"):
         write_private_file(root / wrapper, shell_wrapper(wrapper, root), replace=os.path.lexists(root / wrapper), mode=0o700)
     if args.upgrade:
         for source_name in SOURCE_FILES:
@@ -668,10 +745,12 @@ def _install(args: argparse.Namespace) -> int:
         print(f"Installed the contained Degoo vault at {root}.")
         print(f"Account login: {root / 'login.sh'}")
         print(f"Mount: {root / 'mount.sh'}")
+        print(f"Logs: {root / 'logs.sh'}")
         print(f"User service: {root / 'service.sh'} enable")
     else:
         print(f"Installed the contained Degoo client at {root}; no vault folder is configured yet.")
         print(f"Log in with {root / 'login.sh'}, then run {root / 'setup.sh'} --parent-id DEVICE_ID --name VAULT_NAME.")
+        print(f"Logs: {root / 'logs.sh'}")
     return 0
 
 

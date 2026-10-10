@@ -35,6 +35,16 @@ can retain config, cache, and logs in a new owner-private directory. Pending
 uploads can proceed only when both the matching config and cache are retained.
 Cleanup leaves remote data untouched.
 
+The completion summary must appear after either the service or manual-start
+choice. It reports the configured mount path and actual kernel mount state,
+then gives commands for status, logs, login, and service control. Password
+entry uses the original terminal output preserved by the logging layer.
+`logs.sh` provides recent command logs and a follow mode; `info.sh` highlights
+rejected authentication renewal with a login command. Saved token expiry is
+an advisory hint, and automatic renewal may still succeed. Recent failures
+from before an updated account-token file must not keep reporting a stale
+login-required warning.
+
 1. Implement the provider request contracts from the pinned Python reference
    in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and
    partial registration failures. See [API_EVIDENCE.md](API_EVIDENCE.md).

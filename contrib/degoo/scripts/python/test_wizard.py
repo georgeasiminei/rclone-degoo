@@ -79,6 +79,7 @@ class WizardTest(unittest.TestCase):
             folders = wizard._load_folders(Path("/private/root"))
         self.assertEqual([folder["id"] for folder in folders], ["device", "folder"])
         self.assertEqual(run.call_args.args[0][-2:], ["--parent-id", "0"])
+        self.assertEqual(run.call_args.kwargs.get("umask"), 0o077)
 
     def test_device_is_suggested_before_other_valid_folder(self) -> None:
         folders = [
@@ -96,6 +97,19 @@ class WizardTest(unittest.TestCase):
         ):
             self.assertEqual(wizard._check_runtime(input_fn=lambda _: self.fail("no package prompt expected")), (False, True))
 
+    def test_mount_state_decodes_paths_and_matches_only_the_mountpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            mountinfo = Path(temporary) / "mountinfo"
+            mountinfo.write_bytes(b"36 25 0:32 / /tmp/my\\040mount rw,relatime - fuse.degoo degoo rw\n")
+            self.assertEqual(wizard._mounted_state(Path("/tmp/my mount"), mountinfo), "mounted")
+            self.assertEqual(wizard._mounted_state(Path("/tmp/my mount/child"), mountinfo), "not mounted")
+
+    def test_mount_state_is_unknown_when_proc_snapshot_exceeds_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            mountinfo = Path(temporary) / "mountinfo"
+            mountinfo.write_bytes(b"x" * (wizard.MAX_MOUNTINFO_BYTES + 1))
+            self.assertIn("unknown", wizard._mounted_state(Path("/tmp/degoo"), mountinfo))
+
     def test_missing_package_prompt_defaults_to_install(self) -> None:
         with (
             mock.patch.object(wizard, "_package_manager", return_value=("/usr/bin/apt-get", ("install", "-y"))),
@@ -106,7 +120,7 @@ class WizardTest(unittest.TestCase):
         self.assertTrue(installed)
         self.assertEqual(run.call_args.args[0], ["/usr/bin/apt-get", "install", "-y", "fuse3", "util-linux"])
 
-    def _run_default_flow(self, *, login_code: int = 0, setup_code: int = 0) -> tuple[int, mock.Mock, mock.Mock]:
+    def _run_default_flow(self, *, login_code: int = 0, setup_code: int = 0) -> tuple[int, mock.Mock, mock.Mock, str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
             answers = iter([""] * 8)
@@ -119,27 +133,98 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.login, "run", return_value=login_code) as login_call,
                 mock.patch.object(wizard.setup, "run", return_value=setup_code) as setup_call,
                 mock.patch.object(wizard, "_save_settings") as save_call,
-                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stdout(io.StringIO()) as output,
             ):
                 result = wizard._run(args, input_fn=lambda _: next(answers))
-        return result, login_call, setup_call
+        return result, login_call, setup_call, output.getvalue()
 
     def test_default_answers_complete_staged_install(self) -> None:
-        result, login_call, setup_call = self._run_default_flow()
+        result, login_call, setup_call, _ = self._run_default_flow()
         self.assertEqual(result, 0)
         login_call.assert_called_once()
         setup_call.assert_called_once()
         self.assertEqual(setup_call.call_args.args[0].folder_id, "dedicated-id")
 
     def test_failed_login_stops_before_vault_setup(self) -> None:
-        result, _, setup_call = self._run_default_flow(login_code=2)
+        result, _, setup_call, output = self._run_default_flow(login_code=2)
         self.assertEqual(result, 2)
         setup_call.assert_not_called()
+        self.assertIn("Installation summary:", output)
+        self.assertIn("retry with login.sh", output)
 
     def test_failed_setup_stops_before_mount_service(self) -> None:
-        result, _, setup_call = self._run_default_flow(setup_code=3)
+        result, _, setup_call, output = self._run_default_flow(setup_code=3)
         self.assertEqual(result, 3)
         setup_call.assert_called_once()
+        self.assertIn("Installation summary:", output)
+        self.assertIn("retry with setup.sh", output)
+
+    def test_manual_flow_prints_completion_summary_when_dependencies_are_incomplete(self) -> None:
+        result, _, _, output = self._run_default_flow()
+        self.assertEqual(result, 0)
+        self.assertIn("Install root:", output)
+        self.assertIn("Mount point:", output)
+        self.assertIn("not mounted", output)
+        for helper in ("info.sh", "login.sh", "status.sh", "service.sh", "mount.sh", "uninstall.sh", "logs.sh"):
+            self.assertIn(helper, output)
+        self.assertIn("/logs", output)
+
+    def test_service_enable_request_does_not_claim_mount_without_proc_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install root"
+            answers = iter([""] * 9)
+            args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+            output = io.StringIO()
+            with (
+                mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
+                mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                mock.patch.object(wizard.installer, "install", return_value=0),
+                mock.patch.object(wizard.login, "run", return_value=0),
+                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard, "_save_settings"),
+                mock.patch.object(wizard.service, "run", return_value=0) as service_call,
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
+                contextlib.redirect_stdout(output),
+            ):
+                result = wizard._run(args, input_fn=lambda _: next(answers))
+
+        self.assertEqual(result, 0)
+        service_call.assert_called_once_with(root, "enable")
+        mountpoint = shlex.quote(str(root / "mount"))
+        self.assertIn(f"Mount point: {mountpoint} — not mounted", output.getvalue())
+        self.assertNotIn(f"Mount point: {mountpoint} — mounted", output.getvalue())
+        self.assertIn(f"Local status: {shlex.quote(str(root / 'info.sh'))}", output.getvalue())
+        self.assertIn(f"{shlex.quote(str(root / 'logs.sh'))} --follow", output.getvalue())
+
+    def test_failed_service_start_keeps_nonzero_result_and_explains_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            answers = iter([""] * 9)
+            args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+            output = io.StringIO()
+            failure = wizard.service.ServiceError("the service is linked, but could not start")
+            with (
+                mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
+                mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                mock.patch.object(wizard.installer, "install", return_value=0),
+                mock.patch.object(wizard.login, "run", return_value=0),
+                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard, "_save_settings"),
+                mock.patch.object(wizard.service, "run", side_effect=failure),
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="enabled; failed"),
+                contextlib.redirect_stdout(output),
+            ):
+                result = wizard._run(args, input_fn=lambda _: next(answers))
+
+        self.assertEqual(result, 2)
+        self.assertIn("service is configured but the mount did not start", output.getvalue().lower())
+        self.assertIn("Mount point:", output.getvalue())
+        self.assertIn("service.sh status", output.getvalue())
+        self.assertIn("logs.sh", output.getvalue())
 
     def test_default_wizard_flow_installs_real_staged_vault_under_first_device(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

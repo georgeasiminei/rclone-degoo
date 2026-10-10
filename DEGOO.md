@@ -69,6 +69,26 @@ remain active after logout; the installer does not change lingering.
 
 ## Mount and use
 
+The wizard ends with the install directory, mount path, actual mount state,
+and commands for status, logs, login, and service control. The default mount
+is `~/.local/share/rclone-degoo/mount`; open that folder in your file manager
+or use it as an ordinary directory while mounted. All helper scripts are
+under `~/.local/share/rclone-degoo/`, regardless of where you extracted the
+installer.
+
+```sh
+~/.local/share/rclone-degoo/info.sh
+~/.local/share/rclone-degoo/logs.sh
+~/.local/share/rclone-degoo/logs.sh --follow
+```
+
+`logs.sh` shows recent mount, login, setup, and status logs, and `--follow`
+watches new lines.
+If authentication cannot be renewed, `info.sh` shows a login-required warning.
+Run `~/.local/share/rclone-degoo/login.sh` again; the mount can reload the
+saved credentials. Keep pending files and their matching vault configuration
+until remote uploads complete.
+
 See [installation and cleanup](docs/degoo/INSTALLATION.md) for existing vaults,
 dependency setup, service operation, settings, and recovery.
 

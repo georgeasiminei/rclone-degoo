@@ -172,10 +172,21 @@ disabled.
 
 ## Login, mount, and recovery
 
+The wizard finishes with a summary of the install directory, mount location,
+current mount state, helper commands, and log paths. A service start request
+does not establish that the mount is ready: the summary checks the kernel's
+mount table. The default mount path is
+`~/.local/share/rclone-degoo/mount`. Open that directory in a file manager or
+use it like any other directory while mounted. Installed helper scripts are
+in `~/.local/share/rclone-degoo/`, rather than the extracted package folder.
+
 Run `~/.local/share/rclone-degoo/login.sh` to authenticate. The helper remembers
 the email in `config/login.json` with owner-only permissions, but never saves
 the account password. Use `login.sh --clear-email` to forget the email without
 removing existing tokens or vault settings.
+
+The password prompt is shown in the terminal even when command logs are
+written to a file. Password characters are not echoed or saved.
 
 Access tokens refresh automatically when nearing expiry. If Degoo rejects a
 refresh, the mount reports that login is needed. Run the login helper again;
@@ -233,6 +244,47 @@ vault and ancestor folders. It may refresh account authentication; it does not
 download file contents or enumerate the cloud to calculate its size. Zero
 pending uploads means there are no local dirty writes, not that remote data
 passed an independent integrity audit.
+
+## Logs and authentication errors
+
+Show recent mount, login, setup, and status log messages, or watch new messages:
+
+```sh
+~/.local/share/rclone-degoo/logs.sh
+~/.local/share/rclone-degoo/logs.sh --follow
+```
+
+Logs live in `~/.local/share/rclone-degoo/logs/`. The helper hides recognized
+credential fields and signed URLs from displayed lines. For service startup
+and process exit messages, also inspect the user journal:
+
+```sh
+journalctl --user -u rclone-degoo.service -n 100 --no-pager
+```
+
+Upgrading an older wizard installation preserves its known log files and sets
+their permissions to owner-only. New login and setup logs are private when
+created, including commands run directly by the wizard.
+
+`info.sh` displays an explicit login-required warning when recent mount logs
+report rejected authentication renewal, or when the saved credentials cannot
+provide a usable token. An expired access token with a saved refresh token may
+renew automatically on the next cloud request; expiry alone is not reported
+as a rejected renewal. A successful new login clears older authentication
+failure warnings when the saved credentials are updated.
+
+When login is required, run:
+
+```sh
+~/.local/share/rclone-degoo/login.sh
+~/.local/share/rclone-degoo/info.sh --check-remote
+```
+
+The mount can reload the new saved credentials. An active service can still
+have failed cloud requests; service state alone does not establish a healthy
+cloud connection. Keep the cache and vault configuration to recover pending
+changes. Login and remote checks do not establish that pending uploads have
+finished; use `status.sh` to inspect the queue.
 
 ## Uninstall
 
