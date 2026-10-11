@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import install
 import uninstall  # noqa: E402
 
 
@@ -133,6 +134,27 @@ class UninstallTest(unittest.TestCase):
         layout = uninstall._validate_layout(self.root)
 
         self.assertEqual(layout["manifest"]["version"], 1)
+
+    def test_layout_accepts_new_mount_tuning_settings(self) -> None:
+        settings = install.DEFAULT_MOUNT_SETTINGS | {
+            "buffer_size": "32Mi",
+            "read_ahead": "0",
+            "read_chunk_streams": 0,
+            "transfers": 6,
+            "bwlimit": "off",
+        }
+        self.write_private(self.root / "config/mount.json", json.dumps(settings).encode() + b"\n")
+
+        layout = uninstall._validate_layout(self.root)
+
+        self.assertEqual(layout["manifest"]["version"], 1)
+
+    def test_layout_rejects_invalid_mount_tuning_settings(self) -> None:
+        settings = install.DEFAULT_MOUNT_SETTINGS | {"read_chunk_streams": -1}
+        self.write_private(self.root / "config/mount.json", json.dumps(settings).encode() + b"\n")
+
+        with self.assertRaisesRegex(uninstall.CleanupError, "mount settings are invalid"):
+            uninstall._validate_layout(self.root)
 
     def test_default_root_is_the_contained_install(self) -> None:
         stdout = io.StringIO()

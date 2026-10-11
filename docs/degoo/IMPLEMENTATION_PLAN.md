@@ -14,8 +14,11 @@ lifetime are unverified, so the vault is not yet accepted for normal use.
 
 Upload timing separates the local close delay from transfer, registration,
 verification, and publication. The installer exposes a positive `write_back`
-duration and uses one second for new installs; legacy settings keep rclone's
-five-second default until explicitly changed. Nonpositive and disabled values
+duration and uses five seconds for new installs, matching the last deployment
+and rclone's legacy default. Read-ahead (1 MiB), read streams (eight), directory
+caching (30 minutes), and additional VFS/network controls live in the private
+mount settings without new wizard prompts. The installer reuses a validated
+detected binary without prompting for its path. Nonpositive and disabled values
 are refused because they bypass background retry scheduling.
 
 Registration recovery performs bounded metadata reads against the same
@@ -127,7 +130,9 @@ helper.
    Leave merging and deleting the source branch to the user under the
    repository's Git instructions.
 
-Defaults are 1 GiB plaintext chunks and a provisional 19 GiB encrypted object
+Installer defaults are 128 MiB plaintext chunks (the direct vault command
+retains its 1 GiB fallback for an unspecified chunk size) and a provisional
+19 GiB encrypted object
 safety cap. Configuration validation includes crypt overhead and manifest
 size. This does not establish the live provider limit. The vault uses rclone
 crypt's existing format and chunker version 2 `simplejson` manifests, with

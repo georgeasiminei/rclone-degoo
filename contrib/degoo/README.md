@@ -94,18 +94,46 @@ config backed up privately outside the install directory.
 
 ## Defaults and use
 
-New vaults use 1 GiB plaintext chunks and a provisional 19 GiB encrypted object
+New vaults use 128 MiB plaintext chunks and a provisional 19 GiB encrypted object
 cap. Live Degoo limits above 20 GiB have not been verified. Initial
 `config/mount.json` values are:
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `cache_max_size` | `20G` | Soft cache-size target; open and pending files stay cached. |
-| `cache_min_free_space` | `20G` | Free disk space to preserve on the cache filesystem when evicting clean data. |
-| `cache_max_age` | `10m` | Age after which clean cache data becomes eligible for eviction. |
+| `cache_max_size` | `60G` | Soft cache-size target; open and pending files stay cached. |
+| `cache_min_free_space` | `60G` | Free disk space to preserve on the cache filesystem when evicting clean data. |
+| `cache_max_age` | `750h` | Age after which clean cache data becomes eligible for eviction. |
 | `cache_poll_interval` | `5s` | How often the local cache cleaner checks for stale clean files. |
-| `write_back` | `1s` | Wait after a file closes before attempting its upload. Must be positive. |
-| `verify_upload` | `true` | Read back each encrypted upload and compare its size and SHA-256 before publishing it. |
+| `write_back` | `5s` | Wait after a file closes before attempting its upload. Must be positive. |
+| `verify_upload` | `false` | Enable readback of each encrypted upload and compare its size and SHA-256 before publishing it. |
+| `buffer_size` | `16Mi` | RAM read buffer per open file. |
+| `read_ahead` | `1Mi` | Additional advance download into the full VFS disk cache. |
+| `read_chunk_size` | `128Mi` | Network read-request window, independent of stored vault chunks. |
+| `read_chunk_size_limit` | `off` | Maximum adaptive read-window growth when `read_chunk_streams` is zero. |
+| `read_chunk_streams` | `8` | Concurrent fixed-size read streams; zero selects adaptive single-stream reads. |
+| `dir_cache_time` | `30m` | Directory metadata freshness interval; mount changes appear immediately. |
+| `attr_timeout` | `1s` | Kernel file/directory attribute caching interval. |
+| `transfers` | `4` | Maximum simultaneous background file uploads. |
+| `bwlimit` | `off` | Aggregate bandwidth limit; accepts rclone rates and timetables. |
+| `timeout` | `5m` | Network I/O idle timeout, not a total transfer deadline. |
+
+The additional buffering, reading, directory, attribute, concurrency, bandwidth,
+and timeout settings are configured only by editing `config/mount.json`; the
+wizard adds no prompts for them. Existing values survive wizard upgrades.
+Missing fields use the defaults above. Explicit command-line flags take
+precedence. Restart the mount or service after editing this private file.
+Eight read streams are a starting point for a fast connection, not a throughput
+guarantee: each can request a 128 MiB range, so scattered reads may waste
+bandwidth. Set `read_chunk_streams` to zero for adaptive single-stream reads,
+or reduce streams and `read_chunk_size` when partial reads dominate. The
+`read_ahead` value does not cap parallel request sizes.
+
+Cache size and free-space targets are independent. With a 40 GiB cache and
+100 GiB free, neither 60 GiB target triggers eviction. With only 50 GiB free,
+the cleaner tries to reclaim 10 GiB from clean, closed cached files. Open and
+pending files remain protected; these targets cannot guarantee against a full
+disk. Cache age is measured since last access, and size or free-space pressure
+can evict clean files before that age is reached.
 
 Run `degoo-rc mount` for a foreground mount, or `degoo-rc service enable` to
 start the user service. Edit `config/mount.json` and restart the mount or

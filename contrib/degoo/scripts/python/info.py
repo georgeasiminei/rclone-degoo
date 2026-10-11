@@ -27,10 +27,7 @@ MAX_JSON_SIZE = 1024 * 1024
 MAX_STATUS_OUTPUT = 4096
 MAX_REMOTE_OUTPUT = 64 * 1024
 MAX_REMOTE_ERROR = 16 * 1024
-RCLONE_DEFAULT_WRITE_BACK = "5s"
 STATUS_PATTERN = re.compile(rb"Pending local uploads: ([0-9]+) files, ([0-9]+) bytes\s*\Z")
-SIZE_PATTERN = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?)(?:[KMGTPE](?:iB?|B)?|B)?\Z", re.IGNORECASE)
-DURATION_PATTERN = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|μs|ms|s|m|h))+\Z")
 MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
 
 
@@ -225,11 +222,22 @@ def _format_bytes(value: int) -> str:
     return f"{value} B"
 
 
-def _safe_setting(value: Any, *, duration: bool = False) -> str:
+def _safe_setting(value: Any, *, duration: bool = False, allow_off: bool = True) -> str:
     if not isinstance(value, str):
         return "unknown"
-    pattern = DURATION_PATTERN if duration else SIZE_PATTERN
-    return value if len(value) <= 32 and pattern.fullmatch(value) else "unknown"
+    if len(value) > 128:
+        return "unknown"
+    valid = (
+        installer.is_valid_mount_duration(value)
+        if duration
+        else installer.is_valid_mount_size(value, allow_off=allow_off)
+    )
+    return value if valid else "unknown"
+
+
+def _safe_count(value: Any, *, allow_zero: bool) -> str:
+    minimum = 0 if allow_zero else 1
+    return str(value) if type(value) is int and minimum <= value <= (1 << 31) - 1 else "unknown"
 
 
 def _expiry_claim(token: str) -> tuple[str, float | None]:
@@ -557,16 +565,33 @@ def _cached_remote_path(manifest: dict[str, Any]) -> str:
 
 
 def _settings_summary(root: Path) -> list[str]:
-    settings = _read_json(root / "config" / "mount.json", 64 * 1024)
-    if settings is None:
+    saved = _read_json(root / "config" / "mount.json", 64 * 1024)
+    if saved is None:
         return ["Mount settings: unavailable or unreadable."]
+    settings = installer.DEFAULT_MOUNT_SETTINGS | saved
     maximum = _safe_setting(settings.get("cache_max_size"))
     minimum = _safe_setting(settings.get("cache_min_free_space"))
     age = _safe_setting(settings.get("cache_max_age"), duration=True)
     poll = _safe_setting(settings.get("cache_poll_interval"), duration=True)
-    write_back = _safe_setting(settings.get("write_back", RCLONE_DEFAULT_WRITE_BACK), duration=True)
+    write_back_value = settings.get("write_back")
+    write_back = (
+        str(write_back_value)
+        if installer.is_valid_write_back_duration(write_back_value)
+        else "unknown"
+    )
     verify = settings.get("verify_upload")
     verify_text = "enabled" if verify is True else "disabled" if verify is False else "unknown"
+    buffer_size = _safe_setting(settings.get("buffer_size"), allow_off=False)
+    read_ahead = _safe_setting(settings.get("read_ahead"), allow_off=False)
+    read_chunk_size = _safe_setting(settings.get("read_chunk_size"))
+    read_chunk_size_limit = _safe_setting(settings.get("read_chunk_size_limit"))
+    read_chunk_streams = _safe_count(settings.get("read_chunk_streams"), allow_zero=True)
+    dir_cache_time = _safe_setting(settings.get("dir_cache_time"), duration=True)
+    attr_timeout = _safe_setting(settings.get("attr_timeout"), duration=True)
+    transfers = _safe_count(settings.get("transfers"), allow_zero=False)
+    bwlimit = settings.get("bwlimit")
+    bwlimit_text = bwlimit if installer.is_valid_bwlimit(bwlimit) else "unknown"
+    timeout = _safe_setting(settings.get("timeout"), duration=True)
     return [
         f"  Cache maximum size: {maximum} (soft target; dirty or open files cannot be evicted).",
         f"  Minimum free-space target: {minimum} (soft target; dirty or open files are retained).",
@@ -574,6 +599,16 @@ def _settings_summary(root: Path) -> list[str]:
         f"  Cache polling interval: {poll}.",
         f"  Delay before uploading closed files: {write_back}.",
         f"  Upload verification: {verify_text}.",
+        f"  Read buffer size: {buffer_size}.",
+        f"  Read ahead: {read_ahead}.",
+        f"  Read chunk size: {read_chunk_size}.",
+        f"  Read chunk size limit: {read_chunk_size_limit}.",
+        f"  Read chunk streams: {read_chunk_streams}.",
+        f"  Directory cache time: {dir_cache_time}.",
+        f"  Attribute cache timeout: {attr_timeout}.",
+        f"  Transfers: {transfers}.",
+        f"  Bandwidth limit: {bwlimit_text}.",
+        f"  Network timeout: {timeout}.",
     ]
 
 
@@ -646,7 +681,7 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
             root / "config" / "login.json",
             f"remembered email only; {_login_command(root / 'config' / 'auth.json')} --clear-email forgets it",
         ),
-        ("Mount settings", root / "config" / "mount.json", "cache and upload behavior"),
+        ("Mount settings", root / "config" / "mount.json", "mount and cache behavior"),
         ("Rclone config", root / "config" / "rclone.conf", "contained remote and auth-file path"),
         ("Install manifest", root / "install.json", "local vault identity and owned systemd-link records"),
         ("User service unit", root / service_manager.UNIT_NAME, "mount startup, restart policy, and stop command"),

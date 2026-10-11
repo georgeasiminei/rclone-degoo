@@ -29,7 +29,6 @@ import uninstall as cleanup
 
 DEFAULT_FOLDER_NAME = "rclone-degoo-vault"
 SIZE_PATTERN = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?)(?:[KMGTPE](?:iB?)?|B)?\Z", re.IGNORECASE)
-DURATION_PATTERN = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|ms|s|m|h))+\Z", re.IGNORECASE)
 FUSE_HELPERS = ("fusermount3", "fusermount", "fusermount2", "fusermount2.9")
 SELECTABLE_CATEGORIES = {1, 2, 6}
 PACKAGE_MANAGERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -111,8 +110,8 @@ def _size_bytes(value: str) -> int:
 
 def _read_text_setting(settings: dict[str, Any], key: str, default: str, *, duration: bool = False) -> str:
     value = settings.get(key)
-    pattern = DURATION_PATTERN if duration else SIZE_PATTERN
-    return value if isinstance(value, str) and len(value) <= 32 and pattern.fullmatch(value) else default
+    valid = installer.is_valid_mount_duration(value) if duration else installer.is_valid_mount_size(value)
+    return value if valid else default
 
 
 def _source_roots() -> list[Path]:
@@ -130,10 +129,12 @@ def _source_repo() -> Path | None:
 
 def _default_binary() -> Path:
     source_repo = _source_repo()
-    candidates = [source_repo / "build/rclone", source_repo / "rclone"] if source_repo else []
+    candidates = []
     for root in _source_roots():
         if root != source_repo:
-            candidates.extend((root / "bin/rclone", root / "rclone"))
+            candidates.extend((root / "rclone", root / "bin/rclone"))
+    if source_repo:
+        candidates.extend((source_repo / "build/rclone", source_repo / "rclone"))
     candidates.extend((installer.expected_root() / "bin/rclone", Path.cwd() / "rclone"))
     for candidate in candidates:
         try:
@@ -705,6 +706,17 @@ def _choose_binary(args: argparse.Namespace, *, input_fn: Callable[[str], str]) 
     source_repo = _source_repo()
     default_binary = _default_binary()
     binary_present = default_binary.is_file() and os.access(default_binary, os.X_OK)
+    if supplied or binary_present:
+        try:
+            path = installer._binary_source(str(supplied or default_binary))
+            installer.validate_binary(path)
+        except installer.InstallError as exc:
+            if supplied:
+                raise WizardError(str(exc)) from None
+            print(f"The detected binary cannot be used: {exc}")
+        else:
+            print(f"Using Degoo-enabled rclone binary: {path}")
+            return str(path), None
     if not supplied and not binary_present and source_repo:
         go_available = _go_available(source_repo)
         if not go_available:
@@ -876,14 +888,16 @@ def _prompt_cache_settings(settings: dict[str, Any], *, input_fn: Callable[[str]
     write_back = settings.get("write_back")
     if not installer.is_valid_write_back_duration(write_back):
         write_back = defaults["write_back"]
-    result = {
+    result = dict(defaults)
+    result.update(settings)
+    result.update({
         "cache_max_size": _read_text_setting(settings, "cache_max_size", defaults["cache_max_size"]),
         "cache_min_free_space": _read_text_setting(settings, "cache_min_free_space", defaults["cache_min_free_space"]),
         "cache_max_age": _read_text_setting(settings, "cache_max_age", defaults["cache_max_age"], duration=True),
         "cache_poll_interval": _read_text_setting(settings, "cache_poll_interval", defaults["cache_poll_interval"], duration=True),
         "write_back": write_back,
         "verify_upload": settings.get("verify_upload") if type(settings.get("verify_upload")) is bool else defaults["verify_upload"],
-    }
+    })
     result["cache_max_size"] = _prompt("Maximum local cache size", result["cache_max_size"], input_fn=input_fn)
     result["cache_min_free_space"] = _prompt("Minimum free-space target", result["cache_min_free_space"], input_fn=input_fn)
     result["cache_max_age"] = _prompt("Maximum cache age", result["cache_max_age"], input_fn=input_fn)
@@ -891,13 +905,17 @@ def _prompt_cache_settings(settings: dict[str, Any], *, input_fn: Callable[[str]
     result["write_back"] = _prompt("Delay before uploading a closed file", result["write_back"], input_fn=input_fn)
     result["verify_upload"] = _yes_no("Verify completed uploads", default=result["verify_upload"], input_fn=input_fn)
     for key in ("cache_max_size", "cache_min_free_space"):
-        if not SIZE_PATTERN.fullmatch(result[key]):
+        if not installer.is_valid_mount_size(result[key]):
             raise WizardError(f"{key} must be a size such as 20G")
     for key in ("cache_max_age", "cache_poll_interval"):
-        if not DURATION_PATTERN.fullmatch(result[key]):
+        if not installer.is_valid_mount_duration(result[key]):
             raise WizardError(f"{key} must be a duration such as 10m or 5s")
     if not installer.is_valid_write_back_duration(result["write_back"]):
         raise WizardError("write_back must be a positive duration such as 1s")
+    try:
+        installer.validate_mount_settings(json.dumps(result).encode("utf-8"))
+    except installer.InstallError as exc:
+        raise WizardError(str(exc)) from None
     return result
 
 
@@ -917,7 +935,7 @@ def _cache_settings(root: Path, *, input_fn: Callable[[str], str]) -> dict[str, 
 def _new_vault_sizes(imported: dict[str, Any] | None, *, input_fn: Callable[[str], str]) -> dict[str, str] | None:
     if imported is not None:
         return None
-    chunk = _prompt("Maximum plaintext chunk size", "1Gi", input_fn=input_fn)
+    chunk = _prompt("Maximum plaintext chunk size", "128Mi", input_fn=input_fn)
     object_limit = _prompt("Maximum encrypted object size (provisional Degoo safety cap)", "19Gi", input_fn=input_fn)
     chunk_bytes = _size_bytes(chunk)
     object_bytes = _size_bytes(object_limit)
