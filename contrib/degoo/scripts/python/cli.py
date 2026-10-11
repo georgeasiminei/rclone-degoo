@@ -23,6 +23,7 @@ COMMANDS = {
     "mount": "Mount the vault in the foreground with transparent encryption and decryption.",
     "stop": "Unmount the foreground vault safely, preserving pending cached writes.",
     "status": "Show authentication, mount health, pending uploads, and optional per-file upload state.",
+    "benchmark": "Measure mounted read/write throughput with cleanup by default.",
     "sync": "Refresh the mounted remote directory view for a local path, preserving pending writes.",
     "location": "Query Degoo for the configured vault folder and its ancestry.",
     "folders": "List account device folders or children of a selected folder.",
@@ -32,7 +33,7 @@ COMMANDS = {
     "trash": "List account-wide trash without deleting anything.",
     "empty-trash": "Permanently delete all account trash after confirmation; supports dry-run.",
 }
-PYTHON_COMMANDS = {"install", "uninstall", "backup-config", "sync", "login", "setup", "service", "info", "logs", "status"}
+PYTHON_COMMANDS = {"install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "service", "info", "logs", "status"}
 DETAILS = {
     "install": "With no parameters, starts the wizard. Installs into ~/.local/share/rclone-degoo and links ~/.local/bin/degoo-rc. An unattended install needs --binary and --no-wizard. Upgrade preserves configuration and cached writes.",
     "uninstall": "With no parameters in a terminal, starts guided cleanup. --inventory is read-only. Removal affects local installation files and owned service/PATH links; remote files remain. Pending writes require retaining both cache and matching configuration.",
@@ -140,6 +141,11 @@ def main(argv: list[str] | None = None) -> int:
     if command not in COMMANDS:
         print(f"Unknown command: {command}. Use degoo-rc help.", file=sys.stderr)
         return 2
+    if command == "benchmark" and parameters and parameters[0] in {"read", "write"} and any(
+        item in {"--help", "-h", "help"} for item in parameters[1:]
+    ):
+        module = importlib.import_module("benchmark")
+        return module.main([parameters[0], "--help"])
     if parameters == ["help"] or "--help" in parameters or "-h" in parameters:
         return show_help(command)
     root = root_directory()

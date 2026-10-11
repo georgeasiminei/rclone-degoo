@@ -84,6 +84,15 @@ mount settings without new wizard prompts. The installer reuses a validated
 detected binary without prompting for its path. Nonpositive and disabled values
 are refused because they bypass background retry scheduling.
 
+The contained `degoo-rc benchmark read|write` command measures mounted
+throughput using generated zero data for writes and the selected file for
+reads. Writes create a new path, then time through VFS `uploaded` state,
+including `fsync`, close, and writeback; reads request direct I/O unless
+`--buffered` is selected. Both modes delete the file after success by default,
+while `--no-delete` retains it and failures preserve it. A read may still come
+from rclone's disk cache, and VFS `uploaded` state is not an independent cloud
+integrity proof. Detailed options and examples are in [USAGE.md](USAGE.md).
+
 Registration recovery performs bounded metadata reads against the same
 temporary object without replaying the mutation. Missing, null, or lost
 acknowledgements receive a twenty-second visibility window; negative boolean
@@ -98,9 +107,10 @@ original sequence below remains the release acceptance guide; live gates
 cannot be inferred from mock results or from the partial live probes.
 
 The contained install and cleanup experience is part of the user handoff. The
-unified `degoo-rc` entrypoint provides `install`, `uninstall`, `login`, `setup`,
-`mount`, `stop`, `status`, `location`, `folders`, `service`, `info`, `logs`,
-`trash`, and `empty-trash`. Source checkouts use
+unified `degoo-rc` entrypoint provides `install`, `uninstall`, `backup-config`,
+`login`, `setup`, `mount`, `stop`, `status`, `benchmark`, `sync`, `location`,
+`folders`, `service`, `info`, `logs`, `trash`, and `empty-trash`. Source
+checkouts use
 `./contrib/degoo/degoo-rc install`; archive users run
 `./degoo-rc install`; an installed user starts with `degoo-rc help`. Existing
 installer and helper options remain available, with `degoo-rc COMMAND help`
