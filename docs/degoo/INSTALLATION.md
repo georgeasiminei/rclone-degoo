@@ -230,15 +230,14 @@ sudo chmod 700 -- /mnt/degoo
 sudo chattr +i -- /mnt/degoo
 ```
 
-The Linux mount checks that the directory belongs to the user, refuses to hide
-files already in it, and keeps the underlying directory unwritable while
-unmounted. An immutable flag can prevent unprivileged FUSE mounting because the
-mount process needs write access to the mountpoint. If the mount detects that
-condition, it stops and prints a `sudo chattr -i -- /mnt/degoo` command; clear
-the flag and retry. The mount guard then removes write permission through the
-retained directory handle after mounting and again on failure or unmount. You
-may reapply `chattr +i` while the directory is idle, but clear it before the
-next ordinary-user mount.
+The Linux mount checks that the directory belongs to the user and refuses to
+hide files already in it. You may leave `chattr +i` set while the mount is
+running and while it is stopped; the installer does not treat the flag itself
+as a startup failure, and the mount guard does not clear it. Keep the directory
+owned by the mounting user with owner access so the FUSE helper can mount on
+it. When the immutable flag is absent, the mount guard removes write permission
+through the retained directory handle after mounting and again on failure or
+unmount.
 
 The installer helpers accept `/mnt/degoo` or the legacy in-install `mount`
 directory. Upgrades preserve the recorded mountpoint by default. To migrate an
@@ -358,9 +357,8 @@ does not establish that the mount is ready: the wizard waits briefly for the
 kernel's mount table to show a connected mount. If requested startup fails or
 remains unconfirmed, installation reports an explicit error and returns a
 nonzero exit status. Completed configuration remains available for retry.
-Known immutable-flag blockers include the exact `sudo chattr -i` command;
-other startup errors include commands to inspect status and logs. Choosing
-manual startup allows installation to finish without mounting. The default
+Startup errors include commands to inspect status and logs. Choosing manual
+startup allows installation to finish without mounting. The default
 mount path is `/mnt/degoo`. Open that directory in a file manager or use it like
 any other directory while mounted. Ordinary files created there while the
 mount is absent remain local-only and are never uploaded; a mount refuses to

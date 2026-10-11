@@ -59,7 +59,7 @@ func TestMountpointProtectionRejectsSymlink(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestMountpointImmutableAccessInstructions(t *testing.T) {
+func TestMountpointImmutableWithoutOwnerWriteAccess(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write a directory without write permission")
 	}
@@ -71,5 +71,21 @@ func TestMountpointImmutableAccessInstructions(t *testing.T) {
 		require.NoError(t, os.Chmod(dir, 0700))
 	})
 	guard.immutable = true
-	require.ErrorContains(t, guard.prepare(), "sudo chattr -i --")
+	require.ErrorContains(t, guard.prepare(), "not writable by the current user")
+	require.ErrorContains(t, guard.prepare(), "immutable flag may remain set")
+}
+
+func TestMountpointImmutableWithOwnerWriteAccess(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "mount")
+	guard, err := protectMountpoint(dir)
+	require.NoError(t, err)
+	require.NoError(t, guard.file.Chmod(0700))
+	guard.immutable = true
+
+	require.NoError(t, guard.prepare())
+	require.NoError(t, guard.protect())
+	require.NoError(t, guard.Close())
+	info, err := os.Stat(dir)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0700), info.Mode().Perm())
 }

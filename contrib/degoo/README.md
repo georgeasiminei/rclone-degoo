@@ -261,10 +261,12 @@ installer cannot prepare it, it prints the privileged setup commands. Upgrades
 preserve their saved mount path. To migrate an older install, choose
 `--mountpoint /mnt/degoo`; migration is refused while the old underlying
 directory contains files. The external mount directory remains after uninstall.
-If you set `chattr +i` to protect it while idle, clear the flag with
-`sudo chattr -i -- /mnt/degoo` before mounting; it can prevent unprivileged
-FUSE setup. The mount protects the underlying directory by removing write
-permissions after mounting and on failure or unmount.
+You can leave `chattr +i` set while mounted and unmounted. The installer does
+not reject that flag, and the mount guard leaves it unchanged. Keep the
+directory owned by the mounting user with owner access so the FUSE helper can
+mount on it. When the immutable flag is absent, the mount protects the
+underlying directory by removing write permissions after mounting and on
+failure or unmount.
 The installed `degoo-rc` command is available on `PATH`:
 
 ```sh

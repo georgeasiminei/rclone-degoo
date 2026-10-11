@@ -81,8 +81,7 @@ func (guard *mountpointGuard) prepare() error {
 	}
 	if guard.immutable {
 		if err := unix.Access(guard.file.Name(), unix.W_OK); err != nil {
-			quoted := "'" + strings.ReplaceAll(guard.file.Name(), "'", "'\"'\"'") + "'"
-			return fmt.Errorf("immutable mount directory blocks unprivileged FUSE mounting; run sudo chattr -i -- %s, then retry; mount protection removes write permissions from the underlying directory after mounting and on failure or unmount", quoted)
+			return fmt.Errorf("mount directory is not writable by the current user; ensure it is owned by that user with owner write access (the immutable flag may remain set)")
 		}
 		return nil
 	}

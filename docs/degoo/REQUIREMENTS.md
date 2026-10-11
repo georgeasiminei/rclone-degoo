@@ -45,11 +45,11 @@ These points are the binding product requirements recorded from the user.
 - The installer attempts to create `/mnt/degoo` as an owner-private directory.
   If it cannot, it prints `sudo mkdir`, `chown`, `chmod 700`, and `chattr +i`
   commands for the user to run. The mount refuses to cover ordinary local
-  files in an unmounted mount directory. An immutable flag can block
-  unprivileged FUSE mounting when the mountpoint needs write access; the mount
-  reports a `chattr -i` command to run before retrying. With the immutable flag
-  cleared, the mount removes write permissions through the retained directory
-  handle after mounting and on failure or unmount.
+  files in an unmounted mount directory. Users may keep the immutable flag set
+  while mounted and unmounted; the installer must not reject it preemptively or
+  ask the user to clear it. The mount leaves that flag unchanged and uses the
+  retained directory handle to protect the underlying mount directory when the
+  immutable flag is absent.
 - Changing an existing install from the legacy in-install `mount` directory to
   `/mnt/degoo` is refused while the old directory contains files. The
   installer and maintenance helpers accept only these two mountpoint choices.

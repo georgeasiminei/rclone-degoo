@@ -12,16 +12,18 @@ See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 
 Inspection confirmed that the installer already returned status `2` after an
 unconfirmed requested mount, but its normal-looking summary did not show a
-prominent error. The service was retrying after the immutable external
-mountpoint blocked unprivileged FUSE mounting. Clearing that flag and starting
-the owned service produced a connected mount, an active running service, and
-a successful local health report with no queued uploads. No remote file data
-was written during this recovery.
+prominent error. At that time, its immutable-flag precheck skipped service
+startup and advised removing the flag. That behavior is superseded: the wizard
+now tries the service with the flag retained, and the mount guard leaves it
+unchanged. The earlier recovery after temporarily clearing the flag produced a
+connected mount, an active running service, and a successful local health
+report with no queued uploads. No remote file data was written during this
+recovery.
 
-All 250 Python helper tests, the package self-check, scoped Markdown lint,
-Python syntax checks, and `git diff --check` passed. Regressions cover explicit
-startup errors, service rejection, disconnected and unknown mounts, final
-mount-state observation races, read-only immutable-flag inspection, and
+At the time, 250 Python helper tests, the package self-check, scoped Markdown
+lint, Python syntax checks, and `git diff --check` passed. Regressions covered
+explicit startup errors, service rejection, disconnected and unknown mounts,
+final mount-state observation races, read-only immutable-flag inspection, and
 successful installation when the user chooses manual startup.
 
 ## Incomplete uninstall and recovery
@@ -76,13 +78,11 @@ this follow-up. A local vault binding that had used a
 folder name where an opaque provider folder ID was required was corrected after
 confirming that the prior cache contained only its lock file, with no identity
 or cached file data. No actual provider ID or private path is recorded here.
-These events do not establish reliable automatic renewal. An immutable flag on
-the current mountpoint prevented an ordinary-user FUSE mount because the FUSE
-helper requires write access; the mount reports a `sudo chattr -i` instruction
-before retrying. The targeted test simulated this access failure and verified
-the instruction, and the native FUSE smoke test verified mode-based protection
-on its temporary mountpoint. No privileged flag change was made, so final
-health of the installed mount remains pending. Earlier live smoke tests used
+These events do not establish reliable automatic renewal. The earlier wizard
+treated an immutable flag as a blocker and directed the user to clear it; this
+was stricter than necessary when the directory remained owned and writable by
+the mounting user. The native FUSE smoke test verified mode-based protection
+on its temporary mountpoint. Earlier live smoke tests used
 generated data in a dedicated disposable folder; they do not establish
 long-term token renewal by themselves.
 

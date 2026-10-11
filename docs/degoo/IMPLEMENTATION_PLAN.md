@@ -59,11 +59,10 @@ directory to be empty, and uninstall leaves the external directory in place.
 The mount creates an owner-private directory when possible, refuses to cover
 local files, and protects the underlying directory after mounting and on
 failure or unmount. If setup cannot create it, diagnostics print privileged
-`mkdir`, `chown`, `chmod`, and `chattr +i` commands. An immutable directory can
-block unprivileged FUSE mounting; the mount reports a `sudo chattr -i` command
-when the current user lacks write access. Clear the flag before retrying; the
-mount guard then protects the underlying directory by removing write
-permissions through its retained directory handle.
+`mkdir`, `chown`, `chmod`, and `chattr +i` commands. An immutable flag may stay
+set across mounts; the installer does not reject it and the mount guard leaves
+it unchanged. The mountpoint still needs to be owned by the mounting user with
+owner access for the FUSE helper.
 
 Status output places authentication errors first. Private `status.log` and
 `diagnostics.log` capture the relevant helper and Degoo diagnostics; displayed
@@ -71,9 +70,12 @@ command errors omit Cobra usage blocks and redact recognized credentials.
 The final repository-wide test suite, scoped race and lint checks, Python
 helper tests, package self-check, native FUSE upload-status smoke test, and
 changed-document lint passed; details are recorded in [VALIDATION.md](VALIDATION.md).
-The external mountpoint's immutable flag blocked ordinary-user FUSE mounting.
-After clearing it, the service reached a connected mount and the local health
-check returned success without writing remote file data.
+The earlier installer treated an immutable external mountpoint as a startup
+blocker and advised clearing its flag. The wizard now attempts the requested
+service start with the flag left in place; the mount guard reports an ownership
+or permission problem only if the current user lacks write access. The local
+health check returned success during the earlier recovery without writing
+remote file data.
 
 Upload timing separates the local close delay from transfer, registration,
 verification, and publication. The installer exposes a positive `write_back`
