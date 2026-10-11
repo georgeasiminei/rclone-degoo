@@ -30,6 +30,7 @@ PYTHON_HELPERS = (
     "uninstall.py",
     "wizard.py",
     "mount_prerequisites.py",
+    "mount_setup.py",
     "connection.py",
     "restore.py",
     "backup_config.py",

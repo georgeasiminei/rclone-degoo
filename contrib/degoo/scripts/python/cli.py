@@ -21,6 +21,7 @@ COMMANDS = {
     "login": "Sign in to Degoo without saving the account password.",
     "setup": "Select or create a dedicated remote folder and configure vault encryption.",
     "mount": "Mount the vault in the foreground with transparent encryption and decryption.",
+    "mount-setup": "Install the system helper for an immutable /mnt/degoo (run explicitly with sudo).",
     "stop": "Unmount the foreground vault safely, preserving pending cached writes.",
     "status": "Show authentication, mount health, pending uploads, and optional per-file upload state.",
     "benchmark": "Measure mounted read/write throughput with cleanup by default.",
@@ -33,7 +34,7 @@ COMMANDS = {
     "trash": "List account-wide trash without deleting anything.",
     "empty-trash": "Permanently delete all account trash after confirmation; supports dry-run.",
 }
-PYTHON_COMMANDS = {"install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "service", "info", "logs", "status"}
+PYTHON_COMMANDS = {"install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "service", "info", "logs", "status", "mount-setup"}
 DETAILS = {
     "install": "With no parameters, starts the wizard. Installs into ~/.local/share/rclone-degoo and links ~/.local/bin/degoo-rc. An unattended install needs --binary and --no-wizard. Upgrade preserves configuration and cached writes.",
     "uninstall": "With no parameters in a terminal, starts guided cleanup. --inventory is read-only. Removal affects local installation files and owned service/PATH links; remote files remain. Pending writes require retaining both cache and matching configuration.",
@@ -85,7 +86,7 @@ def show_help(command: str | None = None) -> int:
         for action in parser._actions:
             if action.dest == "root":
                 action.required = False
-                action.default = str(root_directory())
+                action.default = str(BASE if command == "mount-setup" else root_directory())
         parser.print_help()
     elif command in {"trash", "empty-trash"}:
         print(f"Usage: degoo-rc {command} [AUTH_FILE] [OPTIONS]\n")
@@ -148,6 +149,9 @@ def main(argv: list[str] | None = None) -> int:
         return module.main([parameters[0], "--help"])
     if parameters == ["help"] or "--help" in parameters or "-h" in parameters:
         return show_help(command)
+    if command == "mount-setup":
+        module = importlib.import_module("mount_setup")
+        return module.main(["--root", str(BASE), *parameters])
     root = root_directory()
     if command in PYTHON_COMMANDS:
         module = importlib.import_module(command.replace("-", "_"))

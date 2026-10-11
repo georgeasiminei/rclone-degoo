@@ -8,12 +8,20 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import cli
 
 
 class CLITest(unittest.TestCase):
+    def test_mount_setup_dispatch_uses_launcher_root_without_sudo_home(self):
+        module = mock.Mock()
+        module.main.return_value = 0
+        with mock.patch.object(cli, "root_directory", side_effect=AssertionError("sudo HOME must not select the client")), mock.patch.object(cli.importlib, "import_module", return_value=module):
+            self.assertEqual(cli.main(["mount-setup", "--foreground"]), 0)
+        module.main.assert_called_once_with(["--root", str(cli.BASE), "--foreground"])
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="degoo-cli-")
         self.addCleanup(self.temporary.cleanup)
@@ -72,6 +80,21 @@ class CLITest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("degoo-rc help", result.stderr)
         self.assertEqual(self.run_cli("stop", "unexpected").returncode, 2)
+
+    def test_installed_mount_setup_uses_its_source_after_home_changes(self):
+        self.install()
+        module = self.root / "scripts/python/mount_setup.py"
+        module.write_text(
+            'import json\ndef main(argv):\n    print(json.dumps(argv))\n    return 0\n',
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(self.home / ".local/bin/degoo-rc"), "mount-setup"],
+            env=dict(self.env, HOME=str(self.workspace / "different home")),
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["--root", str(self.root)])
 
     def test_failed_uninstall_propagates_incomplete_cleanup_through_launcher(self):
         self.install()

@@ -26,16 +26,27 @@ encrypted data. This does not establish live Degoo provider behavior.
 
 When automatic startup is selected, a rejected service request or an
 unconfirmed connected mount ends installation with an explicit error and a
-nonzero exit status. When an immutable `/mnt/degoo` has no valid helper, mount
-startup fails with an explicit diagnostic that points to the installed
-`immutable-mount/README.md` and tells the user to build and install the helper,
-then run `degoo-rc service enable` to retry setup. For an already enabled
-service, run `degoo-rc service restart`. The
-[helper instructions](../../contrib/degoo/immutable-mount/README.md) describe
-the administrator build and install commands. Installation preserves
-configuration and the local cache while these steps are pending. It never
-clears the flag or installs privileged files itself. Manual startup remains
-optional.
+nonzero exit status. When an immutable `/mnt/degoo` has no valid helper, the
+Step 6 preflight stops before the service-start prompt and returns a
+nonzero result while preserving configuration and the local cache. It prints
+one administrator command from the private install root:
+
+```sh
+sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup
+```
+
+This command builds as the invoking account and installs only the fixed
+root-owned helper. It preserves the immutable flag and never mounts or starts
+the service as root. If GCC is missing, the wizard prints the detected
+distribution's package command and the user can rerun `mount-setup` after
+installing it. Once setup finishes, continue as the ordinary user. With
+systemd, run `degoo-rc service enable` and then `degoo-rc info`. Without
+systemd, add `--foreground` to `mount-setup`, then run `degoo-rc mount` as the
+ordinary user and check `degoo-rc info` from another terminal. An already
+enabled service can be retried with
+`degoo-rc service restart`. The
+[helper README](../../contrib/degoo/immutable-mount/README.md) documents the
+helper's contract and advanced manual installation.
 
 ### Action-specific installer prerequisite preflight
 
@@ -54,16 +65,18 @@ Check an immutable selected mountpoint and the manually installed helper before
 offering or enabling service startup. The helper is required only for an
 immutable `/mnt/degoo`; validate its root ownership, protected parent and file
 permissions, setuid mode, and whether the containing filesystem is mounted
-`nosuid`. Generate build and installation commands from the current private
-install root, point to the bundled
-[helper instructions](../../contrib/degoo/immutable-mount/README.md), and give
-verification and retry commands. These checks must never clear the immutable
-flag or install, replace, or modify a privileged helper. Do not enable or start
-a service when a known required blocker remains. Preserve the completed
-configuration and pending cache so the user can repair the prerequisite and
-retry; report readiness only after the requested mount is confirmed. The
-wizard now runs this preflight before its final service-start choice. The
-implementation-specific validation results are pending and belong in
+`nosuid` or `noexec`. Print one explicit `sudo ... mount-setup` command from
+the current private install root, with the ordinary-user service or
+foreground-mount commands clearly separated. If GCC is missing, print the
+detected distribution's compiler package command. Point to the bundled
+[helper README](../../contrib/degoo/immutable-mount/README.md) for its contract
+and optional manual installation. These checks must never clear the immutable
+flag or automatically install, replace, or modify a privileged helper. Do not
+enable or start a service when a known required blocker remains. Preserve the
+completed configuration and pending cache so the user can repair the
+prerequisite and retry; report readiness only after the requested mount is
+confirmed. The wizard runs this preflight before its final service-start
+choice. The new command's validation results will be recorded in
 [VALIDATION.md](VALIDATION.md).
 
 ### Complete local cleanup and interrupted-uninstall recovery

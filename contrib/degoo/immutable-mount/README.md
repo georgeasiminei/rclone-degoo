@@ -32,7 +32,64 @@ delegation so it cannot execute itself recursively. The original argument
 vector is passed unchanged. For a delegated mount it retains only the
 `_FUSE_COMMFD` value, `PATH`, and `LANG` in the environment.
 
-## Build and install
+## Recommended setup through `degoo-rc`
+
+When the install wizard reports that this helper is missing or invalid, use
+the single administrator command it prints. For the default install root:
+
+```sh
+sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup
+```
+
+From a source checkout or extracted archive, run `sudo ./degoo-rc mount-setup`
+from its root directory instead.
+
+If GCC is missing, the wizard prints a compiler package command for the
+detected distribution. Install that package, then rerun `mount-setup`. A valid
+installed helper does not require GCC. The archive includes the
+`scripts/python/mount_setup.py` command module and C helper source at
+`immutable-mount/helper.c`. The contained install keeps both under its private
+root; setup reads the source and builds in a temporary workspace as the
+invoking user.
+
+`mount-setup` builds as the account that invoked `sudo`, then installs the
+root-owned helper at the fixed path. It preserves the immutable flag and does
+not mount the vault or start its service as root. Use the printed command when
+the install root differs from the default above.
+
+After setup completes, continue as the normal user, without `sudo`. With a
+systemd user manager:
+
+```sh
+degoo-rc service enable
+degoo-rc info
+```
+
+Without a systemd user manager, use this administrator setup command so it
+prints the foreground continuation:
+
+```sh
+sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup --foreground
+```
+
+From a source checkout or extracted archive, use
+`sudo ./degoo-rc mount-setup --foreground` from its root directory. Then start
+the foreground mount as the normal user in one terminal and inspect it from
+another:
+
+```sh
+degoo-rc mount
+```
+
+```sh
+degoo-rc info
+```
+
+If the service is already enabled, run `degoo-rc service restart` as the
+normal user. The installer stops before asking about service startup when the
+helper is a known blocker and prints these commands immediately.
+
+## Advanced manual build and install
 
 Build with GCC or a compatible compiler:
 

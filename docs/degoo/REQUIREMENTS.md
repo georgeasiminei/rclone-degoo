@@ -58,11 +58,27 @@ These points are the binding product requirements recorded from the user.
   Mount launch must validate the helper's path, ownership, permissions, and
   setuid bit before selecting it, and must not install or modify privileged
   files automatically.
-  When `/mnt/degoo` is immutable and no valid helper is available, show its
-  [build and install instructions](../../contrib/degoo/immutable-mount/README.md)
-  and the service command to retry after setup. When the flag is absent, the
-  mount guard protects the underlying directory through its retained directory
-  handle.
+  When `/mnt/degoo` is immutable and no valid helper is available, show one
+  administrator command for the current install root. For the default root,
+  it builds as the invoking account and installs the fixed helper:
+
+  ```sh
+  sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup
+  ```
+
+  When no systemd user manager is available, use this administrator command
+  so it prints the foreground continuation:
+
+  ```sh
+  sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup --foreground
+  ```
+
+  State that this preserves the flag and does not mount or start a service as
+  root. After it succeeds, print a clearly marked normal-user continuation.
+  With systemd, run `degoo-rc service enable` and then `degoo-rc info`. Without
+  systemd, run `degoo-rc mount` in the foreground and check `degoo-rc info`
+  from another terminal. When the flag is absent, the mount guard protects the
+  underlying directory through its retained directory handle.
 - The privileged helper only accepts `/mnt/degoo`; it cannot mount the legacy
   in-install `mount/` path. An upgrade that needs to retain an immutable flag
   must run `degoo-rc install --mountpoint /mnt/degoo` to migrate the saved path
@@ -169,16 +185,25 @@ the separate vault secret, automatic renewal, and simple local-file setup.
   distribution and system context, explain when they need administrator
   privileges, then give commands to verify the repair and retry the blocked
   action. Do not treat printed instructions as a successful repair.
+- For setup requiring several privileged commands, provide a narrow dedicated
+  setup helper whenever practical. Mark its one `sudo` invocation separately
+  from the ordinary-user continuation. If a package prerequisite also needs
+  administrator access, label that command too. Never ask the user to start
+  rclone or its service as root. Do not pause for input before displaying the
+  commands needed to clear a known blocker.
 - Do not enable or start a service when a known required prerequisite means it
   cannot mount, and do not report setup as ready until the requested mount is
   confirmed. If setup is blocked, preserve completed configuration and pending
   local changes and print an actionable retry command.
 - Never clear an immutable mountpoint flag automatically. The immutable-mount
-  helper remains a manual administrator installation: the wizard may check and
-  explain how to build, install, and verify it, but must not install, replace,
-  or modify privileged helper files itself. Explain other mount blockers such
-  as missing FUSE tools, unavailable or inaccessible `/dev/fuse`, and an
-  unusable systemd user manager when relevant to the selected action.
+  helper remains an explicit administrator setup: `degoo-rc mount-setup`, run
+  with `sudo`, builds the helper as the calling user and installs it at the
+  fixed root-owned path. The wizard may print this command but must not invoke
+  it automatically. The command must not start the service or mount as root.
+  When GCC is missing, print the detected distribution's compiler package
+  command. Explain other mount blockers such as missing FUSE tools, unavailable
+  or inaccessible `/dev/fuse`, and an unusable systemd user manager when
+  relevant to the selected action.
 - Show a visible password prompt even when logging to a file. Finish setup
   with the install and mount paths, actual mount state, helper commands, and
   log access. Make rejected authentication renewal visible with an actionable

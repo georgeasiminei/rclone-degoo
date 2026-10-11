@@ -4,10 +4,13 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")/.."
 test_build_dir=$(mktemp -d)
 trap 'rm -rf -- "$test_build_dir"' EXIT
-gcc -O2 -Wall -Wextra -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-    -Wl,-z,relro,-z,now -o "$test_build_dir/fusermount3" contrib/degoo/immutable-mount/helper.c
 go test -c -o "$test_build_dir/degoo.test" ./cmd/degoo
 cp -- contrib/degoo/scripts/python/mount_prerequisites.py "$test_build_dir/mount_prerequisites.py"
+cp -- contrib/degoo/scripts/python/mount_setup.py "$test_build_dir/mount_setup.py"
+cp -- contrib/degoo/immutable-mount/helper.c "$test_build_dir/helper.c"
+cp -- contrib/degoo/degoo-rc "$test_build_dir/degoo-rc"
+cp -- contrib/degoo/scripts/python/cli.py "$test_build_dir/cli.py"
+cp -- contrib/degoo/scripts/python/install.py "$test_build_dir/install.py"
 test_uid=$(id -u)
 test_gid=$(id -g)
 if [[ "$test_uid" == 0 ]]; then
@@ -40,9 +43,33 @@ mount -t tmpfs -o nodev,nosuid,mode=0755 tmpfs /usr/local
 mkdir -m 755 -p /usr/local/libexec/rclone-degoo
 # The helper must be on a suid-enabled mount; only this namespace sees it.
 mount -t tmpfs -o nodev,mode=0755 tmpfs /usr/local/libexec/rclone-degoo
-install -o root -g root -m 4755 "$build_dir/fusermount3" /usr/local/libexec/rclone-degoo/fusermount3
 install -m 755 "$build_dir/degoo.test" "$fixture/degoo.test"
 install -m 644 "$build_dir/mount_prerequisites.py" "$fixture/mount_prerequisites.py"
+mkdir -m 755 -p "$fixture/scripts/python"
+for module in cli install mount_setup mount_prerequisites; do
+    install -m 644 "$build_dir/$module.py" "$fixture/scripts/python/$module.py"
+done
+install -m 755 "$build_dir/degoo-rc" "$fixture/degoo-rc"
+mkdir -m 755 "$fixture/immutable-mount"
+install -m 644 "$build_dir/helper.c" "$fixture/immutable-mount/helper.c"
+env HOME=/root SUDO_UID="$client_uid" SUDO_GID="$client_gid" SUDO_USER="$(id -nu "$client_uid")" \
+    "$fixture/degoo-rc" mount-setup
+# Repeating explicit setup must also leave a working root-owned helper.
+env HOME=/root SUDO_UID="$client_uid" SUDO_GID="$client_gid" SUDO_USER="$(id -nu "$client_uid")" \
+    "$fixture/degoo-rc" mount-setup
+# Repair an invalid leaf without following or modifying its symlink target.
+printf '%s\n' 'generated symlink target: preserve' > "$fixture/keep.txt"
+ln -sfn "$fixture/keep.txt" /usr/local/libexec/rclone-degoo/fusermount3
+env HOME=/root SUDO_UID="$client_uid" SUDO_GID="$client_gid" SUDO_USER="$(id -nu "$client_uid")" \
+    "$fixture/degoo-rc" mount-setup
+test "$(cat "$fixture/keep.txt")" = 'generated symlink target: preserve'
+test ! -L /usr/local/libexec/rclone-degoo/fusermount3
+# Repair a regular leaf with incorrect ownership and writable permissions.
+chown "$client_uid:$client_gid" /usr/local/libexec/rclone-degoo/fusermount3
+chmod 0777 /usr/local/libexec/rclone-degoo/fusermount3
+env HOME=/root SUDO_UID="$client_uid" SUDO_GID="$client_gid" SUDO_USER="$(id -nu "$client_uid")" \
+    "$fixture/degoo-rc" mount-setup
+test "$(stat -c '%u:%g:%a' /usr/local/libexec/rclone-degoo/fusermount3)" = '0:0:4755'
 for helper in /usr/bin/fusermount3 /usr/bin/fusermount; do
     if [[ -x "$helper" ]]; then
         ln -s "$helper" "$fixture/tools/fusermount3"

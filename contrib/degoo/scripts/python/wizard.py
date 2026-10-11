@@ -655,6 +655,7 @@ def _completion_summary(
     service_requested: bool = False,
     service_result: int | None = None,
     service_error: str | None = None,
+    show_commands: bool = True,
 ) -> str:
     """Print actionable local paths and observed state without cloud access."""
     mountpoint = installer.configured_mountpoint(root)
@@ -690,6 +691,8 @@ def _completion_summary(
     elif not systemd_available:
         print("  No systemd user manager is available; run the foreground mount command below when ready.")
 
+    if not show_commands:
+        return mount_state
     print("  # Run the command block for the action you need:")
     print()
     _print_command_block("Local status", _degoo_rc(root, "info"))
@@ -839,16 +842,18 @@ def _mount_preflight(root: Path, mountpoint: Path, *, systemd_available: bool = 
             else:
                 print("Install GCC and the C development headers using your system package manager before building the helper.")
         if not any(issue.startswith("helper source missing:") for issue in issues):
-            _print_command_block("Build as your normal user and install the immutable helper with administrator access", "\n".join(mount_prerequisites.setup_commands(root, start_service=systemd_available)))
-            if not systemd_available:
-                _print_command_block("Start the foreground mount after configuration", _degoo_rc(root, "mount"))
-                _print_command_block("Verify the foreground mount from another terminal", _degoo_rc(root, "info"))
+            commands = mount_prerequisites.setup_commands(root, start_service=systemd_available)
+            _print_command_block("Run this setup command with sudo", commands[0])
+            _print_command_block("After setup succeeds, continue as your normal user (without sudo)", commands[1])
+            label = "Verify the mount" if systemd_available else "Verify the foreground mount from another terminal"
+            _print_command_block(label, commands[2])
         print("Keep the immutable flag set. The wizard does not install privileged files or change mountpoint protection.")
-    _print_command_block("Inspect mountpoint and helper configuration", "\n".join([
-        f"namei -l -- {shlex.quote(str(mountpoint))}",
-        "namei -l -- /usr/local/libexec/rclone-degoo/fusermount3",
-        "findmnt -no TARGET,OPTIONS -T /usr/local/libexec/rclone-degoo",
-    ]))
+    if any("unsafe:" in issue or "nosuid" in issue or "noexec" in issue for issue in issues):
+        _print_command_block("Inspect mountpoint and helper configuration", "\n".join([
+            f"namei -l -- {shlex.quote(str(mountpoint))}",
+            "namei -l -- /usr/local/libexec/rclone-degoo/fusermount3",
+            "findmnt -no TARGET,OPTIONS -T /usr/local/libexec/rclone-degoo",
+        ]))
     return issues
 
 
@@ -1393,6 +1398,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             mount_ready=False,
             systemd_available=systemd_available,
             note="Mount startup was skipped; complete the configuration instructions above before starting.",
+            show_commands=False,
         )
         return 2
     if systemd_available and mount_ready:
