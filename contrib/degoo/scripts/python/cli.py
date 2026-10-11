@@ -23,6 +23,7 @@ COMMANDS = {
     "mount": "Mount the vault in the foreground with transparent encryption and decryption.",
     "stop": "Unmount the foreground vault safely, preserving pending cached writes.",
     "status": "Show the number and total size of locally pending uploads.",
+    "sync": "Refresh the mounted remote directory view for a local path, preserving pending writes.",
     "location": "Query Degoo for the configured vault folder and its ancestry.",
     "folders": "List account device folders or children of a selected folder.",
     "service": "Enable, disable, start, stop, restart, or inspect the systemd user service.",
@@ -31,7 +32,7 @@ COMMANDS = {
     "trash": "List account-wide trash without deleting anything.",
     "empty-trash": "Permanently delete all account trash after confirmation; supports dry-run.",
 }
-PYTHON_COMMANDS = {"install", "uninstall", "backup-config", "login", "setup", "service", "info", "logs"}
+PYTHON_COMMANDS = {"install", "uninstall", "backup-config", "sync", "login", "setup", "service", "info", "logs"}
 DETAILS = {
     "install": "With no parameters, starts the wizard. Installs into ~/.local/share/rclone-degoo and links ~/.local/bin/degoo-rc. An unattended install needs --binary and --no-wizard. Upgrade preserves configuration and cached writes.",
     "uninstall": "With no parameters in a terminal, starts guided cleanup. --inventory is read-only. Removal affects local installation files and owned service/PATH links; remote files remain. Pending writes require retaining both cache and matching configuration.",
@@ -41,6 +42,7 @@ DETAILS = {
     "mount": "Uses the contained vault configuration, cache settings, and mount directory. Keep only one writer using the cache; stop the user service before a foreground mount. Writes persist locally first and upload asynchronously. Ctrl+C ends the foreground session.",
     "stop": "Takes no parameters. Unmounts the contained mount using FUSE. To stop a service-managed mount, use degoo-rc service stop so systemd does not restart it. Cached pending writes remain available for recovery.",
     "status": "Takes no positional parameters. Reports local dirty file counts and bytes; zero pending files does not establish remote integrity. Uses the contained vault configuration.",
+    "sync": "Use sync . from inside the mount, or pass an absolute mounted path. Refreshes remote directory metadata recursively; a file path refreshes its containing directory, and a missing path refreshes its nearest existing directory inside the mount. Preserves pending local writes. Reopen files to see changed content. This command does not upload, mirror, or download the whole directory.",
     "location": "Takes no positional parameters. Contacts Degoo and may renew account tokens. Returns the configured folder ancestry as JSON; does not download file contents.",
     "folders": "Uses the contained account authentication. Defaults to account root ID 0 to discover device folders. --parent-id ID lists children of that folder; output is JSON. Does not modify remote files.",
     "service": "enable links and starts the owned user service; disable stops and unlinks it. start, stop, restart, and status operate on that service. Account lingering is configured separately with loginctl.",
@@ -119,7 +121,7 @@ def show_help(command: str | None = None) -> int:
                 if command == "mount":
                     print("Mount overrides include --read-only, --vfs-cache-max-size SIZE,\n"
                           "--vfs-cache-min-free-space SIZE, --vfs-cache-max-age DURATION,\n"
-                          "--poll-interval DURATION, and --verify-upload=true|false.")
+                          "--dir-cache-time DURATION, and --verify-upload=true|false.")
     if command in DETAILS:
         print(f"\n{DETAILS[command]}")
     return 0

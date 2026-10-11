@@ -97,6 +97,21 @@ degoo-rc setup --parent-id DEVICE_ID --name rclone-degoo-vault
 degoo-rc service enable
 ```
 
+## Remote changes
+
+To refresh remote changes from another client, run `degoo-rc sync .` while
+inside the mounted directory, or pass an absolute mounted file/directory path.
+The selected directory tree is refreshed and pending local writes remain
+intact. Reopen files to see changed content. This refreshes metadata; it does
+not mirror directories or predownload file contents. Older mounts need an
+upgrade and restart to enable this command.
+
+Directory cache staleness is normally up to the remaining 30-minute listing
+TTL plus the next successful request on access. The five-second cache cleanup
+interval does not check remote changes. There is no strict end-to-end maximum
+because provider visibility, open handles, and folder-ID mappings can delay
+external changes. See `docs/USAGE.md` for details.
+
 ## Account trash
 
 The unified command provides separate list and deletion operations for

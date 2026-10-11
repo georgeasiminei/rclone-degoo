@@ -25,7 +25,7 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "connection.py", "restore.py", "backup_config.py")
+SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "connection.py", "restore.py", "backup_config.py", "sync.py")
 SOURCE_SHELL_FILES = ("install.sh", "trash.sh", "uninstall.sh")
 GENERATED_SHELL_FILES = ("info.sh", "logs.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh")
 COMPATIBILITY_SHELL_FILES = (*SOURCE_SHELL_FILES, *GENERATED_SHELL_FILES)
@@ -747,6 +747,9 @@ def shell_wrapper(name: str, root: Path) -> bytes:
         command = f"exec python3 {shell_quote(root / 'scripts/python/uninstall.py')} --root \"$ROOT\" \"$@\""
     elif name == "mount.sh":
         command = (
+            "case $(\"$ROOT/bin/rclone\" degoo mount --help) in\n"
+            "  *--sync-socket*) set -- --sync-socket \"$ROOT/tmp/vfs-sync.sock\" \"$@\";;\n"
+            "esac\n"
             f"exec \"$ROOT/bin/rclone\" --config \"$ROOT/config/rclone.conf\" "
             f"--log-file \"$ROOT/logs/mount.log\" --log-level NOTICE degoo mount "
             f"--settings \"$ROOT/config/mount.json\" \"$ROOT/config/vault.json\" \"$ROOT/mount\" \"$@\""

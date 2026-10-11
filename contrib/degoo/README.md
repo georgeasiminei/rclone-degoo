@@ -132,6 +132,20 @@ not whether the vault password can decrypt remote data; the retained
 
 ## Defaults and use
 
+To refresh another client's remote changes immediately, run `degoo-rc sync .`
+from inside the mounted directory, or pass an absolute mounted path. It
+refreshes the selected directory tree and preserves pending local writes;
+reopen files to see changed content. File paths refresh their containing
+directory. This command refreshes metadata without mirroring directories or
+predownloading file contents. Upgrade and restart an older mount first.
+
+The default directory listing cache lasts 30 minutes and refreshes on access;
+Degoo does not support remote change polling. There is no strict end-to-end
+deadline for another client's changes: provider visibility, request failures,
+open handles, and a separate folder-ID cache can delay them. The five-second
+cache cleanup interval and 750-hour file retention do not control this delay.
+See [remote changes and cache staleness](../../docs/degoo/USAGE.md#remote-changes-and-cache-staleness).
+
 New vaults use 128 MiB plaintext chunks and a provisional 19 GiB encrypted object
 cap. Live Degoo limits above 20 GiB have not been verified. Initial
 `config/mount.json` values are:

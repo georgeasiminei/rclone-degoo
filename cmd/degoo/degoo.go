@@ -130,7 +130,7 @@ func init() {
 	}}
 	initialize.Flags().StringVar(&remote, "remote", "", "Configured raw Degoo remote reserved for this vault (required)")
 	initialize.Flags().StringVar(&cacheDir, "cache-dir", "", "Private persistent cache directory (required)")
-	var settingsFile string
+	var settingsFile, syncSocket string
 	var verifyUpload bool
 	mount := &cobra.Command{Use: "mount vault.json /path/to/mountpoint", Short: "Mount a writable vault with encrypted names, contents, and chunk metadata.", Long: `Mount a private Degoo vault through VFS, chunker, and crypt.
 The configuration must be a private version 1 JSON file. Encryption and full
@@ -140,12 +140,14 @@ to count locally pending files. Only one process may use a vault cache at a time
 Live Degoo behavior is experimental; use a disposable vault first. Upload readback
 verification is enabled by default. The private --settings file may set cache,
 read, mount, and network controls, plus write_back and verify_upload; explicit
-command-line flags take precedence.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
-		return mountVault(c.Context(), args[0], args[1], settingsFile, c.Flags(), verifyUpload)
+command-line flags take precedence. --sync-socket optionally exposes a private
+local Unix socket for targeted VFS cache refreshes.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
+		return mountVault(c.Context(), args[0], args[1], settingsFile, syncSocket, c.Flags(), verifyUpload)
 	}}
 	mountlib.AddFlags(mount.Flags())
 	vfsflags.AddFlags(mount.Flags())
 	mount.Flags().StringVar(&settingsFile, "settings", "", "Private JSON file with optional mount settings")
+	mount.Flags().StringVar(&syncSocket, "sync-socket", "", "Private Unix socket for scoped VFS refresh requests")
 	mount.Flags().BoolVar(&verifyUpload, "verify-upload", true, "Read back and hash each uploaded object before publishing it")
 	status := &cobra.Command{Use: "status vault.json", Short: "Show the number and size of locally pending uploads.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		cfg, err := readConfig(args[0])
@@ -640,7 +642,7 @@ func cacheIdentity(c *VaultConfig, backend string) ([]byte, error) {
 	return []byte(hex.EncodeToString(sum[:]) + "\n"), nil
 }
 
-func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, flags *pflag.FlagSet, verifyUploadFlag bool) error {
+func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSocket string, flags *pflag.FlagSet, verifyUploadFlag bool) error {
 	if err := safeLogging(ctx); err != nil {
 		return err
 	}
@@ -722,7 +724,27 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, 
 	if err != nil {
 		return err
 	}
-	return mnt.Wait()
+	var syncEndpoint *syncEndpoint
+	if syncSocket != "" {
+		syncEndpoint, err = startSyncEndpoint(syncSocket, mnt.VFS, mountDF.DirCacheFlush)
+		if err != nil {
+			unmountErr := mnt.Unmount()
+			if unmountErr != nil {
+				return errors.Join(fmt.Errorf("start sync endpoint: %w", err), fmt.Errorf("unmount after sync endpoint failure: %w", unmountErr))
+			}
+			return fmt.Errorf("start sync endpoint: %w", err)
+		}
+	}
+	waitErr := mnt.Wait()
+	if syncEndpoint != nil {
+		if closeErr := syncEndpoint.Close(); closeErr != nil {
+			if waitErr != nil {
+				return errors.Join(waitErr, closeErr)
+			}
+			return closeErr
+		}
+	}
+	return waitErr
 }
 
 func pending(c *VaultConfig) (files, size int64, err error) {

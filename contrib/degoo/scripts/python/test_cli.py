@@ -94,6 +94,7 @@ class CLITest(unittest.TestCase):
         args = json.loads(result.stdout)
         self.assertIn(str(self.root / "config/vault.json"), args)
         self.assertIn(str(self.root / "mount"), args)
+        self.assertNotIn("--sync-socket", args)
         self.assertEqual(args[-2:], ["--log-file", "a path with spaces"])
         self.assertTrue((self.root / "scripts/mount.sh").is_file())
         self.assertIn("degoo-rc", self.run_cli("help", launcher=link).stdout)
@@ -105,6 +106,21 @@ class CLITest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("empty-trash", result.stdout)
         self.assertEqual(list(self.root.glob("*.sh")), [])
+
+    def test_mount_enables_sync_socket_when_binary_supports_it(self):
+        self.install()
+        binary = self.root / "bin/rclone"
+        binary.write_text(
+            '#!/usr/bin/python3\nimport json, sys\n'
+            'if sys.argv[1:] == ["degoo", "mount", "--help"]:\n'
+            '    print("--sync-socket PATH")\n'
+            'else:\n'
+            '    print(json.dumps(sys.argv[1:]))\n', encoding="utf-8"
+        )
+        result = self.run_cli("mount")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(result.stdout)
+        self.assertEqual(args[args.index("--sync-socket") + 1], str(self.root / "tmp/vfs-sync.sock"))
 
     def test_trash_and_empty_trash_preserve_explicit_native_operations(self):
         self.install()

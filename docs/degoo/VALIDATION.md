@@ -8,6 +8,24 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Scoped mount refresh and remote cache staleness
+
+`degoo-rc sync LOCAL_PATH` requests a recursive metadata refresh through the
+running mount's private Unix socket. Tests cover remote creation, deletion,
+overwrite, nested ancestor refresh, sibling-node preservation, pending local
+writes, failed refresh results, socket permissions/cleanup, and invalid
+requests. Python socket tests cover relative, absolute, file, missing, and
+outside paths; unsafe or missing endpoints; and malformed responses. CLI
+tests verify the wrapper enables the socket only for binaries advertising the
+new flag, so older binaries remain mountable.
+
+All 201 Python helper tests, the full credential-free Go suite, the binary
+build, Degoo command race tests, scoped golangci-lint, package self-check,
+changed Markdown lint, and `git diff --check` passed. Local synthetic remotes
+exercise the actual VFS and Unix HTTP transport without contacting Degoo.
+These checks do not establish live multi-client provider visibility or a
+hard propagation deadline. The installed mount was not changed.
+
 ## Configuration backups, wizard recovery, and connection checks
 
 The wizard offers retained backups before local installation. Offline tests

@@ -967,6 +967,10 @@ def _audit_tree(root: Path) -> list[dict[str, str]]:
                 if info.st_uid != os.getuid() or info.st_mode & 0o022 or info.st_mode & 0o6000:
                     raise CleanupError("an install file has unsafe ownership or permissions")
                 kind = "file"
+            elif stat.S_ISSOCK(info.st_mode) and rel == Path("tmp/vfs-sync.sock"):
+                if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise CleanupError("the mount refresh socket has unsafe ownership or permissions")
+                kind = "socket"
             else:
                 raise CleanupError("special files inside the install are not allowed")
             entries.append({"path": rel.as_posix(), "type": kind})
