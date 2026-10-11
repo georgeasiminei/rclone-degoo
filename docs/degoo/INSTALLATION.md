@@ -242,6 +242,16 @@ are:
 | `bwlimit` | `off` | Aggregate bandwidth limit; accepts rclone rates and timetables. |
 | `timeout` | `5m` | Network I/O idle timeout, not a total transfer deadline. |
 
+Changes published by another client are subject to directory cache staleness.
+The 30-minute directory TTL refreshes on access; the five-second local cache
+cleanup interval does not poll remote changes. Provider visibility and folder-ID
+mapping can delay external changes further, so there is no strict end-to-end
+bound. Use `degoo-rc sync .` inside the mounted directory, or pass an absolute
+mounted path, to refresh its directory tree now while preserving pending writes.
+File paths refresh their parent directory. Reopen files to see changed content.
+After a client upgrade, restart older mounts to enable this command.
+See [remote changes and cache staleness](USAGE.md#remote-changes-and-cache-staleness).
+
 The additional buffering, reading, directory, attribute, concurrency, bandwidth,
 and timeout settings are configured only by editing `config/mount.json`; the
 wizard adds no prompts for them. Existing values survive wizard upgrades.

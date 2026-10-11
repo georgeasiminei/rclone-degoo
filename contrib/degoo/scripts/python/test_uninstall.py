@@ -7,6 +7,7 @@ import fcntl
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,21 @@ import uninstall  # noqa: E402
 
 
 class UninstallTest(unittest.TestCase):
+    def test_inventory_allows_only_the_private_mount_refresh_socket(self) -> None:
+        path = self.root / "tmp/vfs-sync.sock"
+        with socket.socket(socket.AF_UNIX) as control:
+            control.bind(str(path))
+            path.chmod(0o600)
+            self.assertIn({"path": "tmp/vfs-sync.sock", "type": "socket"}, uninstall._audit_tree(self.root))
+            path.chmod(0o660)
+            with self.assertRaises(uninstall.CleanupError):
+                uninstall._audit_tree(self.root)
+        path.unlink()
+        with socket.socket(socket.AF_UNIX) as unexpected:
+            unexpected.bind(str(self.root / "tmp/unexpected.sock"))
+            with self.assertRaises(uninstall.CleanupError):
+                uninstall._audit_tree(self.root)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -74,6 +74,14 @@ uninstalling. File data, cache, and pending uploads are excluded. This supports
 opening the same remote vault on another computer while pending uploads remain
 on their source computer.
 
+`degoo-rc sync LOCAL_PATH` refreshes the mounted directory view through a
+private Unix socket exposing only the refresh operation. It clears the raw
+Degoo folder-ID mapping and refreshes ancestors before the selected subtree,
+using existing VFS forget/refresh behavior to retain pending local writes.
+It does not enable a general remote-control server, mirror directories, or
+promise a provider visibility deadline. Listing expiry remains lazy; clean
+data fingerprints are checked when files reopen.
+
 The folder picker queries account root ID `0` to discover device folders,
 suggests a discovered device ID for new vault creation, and defaults the new
 child name to `rclone-degoo-vault`. Root ID `0` is not accepted as a vault ID or

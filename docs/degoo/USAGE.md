@@ -121,6 +121,54 @@ skips full SHA-256 download verification before publication while retaining
 metadata and publication checks. It defaults to true and is independent of
 the encryption password and cache identity.
 
+## Remote changes and cache staleness
+
+Cache coherence describes keeping cached data consistent with its source;
+cache staleness is the delay before an external change becomes visible.
+The contained mount defaults to `dir_cache_time: "30m"` and disables remote
+change polling because Degoo has no change-notification implementation.
+Each directory is refreshed on access after its listing expires. For an
+actively accessed directory, a server-visible change normally appears within
+the remaining 30-minute interval plus the next successful listing request.
+An idle directory does not actively fetch changes when the timer expires.
+
+This is not a strict end-to-end deadline. The other client must first finish
+publishing its upload, Degoo must expose the new listing, and the request must
+succeed. Open file and directory handles can retain an older view until they
+are reopened. Degoo's separate folder-ID map has no expiry, so external folder
+replacement or renaming can require an explicit refresh or mount restart.
+`cache_poll_interval: "5s"` only schedules local cache cleanup;
+`cache_max_age: "750h"` controls retention of unused clean cached files.
+Neither setting determines remote change visibility. `attr_timeout: "1s"`
+controls an additional kernel attribute cache.
+
+Refresh the current mounted directory tree without waiting for the listing TTL:
+
+```sh
+cd ~/.local/share/rclone-degoo/mount/photos
+degoo-rc sync .
+# An absolute mounted file or directory path also works:
+degoo-rc sync ~/.local/share/rclone-degoo/mount/photos/example.jpg
+```
+
+The command refreshes remote directory metadata recursively. A file path
+refreshes its containing directory; a missing path refreshes its nearest
+existing directory inside the mount. The command also refreshes ancestor
+listings and clears the raw Degoo folder-ID map to resolve moved or replaced folders.
+Paths must belong to the contained mount. Pending local edits stay intact;
+this operation does not upload or mirror directories, predownload all file
+contents, or discard the disk cache. Clean cached content is checked against
+the refreshed remote fingerprint when reopened; vault manifests include SHA1
+for detecting changed logical content. A dirty local version retains priority
+and can later upload over a remote version, so refresh is not conflict merging.
+
+The running mount must support the private refresh endpoint. After upgrading
+an older client, restart the mount or service before using `sync`. A successful
+refresh reports the provider's current listing, not completion of another
+client's upload or immediate replacement of an application's open buffers.
+See rclone's [directory cache documentation](https://rclone.org/commands/rclone_mount/#vfs-directory-cache)
+for the underlying expiry behavior.
+
 ## Persistence and recovery
 
 `fsync` syncs the local VFS cache. Close queues an asynchronous upload. Neither

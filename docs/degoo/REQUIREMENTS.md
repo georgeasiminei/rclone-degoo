@@ -88,6 +88,12 @@ the separate vault secret, automatic renewal, and simple local-file setup.
 
 ### Configuration and data safety
 
+- Explain remote-change cache staleness and distinguish listing freshness from
+  local cache cleanup and data retention. Do not promise a provider visibility
+  deadline that has not been established.
+- Provide `degoo-rc sync [local path]`, including `degoo-rc sync .` from inside
+  the mount, to refresh the selected remote directory view. Preserve pending
+  local edits; this operation must not mirror or delete remote user data.
 - Provide Linux installer and uninstaller wizards with step by step prompts.
   Suggest defaults for settings that can be inferred; account email and
   password have no invented defaults.
