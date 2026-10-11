@@ -230,22 +230,33 @@ sudo chmod 700 -- /mnt/degoo
 sudo chattr +i -- /mnt/degoo
 ```
 
-The Linux mount checks that the directory belongs to the user, refuses to hide
-files already in it, and keeps the underlying directory unwritable while
-unmounted. An immutable flag can prevent unprivileged FUSE mounting because the
-mount process needs write access to the mountpoint. If the mount detects that
-condition, it stops and prints a `sudo chattr -i -- /mnt/degoo` command; clear
-the flag and retry. The mount guard then removes write permission through the
-retained directory handle after mounting and again on failure or unmount. You
-may reapply `chattr +i` while the directory is idle, but clear it before the
-next ordinary-user mount.
+The Linux mount checks that the directory belongs to the user and refuses to
+hide files already in it. You may leave `chattr +i` set on `/mnt/degoo` while
+the mount is running and while it is stopped; the installer never clears it.
+Standard `fusermount3` cannot mount on an immutable directory because the flag
+blocks its required write-access check, even if the directory is
+owner-writable. Keeping the flag set requires an administrator to build and
+install the narrow helper documented in
+[immutable-mount/README.md](../../contrib/degoo/immutable-mount/README.md).
+When this helper is needed, the mount error points to those commands and the
+service command to retry after setup. It does not install privileged files
+automatically. The helper accepts only an empty `/mnt/degoo` owned by the
+mounting user and not writable by group or other users; the default directory
+remains owner-private. It passes that user's ID to the kernel mount, leaves the
+immutable flag unchanged, and rejects `allow_other` and `allow_root`; rclone
+itself runs as the ordinary user. When the flag is absent, the mount guard
+removes write permission through the retained directory handle after mounting
+and again on failure or unmount.
 
 The installer helpers accept `/mnt/degoo` or the legacy in-install `mount`
 directory. Upgrades preserve the recorded mountpoint by default. To migrate an
 older install to `/mnt/degoo`, pass `--mountpoint /mnt/degoo`; migration is
 refused while the old underlying `mount/` directory contains files. Move those
 files out and retry. The external `/mnt/degoo` directory is preserved during
-uninstall.
+uninstall. The privileged helper does not support an immutable legacy
+`mount/` target. For an install whose saved mountpoint is immutable, run
+`degoo-rc install --mountpoint /mnt/degoo` to migrate the saved path while
+preserving the cache. The old underlying `mount/` directory must be empty.
 
 For a new vault, the default chunk size is 128 MiB of plaintext and the
 provisional maximum encrypted object size is 19 GiB. The provider's live limit
@@ -358,9 +369,8 @@ does not establish that the mount is ready: the wizard waits briefly for the
 kernel's mount table to show a connected mount. If requested startup fails or
 remains unconfirmed, installation reports an explicit error and returns a
 nonzero exit status. Completed configuration remains available for retry.
-Known immutable-flag blockers include the exact `sudo chattr -i` command;
-other startup errors include commands to inspect status and logs. Choosing
-manual startup allows installation to finish without mounting. The default
+Startup errors include commands to inspect status and logs. Choosing manual
+startup allows installation to finish without mounting. The default
 mount path is `/mnt/degoo`. Open that directory in a file manager or use it like
 any other directory while mounted. Ordinary files created there while the
 mount is absent remain local-only and are never uploaded; a mount refuses to

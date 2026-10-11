@@ -5,14 +5,12 @@ from __future__ import annotations
 
 import argparse
 import errno
-import fcntl
 import json
 import os
 import re
 import shlex
 import shutil
 import stat
-import struct
 import subprocess
 import sys
 import tempfile
@@ -46,8 +44,6 @@ MAX_MOUNTINFO_LINES = 20000
 MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 MOUNT_STATE_TIMEOUT = 15.0
 MOUNT_STATE_POLL_INTERVAL = 0.25
-FS_IMMUTABLE_FL = 0x00000010
-FS_IOC_GETFLAGS = (2 << 30) | (struct.calcsize("@L") << 16) | (ord("f") << 8) | 1
 
 
 class WizardError(Exception):
@@ -317,26 +313,6 @@ def _observed_mount_state(mountpoint: Path) -> str:
             return "disconnected (ENOTCONN)"
         return "unknown (mountpoint could not be accessed)"
     return "mounted"
-
-
-def _mountpoint_is_immutable(mountpoint: Path) -> bool:
-    """Check the mountpoint's immutable flag without changing filesystem state."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(mountpoint, flags)
-    except OSError:
-        return False
-    try:
-        try:
-            if not stat.S_ISDIR(os.fstat(fd).st_mode):
-                return False
-            value = bytearray(struct.calcsize("@L"))
-            fcntl.ioctl(fd, FS_IOC_GETFLAGS, value, True)
-        except OSError:
-            return False
-        return bool(struct.unpack_from("@L", value)[0] & FS_IMMUTABLE_FL)
-    finally:
-        os.close(fd)
 
 
 def _shell_path(path: Path) -> str:
@@ -738,20 +714,10 @@ def _report_startup_failure(
     *,
     service_result: int | None = None,
     startup_wait_state: str | None = None,
-    immutable: bool = False,
 ) -> None:
     """Report incomplete setup and give safe local recovery commands."""
     command = _degoo_rc(root)
-    if immutable:
-        print(
-            f"Installation incomplete: {mountpoint} has the immutable flag, which blocks an unprivileged FUSE mount.",
-            file=sys.stderr,
-        )
-        print(
-            f"  Clear it manually with `sudo chattr -i -- {shlex.quote(str(mountpoint))}`, then retry with `{command} service enable`.",
-            file=sys.stderr,
-        )
-    elif startup_wait_state is not None:
+    if startup_wait_state is not None:
         state = "".join(character for character in startup_wait_state if character.isprintable())[:160]
         print(
             f"Installation incomplete: the service start did not produce a confirmed mount at {mountpoint} "
@@ -1350,17 +1316,6 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
     if systemd_available and mount_ready:
         if _yes_no("Enable and start the systemd user service?", default=True, input_fn=input_fn):
             mountpoint = installer.configured_mountpoint(root)
-            if _mountpoint_is_immutable(mountpoint):
-                _report_startup_failure(root, mountpoint, immutable=True)
-                _completion_summary(
-                    root,
-                    mount_ready=mount_ready,
-                    systemd_available=systemd_available,
-                    service_requested=True,
-                    service_result=2,
-                    service_error="mountpoint is immutable; service start was skipped",
-                )
-                return 2
             try:
                 service_result = service.run(root, "enable")
             except service.ServiceError as exc:

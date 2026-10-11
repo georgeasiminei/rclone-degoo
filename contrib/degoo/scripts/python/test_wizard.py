@@ -280,28 +280,6 @@ class WizardTest(unittest.TestCase):
             mountinfo.write_bytes(b"x" * (wizard.MAX_MOUNTINFO_BYTES + 1))
             self.assertIn("unknown", wizard._mounted_state(Path("/tmp/degoo"), mountinfo))
 
-    def test_mountpoint_immutable_check_is_read_only_and_tolerates_unsupported_probe(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            mountpoint = Path(temporary) / "mount"
-            mountpoint.mkdir(mode=0o700)
-            mode_before = mountpoint.stat().st_mode
-
-            def write_flags(value: int):
-                def ioctl(_fd: int, _request: int, flags: bytearray, _mutate: bool) -> None:
-                    wizard.struct.pack_into("@L", flags, 0, value)
-                return ioctl
-
-            with mock.patch.object(wizard.fcntl, "ioctl", side_effect=write_flags(wizard.FS_IMMUTABLE_FL)):
-                self.assertTrue(wizard._mountpoint_is_immutable(mountpoint))
-            with mock.patch.object(wizard.fcntl, "ioctl", side_effect=write_flags(0)):
-                self.assertFalse(wizard._mountpoint_is_immutable(mountpoint))
-            with mock.patch.object(wizard.fcntl, "ioctl", side_effect=OSError(errno.ENOTTY, "unsupported")):
-                self.assertFalse(wizard._mountpoint_is_immutable(mountpoint))
-            with mock.patch.object(wizard.fcntl, "ioctl") as ioctl:
-                self.assertFalse(wizard._mountpoint_is_immutable(mountpoint / "missing"))
-            ioctl.assert_not_called()
-            self.assertEqual(mountpoint.stat().st_mode, mode_before)
-
     def test_missing_package_prompt_defaults_to_install(self) -> None:
         with (
             mock.patch.object(wizard, "_package_manager", return_value=("/usr/bin/apt-get", ("install", "-y"))),
@@ -547,11 +525,12 @@ class WizardTest(unittest.TestCase):
                     self.assertIn("Installation incomplete", error_output.getvalue())
                     self.assertIn(f"last check: {error_state}", error_output.getvalue())
 
-    def test_immutable_mountpoint_reports_manual_recovery_without_starting_service(self) -> None:
+    def test_wizard_does_not_preflight_mountpoint_flags_before_service_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
             answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+            output = io.StringIO()
             error_output = io.StringIO()
             with (
                 mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
@@ -562,21 +541,20 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.login, "run", return_value=0),
                 mock.patch.object(wizard.setup, "run", return_value=0),
                 mock.patch.object(wizard, "_save_settings"),
-                mock.patch.object(wizard, "_mountpoint_is_immutable", return_value=True),
-                mock.patch.object(wizard.service, "run") as service_call,
-                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
-                mock.patch.object(wizard.local_info, "service_status", return_value="not configured for this install"),
+                mock.patch.object(wizard.service, "run", return_value=0) as service_call,
+                mock.patch.object(wizard, "_wait_for_mount", return_value="mounted"),
+                mock.patch.object(wizard, "_observed_mount_state", return_value="mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
                 contextlib.redirect_stderr(error_output),
-                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stdout(output),
             ):
                 result = wizard._run(args, input_fn=lambda _: next(answers))
 
-        self.assertEqual(result, 2)
-        service_call.assert_not_called()
-        self.assertIn("Installation incomplete", error_output.getvalue())
-        self.assertIn("immutable", error_output.getvalue())
-        self.assertIn(f"sudo chattr -i -- {root / 'mount'}", error_output.getvalue())
-        self.assertIn("degoo-rc service enable", error_output.getvalue())
+        self.assertEqual(result, 0)
+        service_call.assert_called_once_with(root, "enable")
+        self.assertEqual(error_output.getvalue(), "")
+        self.assertIn("Mount point:", output.getvalue())
+        self.assertIn("mounted", output.getvalue())
 
     def test_declining_systemd_start_keeps_manual_install_successful(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -15,7 +15,10 @@ provider ID or private path is recorded here. This does not establish reliable
 automatic renewal. A later fresh installation mounted successfully after
 clearing the external mountpoint's immutable flag; local health reported no
 errors. Live limits above 20 GiB, pagination beyond 1,000 entries, and upload
-recovery under Degoo's consistency model also remain unverified.
+recovery under Degoo's consistency model also remain unverified. Native Linux
+acceptance now confirms that the administrator-installed helper mounts and
+unmounts `/mnt/degoo` while retaining its immutable flag, using generated local
+encrypted data. This does not establish live Degoo provider behavior.
 
 ## Implementation decisions and validation plan
 
@@ -23,9 +26,16 @@ recovery under Degoo's consistency model also remain unverified.
 
 When automatic startup is selected, a rejected service request or an
 unconfirmed connected mount ends installation with an explicit error and a
-nonzero exit status. Known immutable mountpoint flags are reported before
-requesting service startup, with the command needed to retry. Completed
-configuration and local cache are preserved. Manual startup remains optional.
+nonzero exit status. When an immutable `/mnt/degoo` has no valid helper, mount
+startup fails with an explicit diagnostic that points to the installed
+`immutable-mount/README.md` and tells the user to build and install the helper,
+then run `degoo-rc service enable` to retry setup. For an already enabled
+service, run `degoo-rc service restart`. The
+[helper instructions](../../contrib/degoo/immutable-mount/README.md) describe
+the administrator build and install commands. Installation preserves
+configuration and the local cache while these steps are pending. It never
+clears the flag or installs privileged files itself. Manual startup remains
+optional.
 
 ### Complete local cleanup and interrupted-uninstall recovery
 
@@ -59,11 +69,24 @@ directory to be empty, and uninstall leaves the external directory in place.
 The mount creates an owner-private directory when possible, refuses to cover
 local files, and protects the underlying directory after mounting and on
 failure or unmount. If setup cannot create it, diagnostics print privileged
-`mkdir`, `chown`, `chmod`, and `chattr +i` commands. An immutable directory can
-block unprivileged FUSE mounting; the mount reports a `sudo chattr -i` command
-when the current user lacks write access. Clear the flag before retrying; the
-mount guard then protects the underlying directory by removing write
-permissions through its retained directory handle.
+`mkdir`, `chown`, `chmod`, and `chattr +i` commands. An immutable flag may stay
+set across mounts at `/mnt/degoo`. Standard `fusermount3` rejects the required
+write-access check for an immutable directory even when it is owner-writable.
+Mounting with the flag retained therefore requires the documented manually
+installed helper at `/usr/local/libexec/rclone-degoo/fusermount3`. It can mount
+only an empty `/mnt/degoo` owned by the caller and not writable by group or
+other users; the default directory remains owner-private. It leaves the flag
+unchanged and runs rclone as the ordinary user. It rejects `allow_other` and
+`allow_root`. Mount launch selects this helper only after checking its root
+ownership, protected permissions, and setuid bit; ordinary mutable mountpoints
+continue to use the system helper. No privileged helper is installed
+automatically. If the immutable mountpoint lacks a valid helper, diagnostics
+print build/install instructions and the service command to retry. The
+immutable legacy in-install `mount/` location is not supported by this helper;
+migrate to `/mnt/degoo` to use it, after ensuring the old underlying mount
+directory is empty. Run `degoo-rc install --mountpoint /mnt/degoo` to change the
+saved path while preserving the cache. That legacy-path limitation remains a
+compatibility exception to the earlier mountpoint requirement.
 
 Status output places authentication errors first. Private `status.log` and
 `diagnostics.log` capture the relevant helper and Degoo diagnostics; displayed
@@ -71,9 +94,11 @@ command errors omit Cobra usage blocks and redact recognized credentials.
 The final repository-wide test suite, scoped race and lint checks, Python
 helper tests, package self-check, native FUSE upload-status smoke test, and
 changed-document lint passed; details are recorded in [VALIDATION.md](VALIDATION.md).
-The external mountpoint's immutable flag blocked ordinary-user FUSE mounting.
-After clearing it, the service reached a connected mount and the local health
-check returned success without writing remote file data.
+Earlier validation mounted successfully only after clearing the immutable
+flag. Native Linux acceptance now establishes the retained-flag mount path
+with generated local encrypted data; no Degoo network request or customer data
+was involved. The ordinary FUSE helper still cannot pass its write-access
+check for an immutable directory.
 
 Upload timing separates the local close delay from transfer, registration,
 verification, and publication. The installer exposes a positive `write_back`

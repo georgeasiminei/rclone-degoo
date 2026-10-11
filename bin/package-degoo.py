@@ -56,6 +56,8 @@ PACKAGE_ENTRIES = (
     ("contrib/degoo/degoo-rc", "degoo-rc"),
     *((f"contrib/degoo/{name}", name) for name in SHELL_LAUNCHERS if name.startswith("scripts/")),
     ("contrib/degoo/DISTRIBUTION.md", "README.md"),
+    ("contrib/degoo/immutable-mount/helper.c", "immutable-mount/helper.c"),
+    ("contrib/degoo/immutable-mount/README.md", "immutable-mount/README.md"),
     *((f"contrib/degoo/scripts/python/{name}", f"scripts/python/{name}") for name in PYTHON_HELPERS),
     *((f"docs/degoo/{name}", f"docs/{name}") for name in DOC_FILES),
     ("COPYING", "licenses/COPYING"),
@@ -590,6 +592,8 @@ def self_check(root: Path) -> None:
             f"{ROOT_NAME}/licenses/COPYING",
             f"{ROOT_NAME}/licenses/degoo-NOTICE",
             f"{ROOT_NAME}/docs/BUILD.json",
+            f"{ROOT_NAME}/immutable-mount/helper.c",
+            f"{ROOT_NAME}/immutable-mount/README.md",
         }
         required_paths.update(f"{ROOT_NAME}/scripts/python/{name}" for name in PYTHON_HELPERS)
         required_paths.update(f"{ROOT_NAME}/docs/{name}" for name in DOC_FILES)

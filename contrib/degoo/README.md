@@ -261,10 +261,29 @@ installer cannot prepare it, it prints the privileged setup commands. Upgrades
 preserve their saved mount path. To migrate an older install, choose
 `--mountpoint /mnt/degoo`; migration is refused while the old underlying
 directory contains files. The external mount directory remains after uninstall.
-If you set `chattr +i` to protect it while idle, clear the flag with
-`sudo chattr -i -- /mnt/degoo` before mounting; it can prevent unprivileged
-FUSE setup. The mount protects the underlying directory by removing write
-permissions after mounting and on failure or unmount.
+The privileged helper does not support an immutable legacy `mount/` target.
+For an install whose saved mountpoint is immutable, run
+`degoo-rc install --mountpoint /mnt/degoo` to migrate the saved path while
+preserving the cache. The old underlying `mount/` directory must be empty.
+
+You may leave `chattr +i` set on `/mnt/degoo` while mounted and unmounted. The
+flag blocks the write-access check required by standard `fusermount3`, even
+when the directory is owner-writable. Mounting with the flag retained requires
+the administrator-installed helper in
+[immutable-mount/README.md](immutable-mount/README.md); the installer never
+clears the flag or installs privileged files. The helper is limited to an
+empty `/mnt/degoo` owned by the invoking user and not writable by group or
+other users; the default directory remains owner-private. It mounts with that
+user's ID, rejects `allow_other` and `allow_root`, and leaves rclone running as
+the ordinary user. The mount launcher checks the helper's root ownership,
+protected permissions, and setuid bit, then selects it only for an immutable
+mount. Ordinary mutable mounts continue using the system FUSE helper. When the
+immutable flag is absent, the mount protects the underlying directory by
+removing write permissions after mounting and on failure or unmount.
+
+After an administrator installs the helper, retry a new service setup with
+`degoo-rc service enable`. If the service is already enabled, restart it with
+`degoo-rc service restart`.
 The installed `degoo-rc` command is available on `PATH`:
 
 ```sh

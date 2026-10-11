@@ -46,9 +46,13 @@ for users who manage their own paths and services.
 ## Setup
 
 Build this fork with `go build`. Linux FUSE and `fusermount3` must be installed
-to run the mount. Choose a dedicated Degoo folder and obtain its folder ID
-without changing existing personal files. Use a separate private directory
-for account tokens and the vault configuration:
+to run an ordinary mount. If the mountpoint has `chattr +i`, standard
+`fusermount3` cannot mount it even when it is owner-writable; retaining that
+flag at `/mnt/degoo` requires the administrator-installed helper described in
+[immutable-mount/README.md](../../contrib/degoo/immutable-mount/README.md).
+Choose a dedicated Degoo folder and obtain its folder ID without changing
+existing personal files. Use a separate private directory for account tokens
+and the vault configuration:
 
 ```sh
 install -d -m 700 ~/.config/rclone-degoo
