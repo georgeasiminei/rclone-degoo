@@ -25,7 +25,7 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py")
+SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "connection.py", "restore.py", "backup_config.py")
 SOURCE_SHELL_FILES = ("install.sh", "trash.sh", "uninstall.sh")
 GENERATED_SHELL_FILES = ("info.sh", "logs.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh")
 COMPATIBILITY_SHELL_FILES = (*SOURCE_SHELL_FILES, *GENERATED_SHELL_FILES)
@@ -1212,6 +1212,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--folder-id", help="ID of an existing dedicated Degoo folder (account root 0 is refused)")
     parser.add_argument("--folder-name", help="optional human-readable name for the dedicated folder")
     parser.add_argument("--vault-config", help="private existing vault configuration to import on another machine")
+    parser.add_argument("--restore-directory", help="private retained backup directory to restore through the interactive wizard")
     parser.add_argument("--upgrade", action="store_true", help="update the contained client while preserving its vault, login, settings, and cache")
     parser.add_argument("--folder-created-by-setup", action="store_true", help=argparse.SUPPRESS)
     return parser
@@ -1225,6 +1226,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.wizard or (not arguments and sys.stdin.isatty()):
             import wizard
             return wizard.run(args)
+        if args.restore_directory:
+            parser.error("--restore-directory requires --wizard")
         if not args.binary:
             parser.error("--binary is required for noninteractive installation; use --wizard for guided setup")
         return install(args)

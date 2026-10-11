@@ -8,6 +8,33 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Configuration backups, wizard recovery, and connection checks
+
+The wizard offers retained backups before local installation. Offline tests
+cover recovered defaults, preservation of vault secrets and pending files,
+refusal of unsafe or changed backups, and exclusive cache ownership. Saved
+account credentials are tested before requesting a password; authentication
+rejection and provider/network failure follow separate paths. Folder discovery
+reports name collisions and requires the original vault configuration to reuse
+an existing encrypted folder.
+
+`backup-config` creates a portable private configuration and credentials
+backup without copying cache or file data. Checks cover restore-compatible
+metadata and settings, source preservation, safe destination handling, and
+actual CLI dispatch. Existing pending writes remain on their source computer.
+
+The binary build, full credential-free Go suite, Degoo command race tests,
+scoped golangci-lint, and package self-check passed. A synthetic retained backup
+was restored with the actual built binary: pending bytes were copied, the cache
+identity was rebound offline, the original backup stayed intact, and repeating
+the identity rebind succeeded. All 185 Python helper tests passed, including
+the complete restored-install flow with provider calls mocked. Markdown lint and
+`git diff --check` passed.
+
+These checks did not use live account credentials, change the installed mount,
+or establish live provider acceptance. Backup recovery requires a fresh local
+installation; it does not merge caches into an existing installation.
+
 ## Config-only mount tuning and installer defaults
 
 The installer defaults match the last deployment: 60 GiB cache size and

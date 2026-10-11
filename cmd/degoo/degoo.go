@@ -161,6 +161,7 @@ command-line flags take precedence.`, Args: cobra.ExactArgs(2), RunE: func(c *co
 	}}
 	root.AddCommand(initialize, login, logout, mount, status)
 	addSetupCommands(root)
+	addRestoreCommands(root)
 	addTrashCommands(root)
 }
 
@@ -600,15 +601,10 @@ func bindCache(c *VaultConfig, base rfs.Fs) error {
 	if df, ok := base.(*degoobackend.Fs); ok {
 		backend += "\x00" + df.RootFolderID()
 	}
-	identity, err := json.Marshal(struct {
-		Config  *VaultConfig
-		Backend string
-	}{c, backend})
+	data, err := cacheIdentity(c, backend)
 	if err != nil {
 		return err
 	}
-	sum := sha256.Sum256(identity)
-	data := []byte(hex.EncodeToString(sum[:]) + "\n")
 	filename := filepath.Join(c.CacheDir, c.cacheName()+".identity")
 	old, err := auth.ReadPrivateFile(filename)
 	if os.IsNotExist(err) {
@@ -630,6 +626,18 @@ func bindCache(c *VaultConfig, base rfs.Fs) error {
 		return errors.New("vault settings differ from this cache; restore the original settings to recover pending writes")
 	}
 	return nil
+}
+
+func cacheIdentity(c *VaultConfig, backend string) ([]byte, error) {
+	identity, err := json.Marshal(struct {
+		Config  *VaultConfig
+		Backend string
+	}{c, backend})
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(identity)
+	return []byte(hex.EncodeToString(sum[:]) + "\n"), nil
 }
 
 func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, flags *pflag.FlagSet, verifyUploadFlag bool) error {

@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 import re
 import shutil
 import stat
@@ -1324,9 +1325,9 @@ def uninstall(args: argparse.Namespace) -> int:
         print(
             "Removed the isolated local Degoo install. Pending local uploads "
             f"({pending_files} files, {pending_bytes} bytes) were preserved in {retention_directory}. "
-            f"To resume them, restore that directory's contents to {expected_root()}, then run "
-            "`./contrib/degoo/degoo-rc install --binary "
-            f"{expected_root()}/bin/rclone --upgrade` from the rclone-degoo project checkout. "
+            "To resume them, run `./contrib/degoo/degoo-rc install --wizard "
+            f"--restore-directory {shlex.quote(str(retention_directory))}` from the project checkout "
+            "or use the extracted package's degoo-rc installer. "
             "Degoo remote data was left untouched."
         )
     else:

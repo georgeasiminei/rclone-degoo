@@ -63,6 +63,24 @@ go build -o build/rclone .
 
 Pass `--binary ./build/rclone` to choose a specific binary.
 
+To mount the same vault on another computer, create a configuration backup on
+the configured computer, then transfer it privately:
+
+```sh
+degoo-rc backup-config --directory ~/private-backups/rclone-degoo
+```
+
+This backs up configuration and credentials only, including the vault key and
+account tokens. File data, cache, and pending uploads are excluded. On the new
+computer, the installer offers a backup directory as its first prompt, or use:
+
+```sh
+./degoo-rc install --wizard --restore-directory ~/private-backups/rclone-degoo
+```
+
+Recovered settings become defaults and a successful saved-account connection
+check skips the password prompt. Restoration requires a fresh local install.
+
 For an unattended or staged source install, keep the `--binary` option and add
 `--no-wizard`:
 
@@ -179,9 +197,10 @@ Leave the existing folder ID and vault-config import prompts blank.
 
 If uploads are pending, cleanup refuses to discard the cache. To recover those
 changes, retain both the cache and its matching configuration. Restore the
-backup to `~/.local/share/rclone-degoo`, then run the package launcher with
-`--binary ~/.local/share/rclone-degoo/bin/rclone --upgrade --no-wizard` to
-recreate the installed launchers.
+retained backup into a fresh installation with
+`./degoo-rc install --wizard --restore-directory BACKUP_DIRECTORY`.
+The wizard copies the saved cache and keeps the original backup untouched.
+The separate `backup-config` command excludes cached files and pending uploads.
 
 If you choose not to retain the vault configuration, type `DISCARD` to confirm
 losing the local secret. Type `REMOVE` to confirm local cleanup. Uninstall
