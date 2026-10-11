@@ -8,6 +8,7 @@ import io
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -222,6 +223,22 @@ class UninstallTest(unittest.TestCase):
         self.assertFalse(os.path.lexists(link))
         self.assertFalse(self.root.exists())
 
+    def test_uninstall_recovers_exact_unrecorded_path_link(self) -> None:
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(parents=True, mode=0o700)
+        bin_dir.chmod(0o700)
+        link = bin_dir / "degoo-rc"
+        (self.root / "degoo-rc").write_text("#!/bin/sh\n", encoding="ascii")
+        (self.root / "degoo-rc").chmod(0o700)
+        link.symlink_to(self.root / "degoo-rc")
+
+        code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("owned ~/.local/bin/degoo-rc command link was removed", stdout)
+        self.assertFalse(os.path.lexists(link))
+        self.assertFalse(self.root.exists())
+
     def test_uninstall_preserves_changed_recorded_path_link_and_install(self) -> None:
         bin_dir = self.home / ".local/bin"
         bin_dir.mkdir(parents=True, mode=0o700)
@@ -343,6 +360,15 @@ class UninstallTest(unittest.TestCase):
         self.assertIn("Cancelled", stdout)
         self.assertTrue(self.root.exists())
 
+    def test_wizard_interrupt_during_requested_removal_reports_incomplete(self) -> None:
+        with mock.patch.object(uninstall, "_acquire_cache_lock", side_effect=KeyboardInterrupt):
+            code, stdout, stderr = self.invoke_terminal("n\nn\nn\nDISCARD\nREMOVE\n")
+
+        self.assertEqual(code, 2)
+        self.assertIn("uninstall incomplete", stderr)
+        self.assertNotIn("Cancelled; the local install was left unchanged", stdout)
+        self.assertTrue(self.root.exists())
+
     def test_pending_uploads_can_be_retained_only_with_config_and_cache(self) -> None:
         destination = self.base / "pending-recovery"
         self.write_private(self.root / "cache/pending.bin", b"pending bytes")
@@ -453,6 +479,153 @@ class UninstallTest(unittest.TestCase):
             code, _, stderr = self.invoke("--delete-local", "--discard-vault-secret")
         self.assertEqual(code, 2)
         self.assertIn("unexpected mount exists inside", stderr)
+        self.assertTrue(self.root.exists())
+
+    def test_immutable_legacy_mountpoint_refuses_before_removing_owned_links(self) -> None:
+        direct, wanted, unit = self._add_owned_service_links()
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(mode=0o700)
+        bin_dir.chmod(0o700)
+        (self.root / "degoo-rc").write_text("#!/bin/sh\n", encoding="ascii")
+        (self.root / "degoo-rc").chmod(0o700)
+        path_link = bin_dir / "degoo-rc"
+        path_link.symlink_to(self.root / "degoo-rc")
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["path_link"] = str(path_link)
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+        (self.root / "mount").chmod(0o500)
+        calls, fake = self._fake_systemctl(direct, wanted, unit)
+
+        def get_immutable_flags(fd: int, request: int, flags: bytearray, mutate: bool) -> int:
+            del fd, request, mutate
+            struct.pack_into("@L", flags, 0, uninstall.FS_IMMUTABLE_FL)
+            return 0
+
+        with (
+            mock.patch.object(uninstall.fcntl, "ioctl", side_effect=get_immutable_flags),
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"sudo chattr -i -- {self.root / 'mount'}", stderr)
+        self.assertNotIn("Removed the isolated local Degoo install", stdout)
+        self.assertEqual(calls, [])
+        self.assertTrue(direct.is_symlink())
+        self.assertTrue(wanted.is_symlink())
+        self.assertTrue(path_link.is_symlink())
+        self.assertTrue(self.root.exists())
+
+    def test_read_only_install_directory_can_be_removed(self) -> None:
+        self.write_private(self.root / "logs/old.log", b"old diagnostic")
+        self.root.chmod(0o500)
+        (self.root / "mount").chmod(0o500)
+        (self.root / "logs").chmod(0o500)
+
+        code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("Removed the isolated local Degoo install", stdout)
+        self.assertFalse(self.root.exists())
+
+    def test_cleanup_refuses_success_if_install_root_remains(self) -> None:
+        with mock.patch.object(uninstall, "_remove_root"):
+            code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 2)
+        self.assertIn("install root remains after cleanup", stderr)
+        self.assertNotIn("Removed the isolated local Degoo install", stdout)
+        self.assertTrue(self.root.exists())
+
+    def test_cleanup_refuses_success_if_owned_path_link_reappears(self) -> None:
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(mode=0o700)
+        bin_dir.chmod(0o700)
+        (self.root / "degoo-rc").write_text("#!/bin/sh\n", encoding="ascii")
+        (self.root / "degoo-rc").chmod(0o700)
+        path_link = bin_dir / "degoo-rc"
+        path_link.symlink_to(self.root / "degoo-rc")
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["path_link"] = str(path_link)
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+        remove_root = uninstall._remove_root
+
+        def remove_root_and_restore_link(root: Path) -> None:
+            remove_root(root)
+            path_link.symlink_to(root / "degoo-rc")
+
+        with mock.patch.object(uninstall, "_remove_root", side_effect=remove_root_and_restore_link):
+            code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 2)
+        self.assertIn("owned PATH command link remains after cleanup", stderr)
+        self.assertNotIn("Removed the isolated local Degoo install", stdout)
+        self.assertFalse(self.root.exists())
+        self.assertTrue(path_link.is_symlink())
+
+    def test_cleanup_verification_does_not_treat_lstat_errors_as_absence(self) -> None:
+        with (
+            mock.patch.object(uninstall.os, "lstat", side_effect=PermissionError("denied")),
+            self.assertRaisesRegex(uninstall.CleanupError, "could not be verified safely"),
+        ):
+            uninstall._verify_cleanup(self.root, [], False)
+
+    def test_successful_uninstall_preserves_external_mountpoint(self) -> None:
+        external_mount = self.base / "mnt/degoo"
+        external_mount.mkdir(parents=True, mode=0o700)
+        external_mount.chmod(0o500)
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["mountpoint"] = install.DEFAULT_MOUNTPOINT
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+
+        with (
+            mock.patch.object(install, "configured_mountpoint", return_value=external_mount),
+            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
+        ):
+            code, _, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(external_mount.is_dir())
+        self.assertEqual(external_mount.stat().st_mode & 0o777, 0o500)
+        self.assertFalse(self.root.exists())
+
+    def test_external_mount_selection_refuses_nonempty_contained_mount_before_cleanup(self) -> None:
+        external_mount = self.base / "mnt/degoo"
+        external_mount.mkdir(parents=True, mode=0o700)
+        (self.root / "mount/local-state").write_text("keep", encoding="ascii")
+        (self.root / "mount").chmod(0o500)
+        direct, wanted, unit = self._add_owned_service_links()
+        bin_dir = self.home / ".local/bin"
+        bin_dir.mkdir(mode=0o700)
+        bin_dir.chmod(0o700)
+        (self.root / "degoo-rc").write_text("#!/bin/sh\n", encoding="ascii")
+        (self.root / "degoo-rc").chmod(0o700)
+        path_link = bin_dir / "degoo-rc"
+        path_link.symlink_to(self.root / "degoo-rc")
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["path_link"] = str(path_link)
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+        calls, fake = self._fake_systemctl(direct, wanted, unit)
+
+        with (
+            mock.patch.object(install, "configured_mountpoint", return_value=external_mount),
+            mock.patch.object(uninstall, "read_mountpoints", return_value={str(external_mount)}),
+            mock.patch.object(uninstall.subprocess, "run", side_effect=fake),
+            mock.patch.object(uninstall, "_unmount") as unmount,
+        ):
+            code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 2)
+        self.assertIn("unused contained mount directory contains local files", stderr)
+        self.assertNotIn("Removed the isolated local Degoo install", stdout)
+        self.assertEqual(calls, [])
+        unmount.assert_not_called()
+        self.assertTrue(direct.is_symlink())
+        self.assertTrue(wanted.is_symlink())
+        self.assertTrue(path_link.is_symlink())
+        self.assertEqual((self.root / "mount").stat().st_mode & 0o777, 0o500)
+        self.assertEqual((self.root / "mount/local-state").read_text(encoding="ascii"), "keep")
         self.assertTrue(self.root.exists())
 
     def test_unmount_targets_only_the_isolated_mountpoint(self) -> None:

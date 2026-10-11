@@ -140,6 +140,10 @@ the separate vault secret, automatic renewal, and simple local-file setup.
 - Offer to keep selected local state during uninstall. Preserve pending
   changes and the configuration needed to recover them; remote removal is
   separate from removing the local installation.
+- Uninstall returns an error when any required local cleanup fails or cannot
+  be verified. It reports success only after the installation directory and
+  its owned command and service links are absent. Explain incomplete cleanup
+  and the action needed to retry, including immutable directory flags.
 - Keep scripts organized in their own directories, including a Python
   subdirectory. Select a dedicated vault under a discovered Degoo device
   folder by default when creation at account root ID `0` is unsupported.

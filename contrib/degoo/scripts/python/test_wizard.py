@@ -451,6 +451,142 @@ class WizardTest(unittest.TestCase):
         self.assertLess(events.index("service:stop"), events.index("runtime"))
         self.assertLess(events.index("runtime"), events.index("install"))
 
+    def test_upgrade_allows_missing_links_when_systemd_confirms_no_loaded_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            config_home = Path(temporary) / "home/.config"
+            direct = config_home / "systemd/user/rclone-degoo.service"
+            manifest = {"service_config_home": str(config_home), "service_links": [str(direct)]}
+            systemd_state = {"LoadState": "not-found", "ActiveState": "inactive", "FragmentPath": ""}
+            with (
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="unknown (owned service link is missing)"),
+                mock.patch.object(wizard.service, "_load_manifest", return_value=manifest),
+                mock.patch.object(wizard.cleanup, "_systemctl_service_state", return_value=systemd_state),
+                mock.patch.object(wizard.service, "run", side_effect=wizard.service.ServiceError("must not stop an unloaded service")) as service_call,
+            ):
+                wizard._prepare_upgrade_mount(root, manifest, input_fn=lambda _: "")
+
+        service_call.assert_not_called()
+
+    def test_upgrade_allows_missing_links_when_owned_loaded_service_is_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            config_home = Path(temporary) / "home/.config"
+            direct = config_home / "systemd/user/rclone-degoo.service"
+            manifest = {"service_config_home": str(config_home), "service_links": [str(direct)]}
+            systemd_state = {
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "FragmentPath": str(root / wizard.service.UNIT_NAME),
+            }
+            with (
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="unknown (owned service link is missing)"),
+                mock.patch.object(wizard.service, "_load_manifest", return_value=manifest),
+                mock.patch.object(wizard.cleanup, "_systemctl_service_state", return_value=systemd_state),
+                mock.patch.object(wizard.cleanup, "_stop_owned_service") as stop_owned,
+                mock.patch.object(wizard.service, "run") as service_call,
+            ):
+                wizard._prepare_upgrade_mount(root, manifest, input_fn=lambda _: "")
+
+        stop_owned.assert_not_called()
+        service_call.assert_not_called()
+
+    def test_upgrade_stops_active_loaded_owned_service_when_links_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            config_home = Path(temporary) / "home/.config"
+            direct = config_home / "systemd/user/rclone-degoo.service"
+            manifest = {"service_config_home": str(config_home), "service_links": [str(direct)]}
+            active = {"LoadState": "loaded", "ActiveState": "active", "FragmentPath": str(root / wizard.service.UNIT_NAME)}
+            inactive = {"LoadState": "not-found", "ActiveState": "inactive", "FragmentPath": ""}
+            with (
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="unknown (owned service link is missing)"),
+                mock.patch.object(wizard.service, "_load_manifest", return_value=manifest),
+                mock.patch.object(wizard.cleanup, "_systemctl_service_state", side_effect=(active, active, inactive)),
+                mock.patch.object(wizard.cleanup, "_stop_owned_service", return_value={str(root / wizard.service.UNIT_NAME)}) as stop_owned,
+                mock.patch.object(wizard.service, "run") as service_call,
+                mock.patch.object(wizard, "_wait_for_mount_state", return_value="not mounted"),
+            ):
+                wizard._prepare_upgrade_mount(root, manifest, input_fn=lambda _: "")
+
+        stop_owned.assert_called_once_with(root, manifest)
+        service_call.assert_not_called()
+
+    def test_upgrade_refuses_if_owned_service_remains_active_after_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            config_home = Path(temporary) / "home/.config"
+            direct = config_home / "systemd/user/rclone-degoo.service"
+            manifest = {"service_config_home": str(config_home), "service_links": [str(direct)]}
+            active = {"LoadState": "loaded", "ActiveState": "active", "FragmentPath": str(root / wizard.service.UNIT_NAME)}
+            with (
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="unknown (owned service link is missing)"),
+                mock.patch.object(wizard.service, "_load_manifest", return_value=manifest),
+                mock.patch.object(wizard.cleanup, "_systemctl_service_state", return_value=active),
+                mock.patch.object(wizard.cleanup, "_stop_owned_service") as stop_owned,
+                mock.patch.object(wizard.service, "run") as service_call,
+                self.assertRaisesRegex(wizard.WizardError, "remains active after the stop request"),
+            ):
+                wizard._prepare_upgrade_mount(root, manifest, input_fn=lambda _: "")
+
+        stop_owned.assert_called_once_with(root, manifest)
+        service_call.assert_not_called()
+
+    def test_upgrade_refuses_missing_links_when_systemd_state_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            config_home = Path(temporary) / "home/.config"
+            direct = config_home / "systemd/user/rclone-degoo.service"
+            manifest = {"service_config_home": str(config_home), "service_links": [str(direct)]}
+            with (
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="unknown (owned service link is missing)"),
+                mock.patch.object(wizard.service, "_load_manifest", return_value=manifest),
+                mock.patch.object(wizard.cleanup, "_systemctl_service_state", side_effect=wizard.cleanup.CleanupError("manager unavailable")),
+                mock.patch.object(wizard.cleanup, "_stop_owned_service") as stop_owned,
+                mock.patch.object(wizard.service, "run") as service_call,
+                self.assertRaisesRegex(wizard.WizardError, "systemd.*verify|verify.*systemd"),
+            ):
+                wizard._prepare_upgrade_mount(root, manifest, input_fn=lambda _: "")
+
+        stop_owned.assert_not_called()
+        service_call.assert_not_called()
+
+    def test_upgrade_refuses_to_stop_unrelated_unit_when_links_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir(mode=0o700)
+            config_home = Path(temporary) / "home/.config"
+            direct = config_home / "systemd/user/rclone-degoo.service"
+            manifest = {"service_config_home": str(config_home), "service_links": [str(direct)]}
+            unrelated = {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "FragmentPath": str(Path(temporary) / "other/rclone-degoo.service"),
+            }
+            with (
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="unknown (owned service link is missing)"),
+                mock.patch.object(wizard.service, "_load_manifest", return_value=manifest),
+                mock.patch.object(wizard.cleanup, "_systemctl_service_state", return_value=unrelated),
+                mock.patch.object(wizard.cleanup, "_stop_owned_service") as stop_owned,
+                mock.patch.object(wizard.service, "run") as service_call,
+                self.assertRaisesRegex(wizard.WizardError, "another unit|different unit|ownership"),
+            ):
+                wizard._prepare_upgrade_mount(root, manifest, input_fn=lambda _: "")
+
+        stop_owned.assert_not_called()
+        service_call.assert_not_called()
+
     def test_upgrade_without_owned_service_uses_contained_stop_wrapper(self) -> None:
         root = Path("/tmp/degoo-test-install")
         with (

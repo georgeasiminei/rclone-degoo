@@ -437,6 +437,61 @@ def _mount_state_error(root: Path, detail: str) -> WizardError:
     )
 
 
+def _missing_service_state_error(root: Path, detail: str) -> WizardError:
+    return WizardError(
+        "the recorded Degoo service links are missing and systemd could not verify a safe unit state "
+        f"({detail}); refusing to upgrade. Check the unit identity before restoring this install's links.\n"
+        f"# Inspect this install\n  {_degoo_rc(root, 'info')}\n\n"
+        f"# Restore links only after confirming this unit belongs to this install\n  {_degoo_rc(root, 'service', 'enable')}"
+    )
+
+
+def _missing_service_state(root: Path, manifest: dict[str, Any]) -> str:
+    """Verify the user-manager state when this install's recorded links are absent."""
+    try:
+        checked_manifest = service._load_manifest(root)
+        if checked_manifest != manifest:
+            raise cleanup.CleanupError("the install manifest changed during upgrade preflight")
+        links, recorded = cleanup._owned_service_links(root, checked_manifest)
+        if not recorded or links:
+            raise cleanup.CleanupError("the recorded service links changed during upgrade preflight")
+        state = cleanup._systemctl_service_state()
+    except (cleanup.CleanupError, service.ServiceError, installer.InstallError, OSError) as exc:
+        raise _missing_service_state_error(root, str(exc)) from None
+
+    unit = service._unit_path(root)
+    allowed_fragments = {str(unit), *recorded}
+    fragment = state["FragmentPath"]
+    load_state = state["LoadState"]
+    active_state = state["ActiveState"]
+    if fragment:
+        if not Path(fragment).is_absolute() or os.path.normpath(fragment) not in allowed_fragments:
+            raise _missing_service_state_error(root, "systemd resolved the service name to a different unit")
+        if load_state != "loaded":
+            raise _missing_service_state_error(root, "systemd returned an unexpected loaded-unit state")
+        if active_state in {"active", "activating", "deactivating", "reloading"}:
+            return "active"
+        if active_state in {"inactive", "failed"}:
+            return "inactive"
+        raise _missing_service_state_error(root, "systemd could not identify the loaded unit's active state")
+    if load_state == "not-found" and active_state == "inactive":
+        return "inactive"
+    raise _missing_service_state_error(root, "systemd could not verify that the service is unloaded and inactive")
+
+
+def _stop_missing_link_service(root: Path, manifest: dict[str, Any]) -> None:
+    """Stop an active unit only after its loaded fragment matches this install."""
+    try:
+        cleanup._stop_owned_service(root, manifest)
+    except (cleanup.CleanupError, OSError) as exc:
+        raise _missing_service_state_error(root, str(exc)) from None
+    if _missing_service_state(root, manifest) != "inactive":
+        raise WizardError(
+            "the owned Degoo service remains active after the stop request; refusing to upgrade safely.\n"
+            f"# Check local mount and service state\n  {_degoo_rc(root, 'info')}"
+        )
+
+
 def _recover_disconnected_mount(
     root: Path,
     *,
@@ -511,22 +566,30 @@ def _prepare_upgrade_mount(
     mountpoint = installer.configured_mountpoint(root)
     mount_state = _mounted_state(mountpoint)
     service_state = local_info.service_status(root, manifest)
+    missing_service_links = service_state == "unknown (owned service link is missing)"
     service_configured = service_state != "not configured for this install"
-    service_active_state = service_state.rsplit("; ", 1)[-1] if "; " in service_state else "unknown"
-    service_may_start = service_configured and service_active_state in {
-        "active",
-        "activating",
-        "deactivating",
-        "reloading",
-        "unknown",
-    }
+    if missing_service_links:
+        service_may_start = _missing_service_state(root, manifest) == "active"
+    else:
+        service_active_state = service_state.rsplit("; ", 1)[-1] if "; " in service_state else "unknown"
+        service_may_start = service_configured and service_active_state in {
+            "active",
+            "activating",
+            "deactivating",
+            "reloading",
+            "unknown",
+        }
 
     if mount_state == "not mounted" and not service_may_start:
-        if service_state.startswith("unknown ("):
+        if service_state.startswith("unknown (") and not missing_service_links:
             raise WizardError("the owned service state could not be verified; refusing to upgrade safely")
         if _mounted_state(mountpoint) != "not mounted":
             raise WizardError("the mount state changed during upgrade preflight; refusing to upgrade safely")
-        return
+        if not missing_service_links:
+            return
+        service_may_start = _missing_service_state(root, manifest) == "active"
+        if not service_may_start:
+            return
     if mount_state.startswith("unknown (") and not service_configured:
         raise WizardError("the kernel mount state is unavailable; refusing to upgrade safely")
 
@@ -538,12 +601,17 @@ def _prepare_upgrade_mount(
         raise WizardCancelled
 
     if service_configured:
-        try:
-            service_result = service.run(root, "stop")
-        except (service.ServiceError, installer.InstallError, OSError):
-            raise WizardError("the owned Degoo service could not be stopped; refusing to upgrade") from None
-        if service_result != 0:
-            raise WizardError("the owned Degoo service did not stop successfully; refusing to upgrade")
+        if missing_service_links:
+            service_may_start = _missing_service_state(root, manifest) == "active"
+            if service_may_start:
+                _stop_missing_link_service(root, manifest)
+        else:
+            try:
+                service_result = service.run(root, "stop")
+            except (service.ServiceError, installer.InstallError, OSError):
+                raise WizardError("the owned Degoo service could not be stopped; refusing to upgrade") from None
+            if service_result != 0:
+                raise WizardError("the owned Degoo service did not stop successfully; refusing to upgrade")
         if service_may_start:
             state = _wait_for_mount_state(mountpoint, "not mounted", timeout=MOUNT_STATE_TIMEOUT)
         else:

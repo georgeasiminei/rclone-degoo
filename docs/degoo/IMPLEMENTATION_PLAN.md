@@ -18,6 +18,17 @@ Degoo's consistency model also remain unverified.
 
 ## Implementation decisions and validation plan
 
+### Complete local cleanup and interrupted-uninstall recovery
+
+Uninstall checks mount-directory blockers before disabling service links and
+verifies that the installation directory and owned links are absent before reporting
+success. Failed or unverifiable cleanup exits nonzero with an incomplete
+cleanup message and retry instructions. Immutable legacy mount directories
+require the user to clear the flag; cleanup never invokes sudo automatically.
+The install wizard can recover missing service links after systemd confirms
+that the unit is absent and inactive, or proves a loaded unit belongs to this
+installation before stopping it. Pending-upload retention checks still apply.
+
 ### Health reporting, file upload state, and mountpoint protection
 
 The contained `degoo-rc status` command checks authentication first, then
