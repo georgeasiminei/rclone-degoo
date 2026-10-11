@@ -690,3 +690,41 @@ PATH=/tmp/degoo-review-tools:$PATH \
 ```
 
 `golangci-lint` was unavailable, so Go lint was not run.
+
+## Wizard prerequisite preflight — validated 2026-10-11
+
+The wizard lists runtime prerequisites and checks the configured mountpoint
+before offering service startup. A known blocker prevents service enablement
+and startup, returns a nonzero result, and preserves the installed client,
+vault configuration, and local cache. A valid immutable-mount helper does not
+require GCC; the wizard checks and reports compiler and source prerequisites
+when helper installation is needed. The wizard does not clear immutable flags
+or install or change privileged helper files automatically.
+
+Offline validation passed:
+
+- All 288 Python installer and helper tests passed, including 69 wizard tests
+  and 18 mount-prerequisite module tests. They cover actual flag-reading calls,
+  missing and misconfigured helpers, unsafe paths, `nosuid`/`noexec` mounts,
+  compiler/source prerequisites, preserved local files, owner read/execute
+  access, and foreground recovery without systemd.
+- The full credential-free Go suite passed with exit status 0:
+
+  ```sh
+  PATH=/tmp/degoo-review-tools:$PATH RCLONE_CONFIG=/notfound go test ./...
+  ```
+
+- The full binary build to `/tmp/rclone-degoo-prerequisites-check` passed.
+- `python3 bin/package-degoo.py --self-check` passed. Python compilation and
+  shell syntax checks passed for the setup block and native test driver.
+- The extended native namespace driver copied the prerequisite checker into
+  its isolated test setup and ran it as an ordinary user. It reported a
+  caller-owned mode-0700 immutable `/mnt/degoo` with a valid root-owned,
+  mode-4755 helper as ready. Encrypted local write/read, unmount/remount, and
+  failed-send cleanup all passed while the immutable flag remained set.
+- A read-only SSH check on the user-authorized target server correctly
+  reported the helper missing. It made no service, client, helper, or
+  configuration changes there. No Degoo cloud access was involved in these
+  checks.
+- The six changed Degoo Markdown files passed scoped markdownlint, and
+  `git diff --check` passed.

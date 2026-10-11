@@ -29,8 +29,69 @@ you decline or the system manager is unavailable, vault configuration can
 still finish, but mounting requires installing the missing dependencies first.
 The installer cannot create `/dev/fuse` when the kernel or system policy has
 not made it available; ask the system administrator to enable FUSE in that
-case. The wizard will not enable the service while mount dependencies are
-unavailable.
+case. The wizard checks the prerequisites for the selected mount and service
+path before the affected action. It distinguishes a missing command or device
+from an installed but inaccessible or misconfigured one, and identifies
+optional components such as the systemd user manager. It will not enable or
+start a service when a known required mount prerequisite is unavailable.
+
+### Repair missing or unusable mount prerequisites
+
+The wizard prints commands for the detected distribution and selected mount
+path, explains when they need administrator privileges, and gives commands to
+verify the repair and retry setup. The following package commands are manual
+examples if you need to install the generic FUSE and mountpoint tools yourself:
+
+```sh
+# Debian or Ubuntu
+sudo apt-get install fuse3 util-linux
+
+# Fedora or RHEL-compatible systems
+sudo dnf install fuse3 util-linux
+
+# Arch Linux
+sudo pacman -S --needed fuse3 util-linux
+
+# openSUSE
+sudo zypper install fuse3 util-linux
+```
+
+Run the checks as the account that will mount the vault:
+
+```sh
+command -v fusermount3 || command -v fusermount
+command -v mountpoint
+test -c /dev/fuse && test -r /dev/fuse && test -w /dev/fuse
+```
+
+If `/dev/fuse` is absent but the running kernel provides the FUSE module, an
+administrator can try `sudo modprobe fuse` and repeat the checks. If it remains
+absent, or exists but this account cannot read and write it, the kernel,
+container, or system device policy must be fixed. Inspect it with `ls -l
+/dev/fuse` and `id`; use the wizard's system-specific access instructions or
+ask the administrator. Do not make the device world-writable as a workaround.
+
+An immutable `/mnt/degoo` needs the manually installed helper described in
+[immutable-mount/README.md](../../contrib/degoo/immutable-mount/README.md).
+When that helper is missing or invalid, the wizard checks for GCC and the
+helper source copied into the private install root, then prints build and
+`sudo install` commands from that root. A valid installed helper does not need
+GCC. Building runs as the ordinary account; only installing the root-owned
+mode-4755 helper and its root-owned
+mode-0755 directory requires administrator privileges. The wizard verifies
+the helper path, ownership, directory and file modes, setuid bit, and whether
+its filesystem is mounted `nosuid` or `noexec`; it also prints verification
+and service retry commands. This helper is not needed for a mutable mountpoint.
+The installer never clears the immutable flag or changes privileged helper files
+automatically. If compiler or source prerequisites are missing, the wizard
+explains which one and how to supply it while preserving the saved vault
+configuration and cache for retry.
+
+For a new setup, rerun the service step with `degoo-rc service enable` after
+repair. If the service is already enabled, use `degoo-rc service restart`.
+If the systemd user manager is unavailable, run `degoo-rc mount` for a
+foreground mount after repairing the blocker.
+The wizard reports setup as ready only after it confirms the requested mount.
 
 ## Start the installer
 
@@ -257,6 +318,9 @@ uninstall. The privileged helper does not support an immutable legacy
 `mount/` target. For an install whose saved mountpoint is immutable, run
 `degoo-rc install --mountpoint /mnt/degoo` to migrate the saved path while
 preserving the cache. The old underlying `mount/` directory must be empty.
+This migration does not clear an immutable flag; the root helper supports only
+`/mnt/degoo`. If the old legacy directory itself is immutable, it remains
+protected and may need a separate manual unlock before uninstall cleanup.
 
 For a new vault, the default chunk size is 128 MiB of plaintext and the
 provisional maximum encrypted object size is 19 GiB. The provider's live limit

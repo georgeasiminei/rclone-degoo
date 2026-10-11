@@ -162,6 +162,23 @@ the separate vault secret, automatic renewal, and simple local-file setup.
   Suggest defaults for settings that can be inferred; account email and
   password have no invented defaults.
 - List dependencies even when installed, and offer to install missing ones.
+- Before each action that depends on local prerequisites, check them for the
+  selected install, build, mount, or service path. Report which requirements
+  are missing, present, misconfigured, or optional. For a detected and
+  repairable problem, print safe, copy-pastable setup commands for the current
+  distribution and system context, explain when they need administrator
+  privileges, then give commands to verify the repair and retry the blocked
+  action. Do not treat printed instructions as a successful repair.
+- Do not enable or start a service when a known required prerequisite means it
+  cannot mount, and do not report setup as ready until the requested mount is
+  confirmed. If setup is blocked, preserve completed configuration and pending
+  local changes and print an actionable retry command.
+- Never clear an immutable mountpoint flag automatically. The immutable-mount
+  helper remains a manual administrator installation: the wizard may check and
+  explain how to build, install, and verify it, but must not install, replace,
+  or modify privileged helper files itself. Explain other mount blockers such
+  as missing FUSE tools, unavailable or inaccessible `/dev/fuse`, and an
+  unusable systemd user manager when relevant to the selected action.
 - Show a visible password prompt even when logging to a file. Finish setup
   with the install and mount paths, actual mount state, helper commands, and
   log access. Make rejected authentication renewal visible with an actionable

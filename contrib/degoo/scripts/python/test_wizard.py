@@ -19,6 +19,117 @@ import wizard
 
 
 class WizardTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.preflight = mock.patch.object(wizard, "_mount_preflight", return_value=[])
+        self.preflight.start()
+        self.addCleanup(self.preflight.stop)
+
+    def test_preflight_prints_helper_install_and_retry_commands(self) -> None:
+        self.preflight.stop()
+        root = Path("/private/install with spaces")
+        issues = ["immutable mount helper invalid: helper is missing"]
+        with (
+            mock.patch.object(wizard, "_observed_mount_state", return_value="not mounted"),
+            mock.patch.object(wizard.mount_prerequisites, "check", return_value=issues),
+            mock.patch.object(wizard.subprocess, "run") as run,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(wizard._mount_preflight(root, Path("/mnt/degoo")), issues)
+        text = output.getvalue()
+        self.assertIn("gcc", text)
+        self.assertIn("sudo install", text)
+        self.assertIn("4755", text)
+        self.assertIn("service enable", text)
+        self.assertIn("Keep the immutable flag set", text)
+        self.assertNotIn("chattr -i", text)
+        run.assert_not_called()
+
+    def test_preflight_prints_compiler_package_configuration(self) -> None:
+        self.preflight.stop()
+        with (
+            mock.patch.object(wizard, "_observed_mount_state", return_value="not mounted"),
+            mock.patch.object(wizard.mount_prerequisites, "check", return_value=[
+                "immutable mount helper invalid: helper is missing", "GCC missing: install a compiler",
+            ]),
+            mock.patch.object(wizard, "_package_manager", return_value=("/usr/bin/apt-get", ("install", "-y"))),
+            mock.patch.object(wizard.os, "geteuid", return_value=1000),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            wizard._mount_preflight(Path("/private/install"), Path("/mnt/degoo"))
+        self.assertIn("sudo /usr/bin/apt-get install -y build-essential", output.getvalue())
+
+    def test_preflight_without_systemd_prints_foreground_recovery(self) -> None:
+        self.preflight.stop()
+        with (
+            mock.patch.object(wizard, "_observed_mount_state", return_value="not mounted"),
+            mock.patch.object(wizard.mount_prerequisites, "check", return_value=["immutable mount helper invalid: helper is missing"]),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            wizard._mount_preflight(Path("/private/install"), Path("/mnt/degoo"), systemd_available=False)
+        text = output.getvalue()
+        self.assertIn("degoo-rc mount", text)
+        self.assertIn("another terminal", text)
+        self.assertNotIn("service enable", text)
+
+    def test_preflight_missing_source_explains_repair_without_broken_build_command(self) -> None:
+        self.preflight.stop()
+        with (
+            mock.patch.object(wizard, "_observed_mount_state", return_value="not mounted"),
+            mock.patch.object(wizard.mount_prerequisites, "check", return_value=[
+                "immutable mount helper invalid: helper is missing",
+                "helper source missing: re-extract the complete archive and run ./degoo-rc install --upgrade",
+            ]),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            wizard._mount_preflight(Path("/private/install"), Path("/mnt/degoo"))
+        self.assertIn("re-extract the complete archive", output.getvalue())
+        self.assertNotIn("gcc -O2", output.getvalue())
+
+    def test_preflight_missing_legacy_directory_does_not_require_unsupported_flag(self) -> None:
+        self.preflight.stop()
+        with (
+            mock.patch.object(wizard, "_observed_mount_state", return_value="not mounted"),
+            mock.patch.object(wizard.mount_prerequisites, "check", return_value=["mountpoint missing: directory missing"]),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            wizard._mount_preflight(Path("/private/install"), Path("/private/install/mount"))
+        self.assertIn("sudo mkdir", output.getvalue())
+        self.assertNotIn("chattr", output.getvalue())
+        self.assertNotIn("gcc", output.getvalue())
+
+    def test_preflight_does_not_inspect_underlying_inode_when_mounted(self) -> None:
+        self.preflight.stop()
+        with (
+            mock.patch.object(wizard, "_observed_mount_state", return_value="mounted"),
+            mock.patch.object(wizard.mount_prerequisites, "check") as check,
+        ):
+            self.assertEqual(wizard._mount_preflight(Path("/private/install"), Path("/mnt/degoo")), [])
+        check.assert_not_called()
+
+    def test_preflight_unknown_state_blocks_inspection_and_reports_recovery(self) -> None:
+        self.preflight.stop()
+        with (
+            mock.patch.object(wizard, "_observed_mount_state", return_value="unknown (mount table unavailable)"),
+            mock.patch.object(wizard.mount_prerequisites, "check") as check,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            issues = wizard._mount_preflight(Path("/private/install"), Path("/mnt/degoo"))
+        self.assertTrue(issues)
+        self.assertIn("degoo-rc info", output.getvalue())
+        self.assertIn("degoo-rc logs", output.getvalue())
+        check.assert_not_called()
+
+    def test_declining_package_install_keeps_explicit_manual_command(self) -> None:
+        with (
+            mock.patch.object(wizard, "_package_manager", return_value=("/usr/bin/apt-get", ("install", "-y"))),
+            mock.patch.object(wizard.os, "geteuid", return_value=1000),
+            mock.patch.object(wizard.subprocess, "run") as run,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertFalse(wizard._install_missing_packages(True, True, input_fn=lambda _: "n"))
+        self.assertIn("sudo /usr/bin/apt-get install -y fuse3 util-linux", output.getvalue())
+        run.assert_not_called()
+
     def test_saved_auth_passes_connection_check_without_password(self) -> None:
         import connection
         with (
@@ -525,7 +636,7 @@ class WizardTest(unittest.TestCase):
                     self.assertIn("Installation incomplete", error_output.getvalue())
                     self.assertIn(f"last check: {error_state}", error_output.getvalue())
 
-    def test_wizard_does_not_preflight_mountpoint_flags_before_service_start(self) -> None:
+    def test_missing_immutable_helper_blocks_service_start_before_mount_wait(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
             answers = iter([""] * 11)
@@ -541,8 +652,9 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.login, "run", return_value=0),
                 mock.patch.object(wizard.setup, "run", return_value=0),
                 mock.patch.object(wizard, "_save_settings"),
+                mock.patch.object(wizard, "_mount_preflight", return_value=["immutable mount helper is missing"], create=True),
                 mock.patch.object(wizard.service, "run", return_value=0) as service_call,
-                mock.patch.object(wizard, "_wait_for_mount", return_value="mounted"),
+                mock.patch.object(wizard, "_wait_for_mount", return_value="mounted") as mount_wait,
                 mock.patch.object(wizard, "_observed_mount_state", return_value="mounted"),
                 mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
                 contextlib.redirect_stderr(error_output),
@@ -550,9 +662,10 @@ class WizardTest(unittest.TestCase):
             ):
                 result = wizard._run(args, input_fn=lambda _: next(answers))
 
-        self.assertEqual(result, 0)
-        service_call.assert_called_once_with(root, "enable")
-        self.assertEqual(error_output.getvalue(), "")
+        self.assertEqual(result, 2)
+        service_call.assert_not_called()
+        mount_wait.assert_not_called()
+        self.assertIn("immutable mount helper is missing", error_output.getvalue())
         self.assertIn("Mount point:", output.getvalue())
         self.assertIn("mounted", output.getvalue())
 

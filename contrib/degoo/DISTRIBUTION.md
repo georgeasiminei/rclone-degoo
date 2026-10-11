@@ -22,7 +22,15 @@ The wizard checks for the mount dependencies and can offer to install missing
 `zypper` package managers. Package installation may require root or `sudo`.
 If mount dependencies remain unavailable, vault setup can still finish but the
 service will not be enabled. The installer cannot make `/dev/fuse` available
-when it is disabled by the kernel or system policy.
+when it is disabled by the kernel or system policy. Before each dependent
+action, the wizard checks the selected path and distinguishes missing tools
+from installed but unusable components. It prints detected-system setup,
+verification, and retry instructions for FUSE, `util-linux`, `/dev/fuse`, and
+the immutable-mount helper when relevant. The root helper stays a manual
+administrator install; the wizard never clears the immutable flag or changes
+privileged helper files. Known blockers prevent service enablement and ready
+status, and completed configuration and pending cache data are preserved for
+retry. See [installation prerequisite recovery](docs/INSTALLATION.md).
 
 ## Install from the archive
 
@@ -143,7 +151,9 @@ the external mount directory in place. The privileged helper does not support
 an immutable legacy `mount/` target. For an install whose saved mountpoint is
 immutable, run `degoo-rc install --mountpoint /mnt/degoo` to migrate the saved
 path while preserving the cache. The old underlying `mount/` directory must
-be empty.
+be empty. Migration does not clear an immutable flag; the root helper supports
+only `/mnt/degoo`. An immutable legacy directory remains protected and may
+need a separate manual unlock before uninstall cleanup.
 
 You may leave `chattr +i` set on `/mnt/degoo` while mounted and unmounted. The
 flag blocks the write-access check required by standard `fusermount3`, even
@@ -161,7 +171,8 @@ immutable flag is absent, the mount guard uses the retained directory handle
 to protect the underlying directory after mounting and on failure or unmount.
 After an administrator installs the helper, retry a new service setup with
 `degoo-rc service enable`. If the service is already enabled, restart it with
-`degoo-rc service restart`.
+`degoo-rc service restart`. If the systemd user manager is unavailable, run
+`degoo-rc mount` for a foreground mount after repairing the blocker.
 
 ```sh
 degoo-rc info

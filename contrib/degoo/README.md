@@ -28,6 +28,19 @@ missing. If you decline mount dependencies, vault setup can still finish but
 the service will not be enabled. If `/dev/fuse` is not available, the kernel
 or system policy must be fixed separately.
 
+Before each action, the wizard checks the prerequisites for the selected
+binary, mountpoint, and service path. It distinguishes missing dependencies
+from inaccessible or misconfigured ones, lists optional components such as
+systemd, and prints system-specific setup, verification, and retry commands.
+This includes FUSE tools, `util-linux`, and `/dev/fuse` access. An immutable
+`/mnt/degoo` requires the manually installed root helper; the wizard can show
+build and installation instructions from the private install root but never
+clears the flag or changes privileged helper files itself. A known blocker
+prevents service enablement and readiness reporting, while completed
+configuration and pending cache data remain available for retry. See
+[installation prerequisite recovery](../../docs/degoo/INSTALLATION.md) for
+examples and verification steps.
+
 ## Install
 
 To build from the `staging` source branch and start the wizard:
@@ -265,6 +278,9 @@ The privileged helper does not support an immutable legacy `mount/` target.
 For an install whose saved mountpoint is immutable, run
 `degoo-rc install --mountpoint /mnt/degoo` to migrate the saved path while
 preserving the cache. The old underlying `mount/` directory must be empty.
+Migration does not clear an immutable flag; the root helper supports only
+`/mnt/degoo`. An immutable legacy directory remains protected and may need a
+separate manual unlock before uninstall cleanup.
 
 You may leave `chattr +i` set on `/mnt/degoo` while mounted and unmounted. The
 flag blocks the write-access check required by standard `fusermount3`, even
@@ -283,7 +299,8 @@ removing write permissions after mounting and on failure or unmount.
 
 After an administrator installs the helper, retry a new service setup with
 `degoo-rc service enable`. If the service is already enabled, restart it with
-`degoo-rc service restart`.
+`degoo-rc service restart`. If the systemd user manager is unavailable, run
+`degoo-rc mount` for a foreground mount after repairing the blocker.
 The installed `degoo-rc` command is available on `PATH`:
 
 ```sh
