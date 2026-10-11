@@ -23,6 +23,7 @@ import connection
 import info as local_info
 import install as installer
 import login
+import mount_prerequisites
 import service
 import setup
 import uninstall as cleanup
@@ -242,6 +243,10 @@ def _install_packages(packages: list[str], purpose: str, *, input_fn: Callable[[
     manager_names = {"apt-get": "apt-get", "dnf": "dnf", "pacman": "pacman", "zypper": "zypper"}
     manager_name = manager_names.get(package_name, package_name)
     print(f"Missing {purpose} packages: {', '.join(packages)} (package manager: {manager_name}).")
+    manual_command = [executable, *prefix, *packages]
+    if os.geteuid() != 0:
+        manual_command.insert(0, "sudo")
+    _print_command_block(f"Install {purpose} packages (administrator access required)", shlex.join(manual_command))
     if not _yes_no(f"Install these {purpose} packages now?", default=True, input_fn=input_fn):
         print(f"Install the {purpose} packages manually before using this feature.")
         return False
@@ -250,6 +255,7 @@ def _install_packages(packages: list[str], purpose: str, *, input_fn: Callable[[
         sudo = shutil.which("sudo", path="/usr/bin:/bin")
         if not sudo:
             print("sudo is unavailable; install the listed packages manually.")
+            _print_command_block("Ask the administrator to run", shlex.join(command))
             return False
         command.insert(0, sudo)
     print(f"Installing the required {purpose} packages…")
@@ -679,8 +685,7 @@ def _completion_summary(
             print(f"  Inspect recent startup output with {_degoo_rc(root, 'logs')}.")
     elif not mount_ready:
         print(
-            "  Mount dependencies are incomplete; install the FUSE helper and mountpoint utility, "
-            "then check /dev/fuse access."
+            "  Mount prerequisites are incomplete; follow the configuration instructions above before starting."
         )
     elif not systemd_available:
         print("  No systemd user manager is available; run the foreground mount command below when ready.")
@@ -776,10 +781,75 @@ def _check_runtime(*, input_fn: Callable[[str], str]) -> tuple[bool, bool]:
     fuse_device_ready = _fuse_device_ready()
     if not fuse_device_ready:
         print("/dev/fuse is unavailable to this user; setup can continue, but mounting requires FUSE device access.")
+        _print_command_block("Enable the FUSE kernel module (administrator access required)", "sudo modprobe fuse")
+        _print_command_block("Verify FUSE device access as the mounting user", "ls -l /dev/fuse\nid\ntest -c /dev/fuse && test -r /dev/fuse && test -w /dev/fuse")
+        print("If /dev/fuse is still unavailable, ask the administrator to configure device permissions or container device access, then rerun degoo-rc install.")
     mount_ready = helper and mountpoint and fuse_device_ready
     if not mount_ready and (not helper or not mountpoint):
         print("Mount helper dependencies are still unavailable; complete setup and install them before mounting.")
+        _print_command_block("Verify the required mount tools", "command -v fusermount3 || command -v fusermount\ncommand -v mountpoint")
+        _print_command_block("Recheck dependencies in the wizard", "degoo-rc install")
     return mount_ready, initial_systemd
+
+
+def _mount_preflight(root: Path, mountpoint: Path, *, systemd_available: bool = True) -> list[str]:
+    """Report selected mountpoint blockers and the manual steps before startup."""
+    state = _observed_mount_state(mountpoint)
+    if state == "mounted":
+        return []
+    if state != "not mounted":
+        issues = [f"mountpoint state cannot be checked safely: {state}; inspect {_degoo_rc(root, 'info')} and {_degoo_rc(root, 'logs')}"]
+    else:
+        issues = mount_prerequisites.check(root, mountpoint)
+    if not issues:
+        return []
+    print("Mountpoint configuration is incomplete:")
+    for issue in issues:
+        print(f"  {issue}")
+    if any("mounted nosuid" in issue or "mounted noexec" in issue for issue in issues):
+        print(
+            "Administrator configuration required: allow setuid and executable files on the filesystem "
+            "or dedicated mount containing /usr/local/libexec/rclone-degoo. Inspect its mount options "
+            "with findmnt below, update that mount's configuration, and remount it before retrying. "
+            "Reinstalling the helper alone does not change these mount options."
+        )
+    if any(issue.startswith("mountpoint missing:") for issue in issues):
+        instructions = installer.mountpoint_instructions(mountpoint)
+        if mountpoint != Path(installer.DEFAULT_MOUNTPOINT):
+            instructions = "\n".join(instructions.splitlines()[:-1])
+        _print_command_block("Create the private mount directory (administrator access required)", instructions)
+    if any(issue.startswith("immutable mountpoint unsupported:") for issue in issues):
+        _print_command_block("Migrate the mountpoint while preserving the cache", _degoo_rc(root, "install", "--mountpoint", installer.DEFAULT_MOUNTPOINT))
+    needs_helper_setup = any(issue.startswith(("immutable mount helper invalid:", "mountpoint missing:")) for issue in issues)
+    if needs_helper_setup and mountpoint == Path(installer.DEFAULT_MOUNTPOINT):
+        if any(issue.startswith("GCC missing:") for issue in issues):
+            manager = _package_manager()
+            if manager:
+                executable, prefix = manager
+                packages = {
+                    "apt-get": ["build-essential"],
+                    "dnf": ["gcc", "glibc-devel"],
+                    "pacman": ["base-devel"],
+                    "zypper": ["gcc", "glibc-devel"],
+                }[Path(executable).name]
+                command = [executable, *prefix, *packages]
+                if os.geteuid() != 0:
+                    command.insert(0, "sudo")
+                _print_command_block("Install the helper build tools (administrator access required)", shlex.join(command))
+            else:
+                print("Install GCC and the C development headers using your system package manager before building the helper.")
+        if not any(issue.startswith("helper source missing:") for issue in issues):
+            _print_command_block("Build as your normal user and install the immutable helper with administrator access", "\n".join(mount_prerequisites.setup_commands(root, start_service=systemd_available)))
+            if not systemd_available:
+                _print_command_block("Start the foreground mount after configuration", _degoo_rc(root, "mount"))
+                _print_command_block("Verify the foreground mount from another terminal", _degoo_rc(root, "info"))
+        print("Keep the immutable flag set. The wizard does not install privileged files or change mountpoint protection.")
+    _print_command_block("Inspect mountpoint and helper configuration", "\n".join([
+        f"namei -l -- {shlex.quote(str(mountpoint))}",
+        "namei -l -- /usr/local/libexec/rclone-degoo/fusermount3",
+        "findmnt -no TARGET,OPTIONS -T /usr/local/libexec/rclone-degoo",
+    ]))
+    return issues
 
 
 def _systemd_user_available() -> bool:
@@ -1313,6 +1383,18 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
         raise
 
     print("Step 6 of 6: Choose how to start the mount.")
+    mountpoint = installer.configured_mountpoint(root)
+    prerequisite_issues = _mount_preflight(root, mountpoint, systemd_available=systemd_available)
+    if prerequisite_issues:
+        print("Installation incomplete: " + "; ".join(prerequisite_issues), file=sys.stderr)
+        print("  The installed client, vault configuration, and local cache are preserved.", file=sys.stderr)
+        _completion_summary(
+            root,
+            mount_ready=False,
+            systemd_available=systemd_available,
+            note="Mount startup was skipped; complete the configuration instructions above before starting.",
+        )
+        return 2
     if systemd_available and mount_ready:
         if _yes_no("Enable and start the systemd user service?", default=True, input_fn=input_fn):
             mountpoint = installer.configured_mountpoint(root)

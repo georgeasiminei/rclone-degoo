@@ -37,6 +37,35 @@ configuration and the local cache while these steps are pending. It never
 clears the flag or installs privileged files itself. Manual startup remains
 optional.
 
+### Action-specific installer prerequisite preflight
+
+Before a wizard action uses the selected binary, mountpoint, or service path,
+check the prerequisites for that action. List required and optional items and
+distinguish absent tools or devices from installed but unusable or
+misconfigured ones. If the detected distribution and system context support a
+repair, print safe copy-pastable commands, explain when administrator
+privileges are required, and give verification and retry commands. Include
+actionable diagnostics for Python, source-build Go, the FUSE helper,
+`mountpoint` from `util-linux`, `/dev/fuse` availability and access, and the
+optional systemd user manager as applicable. A missing immutable-helper
+compiler or source file also needs a specific explanation and recovery steps.
+
+Check an immutable selected mountpoint and the manually installed helper before
+offering or enabling service startup. The helper is required only for an
+immutable `/mnt/degoo`; validate its root ownership, protected parent and file
+permissions, setuid mode, and whether the containing filesystem is mounted
+`nosuid`. Generate build and installation commands from the current private
+install root, point to the bundled
+[helper instructions](../../contrib/degoo/immutable-mount/README.md), and give
+verification and retry commands. These checks must never clear the immutable
+flag or install, replace, or modify a privileged helper. Do not enable or start
+a service when a known required blocker remains. Preserve the completed
+configuration and pending cache so the user can repair the prerequisite and
+retry; report readiness only after the requested mount is confirmed. The
+wizard now runs this preflight before its final service-start choice. The
+implementation-specific validation results are pending and belong in
+[VALIDATION.md](VALIDATION.md).
+
 ### Complete local cleanup and interrupted-uninstall recovery
 
 Uninstall checks mount-directory blockers before disabling service links and
@@ -156,8 +185,10 @@ login. The wizard checks Python 3.10 or
 newer, a FUSE helper, writable `/dev/fuse`, and `mountpoint`. It can offer to
 install `fuse3` and `util-linux` with a detected `apt-get`, `dnf`, `pacman`, or
 `zypper`; when mount dependencies remain unavailable, it can still configure
-the vault but does not enable the service. Go is required only to build from a
-checkout, and the wizard can offer that build if it finds no binary.
+the vault but does not enable the service. The action-specific checks and
+repair instructions described above extend this initial prerequisite handling.
+Go is required only to build from a checkout, and the wizard can offer that
+build if it finds no binary.
 
 The wizard first offers a retained backup directory for fresh installation.
 Recovered folder and mount settings become defaults; saved account credentials

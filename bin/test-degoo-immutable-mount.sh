@@ -7,6 +7,7 @@ trap 'rm -rf -- "$test_build_dir"' EXIT
 gcc -O2 -Wall -Wextra -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
     -Wl,-z,relro,-z,now -o "$test_build_dir/fusermount3" contrib/degoo/immutable-mount/helper.c
 go test -c -o "$test_build_dir/degoo.test" ./cmd/degoo
+cp -- contrib/degoo/scripts/python/mount_prerequisites.py "$test_build_dir/mount_prerequisites.py"
 test_uid=$(id -u)
 test_gid=$(id -g)
 if [[ "$test_uid" == 0 ]]; then
@@ -41,6 +42,7 @@ mkdir -m 755 -p /usr/local/libexec/rclone-degoo
 mount -t tmpfs -o nodev,mode=0755 tmpfs /usr/local/libexec/rclone-degoo
 install -o root -g root -m 4755 "$build_dir/fusermount3" /usr/local/libexec/rclone-degoo/fusermount3
 install -m 755 "$build_dir/degoo.test" "$fixture/degoo.test"
+install -m 644 "$build_dir/mount_prerequisites.py" "$fixture/mount_prerequisites.py"
 for helper in /usr/bin/fusermount3 /usr/bin/fusermount; do
     if [[ -x "$helper" ]]; then
         ln -s "$helper" "$fixture/tools/fusermount3"
@@ -48,6 +50,16 @@ for helper in /usr/bin/fusermount3 /usr/bin/fusermount; do
     fi
 done
 test -L "$fixture/tools/fusermount3"
+sudo -u "#$client_uid" -g "#$client_gid" -- python3 - "$fixture" <<'PYTHON'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import mount_prerequisites
+
+issues = mount_prerequisites.check(Path(sys.argv[1]), Path("/mnt/degoo"))
+assert not issues, issues
+print("real immutable mountpoint and helper prerequisite check passed")
+PYTHON
 sudo -u "#$client_uid" -g "#$client_gid" -- env \
     RCLONE_CONFIG=/notfound PATH="$fixture/tools:/usr/bin:/bin" \
     "$fixture/degoo.test" -test.run '^TestVaultNativeImmutableMount$' \

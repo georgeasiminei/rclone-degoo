@@ -25,7 +25,7 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "connection.py", "restore.py", "backup_config.py", "sync.py", "status.py", "benchmark.py")
+SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "mount_prerequisites.py", "connection.py", "restore.py", "backup_config.py", "sync.py", "status.py", "benchmark.py")
 DEFAULT_MOUNTPOINT = "/mnt/degoo"
 SOURCE_SHELL_FILES = ("install.sh", "trash.sh", "uninstall.sh")
 GENERATED_SHELL_FILES = ("info.sh", "logs.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh")
