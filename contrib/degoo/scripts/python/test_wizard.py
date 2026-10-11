@@ -19,6 +19,88 @@ import wizard
 
 
 class WizardTest(unittest.TestCase):
+    def test_saved_auth_passes_connection_check_without_password(self) -> None:
+        import connection
+        with (
+            mock.patch.object(wizard.installer, "read_private_file", return_value=b"{}"),
+            mock.patch.object(connection, "check_connection", return_value=[{"id": "device", "name": "Device", "category": 1}]) as check,
+            mock.patch.object(wizard.login, "run") as login_call,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            code, folders = wizard._ensure_connection(Path("/private/install"))
+        self.assertEqual(code, 0)
+        self.assertEqual(folders[0]["id"], "device")
+        check.assert_called_once()
+        login_call.assert_not_called()
+        self.assertIn("Connection verified", output.getvalue())
+
+    def test_rejected_saved_auth_logs_in_then_checks_password(self) -> None:
+        import connection
+        with (
+            mock.patch.object(wizard.installer, "read_private_file", return_value=b"{}"),
+            mock.patch.object(connection, "check_connection", side_effect=[connection.LoginRequiredError("login required"), []]) as check,
+            mock.patch.object(wizard.login, "run", return_value=0) as login_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code, _ = wizard._ensure_connection(Path("/private/install"))
+        self.assertEqual(code, 0)
+        self.assertEqual(check.call_count, 2)
+        login_call.assert_called_once()
+
+    def test_network_failure_does_not_reprompt_password(self) -> None:
+        import connection
+        with (
+            mock.patch.object(wizard.installer, "read_private_file", return_value=b"{}"),
+            mock.patch.object(connection, "check_connection", side_effect=connection.ProviderQueryError("network unavailable")),
+            mock.patch.object(wizard.login, "run") as login_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(wizard.WizardError):
+                wizard._ensure_connection(Path("/private/install"))
+        login_call.assert_not_called()
+
+    def test_successful_login_requires_authenticated_connection(self) -> None:
+        import connection
+        with (
+            mock.patch.object(wizard.installer, "read_private_file", return_value=None),
+            mock.patch.object(connection, "check_connection", side_effect=connection.LoginRequiredError("rejected")) as check,
+            mock.patch.object(wizard.login, "run", return_value=0),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(wizard.WizardError):
+                wizard._ensure_connection(Path("/private/install"))
+        check.assert_called_once()
+
+    def test_existing_default_folder_is_reported_and_reused_with_import(self) -> None:
+        import connection
+        with (
+            mock.patch.object(connection, "list_folders", return_value=[{"id": "existing", "name": wizard.DEFAULT_FOLDER_NAME, "category": 2}]),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            result = wizard._choose_folder_name(Path("/private/install"), "device", wizard.DEFAULT_FOLDER_NAME, "/private/vault.json", input_fn=lambda _: "")
+        self.assertEqual(result, ("existing", wizard.DEFAULT_FOLDER_NAME, "/private/vault.json"))
+        self.assertIn("already exists", output.getvalue())
+
+    def test_existing_default_folder_requires_secret_or_different_name(self) -> None:
+        import connection
+        with (
+            mock.patch.object(connection, "list_folders", return_value=[{"id": "existing", "name": wizard.DEFAULT_FOLDER_NAME, "category": 2}]),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            answers = iter(("", "new-vault"))
+            result = wizard._choose_folder_name(Path("/private/install"), "device", wizard.DEFAULT_FOLDER_NAME, None, input_fn=lambda _: next(answers))
+        self.assertEqual(result, (None, "new-vault", None))
+        self.assertIn("already exists", output.getvalue())
+
+    def test_duplicate_default_folder_matches_are_not_reused(self) -> None:
+        import connection
+        with mock.patch.object(connection, "list_folders", return_value=[
+            {"id": "one", "name": wizard.DEFAULT_FOLDER_NAME, "category": 2},
+            {"id": "two", "name": wizard.DEFAULT_FOLDER_NAME, "category": 2},
+        ]):
+            with self.assertRaises(wizard.WizardError):
+                wizard._choose_folder_name(Path("/private/install"), "device", wizard.DEFAULT_FOLDER_NAME, "/private/vault.json", input_fn=lambda _: "")
+
     def test_write_back_prompt_rejects_nonpositive_and_invalid_durations(self) -> None:
         for value in ("0s", "-1s", "off", "1S", "9223372036854775807ns", "9223372036854775808ns"):
             with self.subTest(value=value):
@@ -164,11 +246,10 @@ class WizardTest(unittest.TestCase):
                 {"id": "bad\nname", "name": "Invalid", "category": 1},
             ]
         ).encode()
-        with mock.patch.object(wizard.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=response)) as run:
+        with mock.patch.object(wizard.connection, "_run_folder_query", return_value=response) as run:
             folders = wizard._load_folders(Path("/private/root"))
         self.assertEqual([folder["id"] for folder in folders], ["device", "folder"])
-        self.assertEqual(run.call_args.args[0][-2:], ["--parent-id", "0"])
-        self.assertEqual(run.call_args.kwargs.get("umask"), 0o077)
+        run.assert_called_once_with(Path("/private/root"), "0")
 
     def test_device_is_suggested_before_other_valid_folder(self) -> None:
         folders = [
@@ -212,13 +293,14 @@ class WizardTest(unittest.TestCase):
     def _run_default_flow(self, *, login_code: int = 0, setup_code: int = 0) -> tuple[int, mock.Mock, mock.Mock, str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
-            answers = iter([""] * 9)
+            answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             with (
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0) as install_call,
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
                 mock.patch.object(wizard.login, "run", return_value=login_code) as login_call,
                 mock.patch.object(wizard.setup, "run", return_value=setup_code) as setup_call,
                 mock.patch.object(wizard, "_save_settings") as save_call,
@@ -279,7 +361,7 @@ class WizardTest(unittest.TestCase):
     def test_service_enable_times_out_without_claiming_mount_or_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install root"
-            answers = iter([""] * 10)
+            answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
             with (
@@ -287,6 +369,7 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
                 mock.patch.object(wizard.login, "run", return_value=0),
                 mock.patch.object(wizard.setup, "run", return_value=0),
                 mock.patch.object(wizard, "_save_settings"),
@@ -313,7 +396,7 @@ class WizardTest(unittest.TestCase):
     def test_failed_service_start_keeps_nonzero_result_and_explains_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
-            answers = iter([""] * 10)
+            answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
             failure = wizard.service.ServiceError("the service is linked, but could not start")
@@ -322,6 +405,7 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
                 mock.patch.object(wizard.login, "run", return_value=0),
                 mock.patch.object(wizard.setup, "run", return_value=0),
                 mock.patch.object(wizard, "_save_settings"),
@@ -355,6 +439,7 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_current_vault_settings", return_value={"password": "private"}),
                 mock.patch.object(wizard, "_cache_settings", return_value=wizard.installer.DEFAULT_MOUNT_SETTINGS),
                 mock.patch.object(wizard.installer, "install", side_effect=lambda _: events.append("install") or 0),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
                 mock.patch.object(wizard.login, "run", return_value=0),
                 mock.patch.object(wizard, "_save_settings"),
                 mock.patch.object(wizard.service, "run", side_effect=lambda _root, action: events.append(f"service:{action}") or 0),
@@ -649,11 +734,12 @@ class WizardTest(unittest.TestCase):
             )
             binary.chmod(0o700)
             args = type("Args", (), {"binary": None, "folder_id": None, "folder_name": None, "vault_config": None, "upgrade": False})()
-            answers = iter([""] * 12)
+            answers = iter([""] * 13)
             with (
                 mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
                 mock.patch.object(wizard.login, "run", return_value=0) as login_call,
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
@@ -673,6 +759,253 @@ class WizardTest(unittest.TestCase):
             remote_config = (root / "config/rclone.conf").read_text(encoding="utf-8")
             self.assertIn("root_folder_id = created-folder-123", remote_config)
             self.assertTrue((root / "scripts/python/install.py").is_file())
+
+    def test_backup_restore_wizard_restores_vault_settings_and_saved_login(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home = base / "home"
+            home.mkdir(mode=0o700)
+            backup = base / "retained state"
+            backup.mkdir(mode=0o700)
+            for name in ("config", "cache"):
+                directory = backup / name
+                directory.mkdir(mode=0o700)
+                directory.chmod(0o700)
+
+            folder_id = "saved-vault-folder-123"
+            folder_name = "Saved Vault"
+            old_root = base / "old install"
+            vault_secret = "test-only-restored-vault-secret"
+            old_cache = str(old_root / "cache")
+            vault = {
+                "version": 1,
+                "remote": f"{wizard.installer.REMOTE_NAME}:",
+                "password": vault_secret,
+                "cache_dir": old_cache,
+                "chunk_size": "64Mi",
+                "max_object_size": "19Gi",
+            }
+            mount_settings = wizard.installer.DEFAULT_MOUNT_SETTINGS | {
+                "read_chunk_streams": 6,
+                "dir_cache_time": "10m",
+                "cache_max_age": "10h",
+            }
+            auth_bytes = b'{"token":"test-only-access-token","refresh_token":"test-only-refresh-token"}\n'
+            login_bytes = b'{"email":"owner@example.test"}\n'
+
+            def write_private(path: Path, data: bytes) -> None:
+                path.write_bytes(data)
+                path.chmod(0o600)
+
+            manifest = {
+                "version": 1,
+                "root_folder_id": folder_id,
+                "remote_folder_name": folder_name,
+                "remote_created_by_setup": True,
+                "remote_name": wizard.installer.REMOTE_NAME,
+                "mountpoint": "mount",
+                "binary": "bin/rclone",
+                "vault_config": "config/vault.json",
+                "rclone_config": "config/rclone.conf",
+                "cache_dir": "cache",
+                "pidfile": "mount.pid",
+                "service_links": ["/ignored/old/rclone-degoo.service"],
+            }
+            write_private(backup / "install.json", (json.dumps(manifest) + "\n").encode())
+            write_private(backup / "config/vault.json", (json.dumps(vault, sort_keys=True) + "\n").encode())
+            write_private(backup / "config/rclone.conf", wizard.installer.rclone_config(old_root, folder_id))
+            write_private(backup / "config/mount.json", (json.dumps(mount_settings, sort_keys=True) + "\n").encode())
+            write_private(backup / "config/auth.json", auth_bytes)
+            write_private(backup / "config/login.json", login_bytes)
+
+            def snapshot(path: Path) -> dict[str, tuple[int, bytes | None]]:
+                entries = [path, *path.rglob("*")]
+                return {
+                    str(entry.relative_to(path)) if entry != path else ".": (
+                        entry.stat().st_mode & 0o777,
+                        entry.read_bytes() if entry.is_file() else None,
+                    )
+                    for entry in entries
+                }
+
+            backup_before = snapshot(backup)
+            binary = base / "rclone"
+            binary.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = degoo ] && [ \"$2\" = --help ]; then\n"
+                "  echo 'Commands: login mount folders create-vault'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            args = type("Args", (), {
+                "binary": None,
+                "folder_id": None,
+                "folder_name": None,
+                "vault_config": None,
+                "restore_directory": None,
+                "upgrade": False,
+            })()
+            prompts: list[str] = []
+
+            def answer(prompt: str) -> str:
+                prompts.append(prompt)
+                return str(backup) if len(prompts) == 1 else ""
+
+            output = io.StringIO()
+            account_folders = [{"id": "device-123", "name": "Device", "category": 1}]
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
+                mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)) as choose_binary,
+                mock.patch.object(wizard.connection, "check_connection", return_value=account_folders) as check_connection,
+                mock.patch.object(wizard.login, "run") as login_call,
+                mock.patch.object(wizard.setup, "run") as setup_call,
+                mock.patch.object(wizard.service, "run") as service_call,
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                result = wizard._run(args, input_fn=answer)
+
+            root = home / ".local/share/rclone-degoo"
+            self.assertEqual(result, 0)
+            self.assertIn("Backup directory to restore", prompts[0])
+            self.assertTrue(any("Recovered dedicated vault folder ID" in prompt and folder_id in prompt for prompt in prompts))
+            self.assertTrue(any("Recovered vault folder name" in prompt and folder_name in prompt for prompt in prompts))
+            self.assertTrue(any("Maximum cache age" in prompt and "10h" in prompt for prompt in prompts))
+            self.assertFalse(any("vault.json to import" in prompt for prompt in prompts))
+            self.assertFalse(any("password" in prompt.casefold() for prompt in prompts))
+            choose_binary.assert_called_once()
+            check_connection.assert_called_once_with(root)
+            login_call.assert_not_called()
+            setup_call.assert_not_called()
+            service_call.assert_not_called()
+
+            installed_manifest = json.loads((root / "install.json").read_bytes())
+            self.assertEqual(installed_manifest["root_folder_id"], folder_id)
+            self.assertEqual(installed_manifest["remote_folder_name"], folder_name)
+            self.assertEqual((root / "config/rclone.conf").read_bytes(), wizard.installer.rclone_config(root, folder_id))
+
+            installed_vault = json.loads((root / "config/vault.json").read_bytes())
+            self.assertEqual(installed_vault["password"], vault_secret)
+            self.assertEqual(installed_vault["cache_dir"], str(root / "cache"))
+            self.assertEqual(installed_vault["chunk_size"], "64Mi")
+            self.assertEqual(installed_vault["max_object_size"], "19Gi")
+            self.assertEqual(json.loads((root / "config/mount.json").read_bytes()), mount_settings)
+            self.assertEqual((root / "config/auth.json").read_bytes(), auth_bytes)
+            self.assertEqual((root / "config/login.json").read_bytes(), login_bytes)
+            self.assertEqual((root / "config/auth.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((root / "config/login.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(snapshot(backup), backup_before)
+
+    def test_unbound_backup_keeps_saved_vault_when_wizard_creates_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home = base / "home"
+            home.mkdir(mode=0o700)
+            backup = base / "retained state"
+            backup.mkdir(mode=0o700)
+            for name in ("config", "cache"):
+                directory = backup / name
+                directory.mkdir(mode=0o700)
+                directory.chmod(0o700)
+
+            old_root = base / "old install"
+            secret = "test-only-unbound-vault-secret"
+            vault = {
+                "version": 1,
+                "remote": f"{wizard.installer.REMOTE_NAME}:",
+                "password": secret,
+                "cache_dir": str(old_root / "cache"),
+                "chunk_size": "64Mi",
+                "max_object_size": "19Gi",
+            }
+
+            def write_private(path: Path, data: bytes) -> None:
+                path.write_bytes(data)
+                path.chmod(0o600)
+
+            manifest = {
+                "version": 1,
+                "root_folder_id": "",
+                "remote_folder_name": "",
+                "remote_created_by_setup": False,
+                "remote_name": wizard.installer.REMOTE_NAME,
+                "mountpoint": "mount",
+                "binary": "bin/rclone",
+                "vault_config": "config/vault.json",
+                "rclone_config": "config/rclone.conf",
+                "cache_dir": "cache",
+                "pidfile": "mount.pid",
+                "service_links": [],
+            }
+            write_private(backup / "install.json", (json.dumps(manifest) + "\n").encode())
+            write_private(backup / "config/vault.json", (json.dumps(vault, sort_keys=True) + "\n").encode())
+            write_private(backup / "config/auth.json", b'{"token":"test-only-access-token"}\n')
+
+            binary = base / "rclone"
+            binary.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = degoo ] && [ \"$2\" = --help ]; then\n"
+                "  echo 'Commands: login mount folders create-vault'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            args = type("Args", (), {
+                "binary": None,
+                "folder_id": None,
+                "folder_name": None,
+                "vault_config": None,
+                "restore_directory": None,
+                "upgrade": False,
+            })()
+            prompts: list[str] = []
+
+            def answer(prompt: str) -> str:
+                prompts.append(prompt)
+                return str(backup) if len(prompts) == 1 else ""
+
+            root = home / ".local/share/rclone-degoo"
+            vault_at_setup: list[dict[str, object]] = []
+
+            def setup_with_existing_vault(_args: argparse.Namespace) -> int:
+                vault_at_setup.append(json.loads((root / "config/vault.json").read_bytes()))
+                return 0
+
+            account_folders = [{"id": "device-123", "name": "Device", "category": 1}]
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
+                mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)),
+                mock.patch.object(wizard.connection, "check_connection", return_value=account_folders) as check_connection,
+                mock.patch.object(wizard.connection, "list_folders", return_value=[]),
+                mock.patch.object(wizard.login, "run") as login_call,
+                mock.patch.object(wizard.setup, "run", side_effect=setup_with_existing_vault) as setup_call,
+                mock.patch.object(wizard.service, "run") as service_call,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                result = wizard._run(args, input_fn=answer)
+
+            self.assertEqual(result, 0)
+            self.assertIn("Backup directory to restore", prompts[0])
+            self.assertFalse(any("vault.json to import" in prompt for prompt in prompts))
+            check_connection.assert_called_once_with(root)
+            login_call.assert_not_called()
+            setup_call.assert_called_once()
+            setup_args = setup_call.call_args.args[0]
+            self.assertIsNone(setup_args.vault_config)
+            self.assertEqual(setup_args.parent_id, "device-123")
+            self.assertIsNone(setup_args.folder_id)
+            self.assertEqual(len(vault_at_setup), 1)
+            self.assertEqual(vault_at_setup[0]["password"], secret)
+            self.assertEqual(vault_at_setup[0]["cache_dir"], str(root / "cache"))
+            service_call.assert_not_called()
 
     def test_requested_folder_id_is_validated_before_dependency_work(self) -> None:
         args = type("Args", (), {"binary": None, "folder_id": "0", "folder_name": None, "vault_config": None, "upgrade": False})()

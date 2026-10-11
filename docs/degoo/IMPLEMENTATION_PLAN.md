@@ -61,6 +61,19 @@ install `fuse3` and `util-linux` with a detected `apt-get`, `dnf`, `pacman`, or
 the vault but does not enable the service. Go is required only to build from a
 checkout, and the wizard can offer that build if it finds no binary.
 
+The wizard first offers a retained backup directory for fresh installation.
+Recovered folder and mount settings become defaults; saved account credentials
+are checked with an authenticated folder query before prompting for a password.
+Original vault settings remain fixed. Retained cache data is copied privately;
+an offline `degoo restore-cache` command verifies the original identity and
+changes only its cache-path binding. Existing installs use the upgrade flow
+rather than merging retained caches. Remote folder-name discovery reports
+collisions and requires the matching vault configuration to reuse a folder.
+`degoo-rc backup-config` creates the same portable configuration layout without
+uninstalling. File data, cache, and pending uploads are excluded. This supports
+opening the same remote vault on another computer while pending uploads remain
+on their source computer.
+
 The folder picker queries account root ID `0` to discover device folders,
 suggests a discovered device ID for new vault creation, and defaults the new
 child name to `rclone-degoo-vault`. Root ID `0` is not accepted as a vault ID or

@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
+import connection
 import info as local_info
 import install as installer
 import login
@@ -630,6 +631,7 @@ def _completion_summary(
     _print_command_block("Manual foreground mount", _degoo_rc(root, "mount"))
     _print_command_block("Unmount this install's foreground/manual mount", _degoo_rc(root, "stop"))
     _print_command_block("Uninstall wizard", _degoo_rc(root, "uninstall"))
+    _print_command_block("Private configuration backup (excludes file data)", _degoo_rc(root, "backup-config"))
     _print_command_block("Recent mount, login, setup, and status logs", _degoo_rc(root, "logs"))
     _print_command_block("Follow mount, login, setup, and status logs", _degoo_rc(root, "logs", "--follow"))
     _print_command_block("Log helper options", _degoo_rc(root, "logs", "help"))
@@ -776,68 +778,96 @@ def _install_args(binary: str, *, upgrade: bool) -> argparse.Namespace:
 
 
 def _load_folders(root: Path) -> list[dict[str, Any]]:
-    binary = root / "bin/rclone"
-    env = {
-        "HOME": str(installer.home_directory()),
-        "XDG_CONFIG_HOME": str(root / "config"),
-        "XDG_CACHE_HOME": str(root / "cache"),
-        "TMPDIR": str(root / "tmp"),
-        "PATH": "/usr/bin:/bin",
-        "LANG": "C.UTF-8",
-    }
     try:
-        result = subprocess.run(
-            [
-                str(binary),
-                "--config",
-                str(root / "config/rclone.conf"),
-                "--log-file",
-                str(root / "logs/wizard-folders.log"),
-                "--log-level",
-                "ERROR",
-                "degoo",
-                "folders",
-                str(root / "config/auth.json"),
-                "--parent-id",
-                "0",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            timeout=120,
-            check=False,
-            umask=0o077,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        raise WizardError(f"Degoo could not list device folders; run {_degoo_rc(root, 'login')} and retry") from None
-    if result.returncode != 0:
-        raise WizardError(f"Degoo could not list device folders; run {_degoo_rc(root, 'login')} and retry")
+        return connection.list_folders(root)
+    except connection.ConnectionCheckError as exc:
+        raise WizardError(str(exc)) from None
+
+
+def _ensure_connection(root: Path) -> tuple[int, list[dict[str, Any]]]:
+    saved = installer.read_private_file(root / "config/auth.json", missing_ok=True)
+    if saved:
+        print("Checking saved Degoo account credentials...")
+        try:
+            folders = connection.check_connection(root)
+        except connection.LoginRequiredError:
+            print("Saved account authentication was rejected; sign in again.")
+        except connection.ConnectionCheckError as exc:
+            raise WizardError(str(exc)) from None
+        else:
+            print("Connection verified with saved credentials; no password is needed.")
+            return 0, folders
+    code = login.run(root, clear_email=False)
+    if code != 0:
+        return code, []
+    print("Testing the authenticated Degoo connection...")
     try:
-        data = json.loads(result.stdout)
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-        raise WizardError("Degoo returned an unrecognized device-folder list") from None
-    if not isinstance(data, list):
-        raise WizardError("Degoo returned an unrecognized device-folder list")
-    folders: list[dict[str, Any]] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        folder_id = item.get("id")
-        name = item.get("name")
-        category = item.get("category")
-        if (
-            not isinstance(folder_id, str)
-            or folder_id == "0"
-            or not folder_id
-            or any(ord(character) < 0x21 or ord(character) == 0x7F for character in folder_id)
-            or not isinstance(name, str)
-            or type(category) is not int
-            or category not in SELECTABLE_CATEGORIES
-        ):
-            continue
-        folders.append({"id": folder_id, "name": name, "category": category})
-    return folders
+        folders = connection.check_connection(root)
+    except connection.ConnectionCheckError as exc:
+        raise WizardError(f"Authenticated connection test did not pass: {exc}") from None
+    print("Connection verified: Degoo accepted the account credentials.")
+    return 0, folders
+
+
+def _choose_folder_name(root: Path, parent_id: str, name: str, import_path: str | None, *, input_fn: Callable[[str], str]) -> tuple[str | None, str, str | None]:
+    try:
+        folders = connection.list_folders(root, parent_id)
+    except connection.ConnectionCheckError as exc:
+        raise WizardError(str(exc)) from None
+    confirmed = False
+    while True:
+        matches = [folder for folder in folders if folder["name"] == name]
+        if len(matches) > 1:
+            raise WizardError("More than one remote folder has the suggested name; use an explicit folder ID and its matching vault configuration")
+        if matches:
+            folder = matches[0]
+            print(f"Remote directory {name!r} already exists under the selected parent (ID {folder['id']}).")
+            if import_path:
+                if _yes_no("Use this existing directory with the imported vault configuration?", default=True, input_fn=input_fn):
+                    return folder["id"], name, import_path
+            else:
+                print("To reopen an encrypted vault, supply its matching private vault configuration or restore its backup.")
+                path = _prompt("Private vault.json for this existing folder (leave blank to choose another name)", "", input_fn=input_fn) or None
+                if path:
+                    _imported_settings(path, root)
+                    return folder["id"], name, path
+            name = setup._validate_name(_prompt("Name for a different new vault folder", name + "-new", input_fn=input_fn))
+            confirmed = True
+        else:
+            print(f"Remote directory {name!r} does not exist under the selected parent.")
+            if confirmed:
+                return None, name, import_path
+            chosen = setup._validate_name(_prompt("Name for the new dedicated vault folder", name, input_fn=input_fn))
+            if chosen == name:
+                return None, name, import_path
+            name = chosen
+            confirmed = True
+
+
+def _choose_backup(args: argparse.Namespace, root: Path, *, root_exists: bool, input_fn: Callable[[str], str]):
+    import restore
+
+    supplied = getattr(args, "restore_directory", None)
+    path = supplied or _prompt("Backup directory to restore (optional; leave blank for normal installation)", "", input_fn=input_fn)
+    if not path:
+        return None
+    if root_exists:
+        raise WizardError("Backup restoration requires a fresh installation; the existing installation and backup were left untouched")
+    try:
+        backup = restore.inspect_backup(path, root)
+    except restore.RestoreError as exc:
+        raise WizardError(str(exc)) from None
+    print(f"Backup found at {backup.directory}.")
+    if backup.folder_id:
+        print(f"Recovered vault folder: {backup.folder_name or '(name not recorded)'} (ID {backup.folder_id}).")
+    print("Recovered mount settings will be offered as defaults; vault encryption settings will be preserved.")
+    if backup.auth_bytes:
+        print("Saved account credentials will be tested before asking for a password.")
+    if backup.cache_has_data:
+        print("Recovered cached files and pending writes will be preserved.")
+    if not _yes_no("Use this backup as the installation defaults?", default=True, input_fn=input_fn):
+        raise WizardCancelled
+    return backup
 
 
 def _select_parent(folders: list[dict[str, Any]], *, input_fn: Callable[[str], str]) -> str:
@@ -991,7 +1021,14 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             manifest = installer.load_manifest(root)
         except installer.InstallError as exc:
             raise WizardError(str(exc)) from None
+    backup = _choose_backup(args, root, root_exists=root_exists, input_fn=input_fn)
     configured_folder_id = manifest.get("root_folder_id", "") if manifest else ""
+    if backup and backup.folder_id:
+        confirmed_id = _prompt("Recovered dedicated vault folder ID", backup.folder_id, input_fn=input_fn)
+        if confirmed_id != backup.folder_id:
+            raise WizardError("Restored configuration and cache must keep their original vault folder ID; choose normal installation to use another vault")
+        configured_folder_id = confirmed_id
+        requested_folder_name = requested_folder_name or _prompt("Recovered vault folder name", backup.folder_name, input_fn=input_fn) or None
     if configured_folder_id and requested_folder_id and configured_folder_id != requested_folder_id:
         raise WizardError("the requested folder ID differs from this install's existing vault binding")
     upgrade = bool(getattr(args, "upgrade", False))
@@ -1010,6 +1047,10 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
 
     installed_vault = _current_vault_settings(root) if root_exists else None
     import_path = getattr(args, "vault_config", None)
+    if backup and backup.vault_config_path:
+        if import_path and Path(import_path).expanduser() != backup.vault_config_path:
+            raise WizardError("The selected backup already supplies its vault configuration; do not replace its encryption settings")
+        import_path = str(backup.vault_config_path)
     if installed_vault is None and not import_path:
         import_path = _prompt("Path to an existing private vault.json to import (optional)", "", input_fn=input_fn) or None
     imported = _imported_settings(import_path, root) if import_path else None
@@ -1019,7 +1060,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
         raise WizardError("this install is bound to a remote vault but its secret is missing; import the matching private vault.json")
 
     print("Step 2 of 6: Set local cache and vault sizing.")
-    mount_settings = _cache_settings(root, input_fn=input_fn)
+    mount_settings = _prompt_cache_settings(backup.mount_settings, input_fn=input_fn) if backup else _cache_settings(root, input_fn=input_fn)
     vault_sizes = _new_vault_sizes(imported, input_fn=input_fn) if installed_vault is None else None
     if imported is not None:
         print("The imported vault password and encryption settings will be preserved.")
@@ -1028,7 +1069,10 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
 
     print("Step 3 of 6: Install or upgrade the private client.")
     staged_args = _install_args(binary, upgrade=upgrade)
-    if configured_folder_id and installed_vault is None and import_path:
+    if backup and configured_folder_id:
+        staged_args.folder_id = configured_folder_id
+        staged_args.folder_name = requested_folder_name
+    if (configured_folder_id or backup) and installed_vault is None and import_path:
         staged_args.vault_config = import_path
     try:
         try:
@@ -1054,10 +1098,20 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             build_temp.cleanup()
     root = installer.expected_root()
 
-    print("Step 4 of 6: Log in to Degoo.")
+    if backup:
+        import restore
+        try:
+            restore.restore_to_install(backup, root)
+            _save_settings(root, mount_settings, None)
+        except (restore.RestoreError, WizardError) as exc:
+            _completion_summary(root, mount_ready=mount_ready, systemd_available=systemd_available,
+                                note="Backup restoration did not complete; keep the original backup and recovered local state before retrying.")
+            raise WizardError(str(exc)) from None
+
+    print("Step 4 of 6: Verify the Degoo account connection.")
     try:
-        login_result = login.run(root, clear_email=False)
-    except login.LoginError:
+        login_result, account_folders = _ensure_connection(root)
+    except (login.LoginError, WizardError):
         _completion_summary(
             root,
             mount_ready=mount_ready,
@@ -1087,7 +1141,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 folder_name = _prompt("Local name for this dedicated folder", "", input_fn=input_fn) or None
         else:
             try:
-                folders = _load_folders(root)
+                folders = account_folders or _load_folders(root)
             except WizardError:
                 _completion_summary(
                     root,
@@ -1100,8 +1154,10 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 )
                 raise
             parent_id = _select_parent(folders, input_fn=input_fn)
-            folder_name = folder_name or _prompt("Name for the new dedicated vault folder", DEFAULT_FOLDER_NAME, input_fn=input_fn)
-            folder_id = None
+            folder_id, folder_name, import_path = _choose_folder_name(
+                root, parent_id, folder_name or DEFAULT_FOLDER_NAME, import_path, input_fn=input_fn)
+            if folder_id and import_path:
+                vault_sizes = None
 
         if folder_id:
             setup_args = argparse.Namespace(
@@ -1109,7 +1165,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 folder_id=folder_id,
                 parent_id=None,
                 name=folder_name,
-                vault_config=import_path,
+                vault_config=None if backup and backup.vault_config_path else import_path,
             )
         else:
             setup_args = argparse.Namespace(
@@ -1117,7 +1173,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 folder_id=None,
                 parent_id=parent_id,
                 name=folder_name,
-                vault_config=import_path,
+                vault_config=None if backup and backup.vault_config_path else import_path,
             )
         try:
             setup_result = setup.run(setup_args)

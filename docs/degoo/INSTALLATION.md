@@ -139,9 +139,12 @@ device/folder or enter its ID. The new dedicated child folder defaults to
 or as the create parent.
 
 You may select an existing dedicated folder instead of creating a new one.
-Existing native Degoo files are not encrypted-vault files and cannot be read
-as such. Setup creates the provider-specific marker for a new vault and will
-not repurpose an existing folder with the same name.
+At the folder-name step, the wizard lists folders under the selected parent and
+reports whether the suggested name already exists. Existing native Degoo files
+are not encrypted-vault files and cannot be read as such. If a folder with the
+chosen name already exists, use its matching private `vault.json` to open an
+encrypted vault or choose another name for a new vault. The wizard will not
+overwrite an existing encrypted folder with a newly generated key.
 
 The wizard generates a cryptographically random vault encryption password for
 a new vault. Keep a private backup of `config/vault.json` outside the install
@@ -161,6 +164,52 @@ Provide the existing folder and configuration when starting the wizard:
 ./contrib/degoo/degoo-rc install --wizard --binary ./build/rclone \
   --folder-id EXISTING_VAULT_ID --vault-config ~/private-backups/vault.json
 ```
+
+To create a configuration backup while keeping the installation and mount:
+
+```sh
+degoo-rc backup-config --directory ~/private-backups/rclone-degoo
+```
+
+Omit `--directory` to create a new timestamped private backup at the default
+location. This is a configuration and credentials backup, not a file-data
+backup. It saves the original vault key, folder binding, saved account login,
+and mount settings. Cache, pending uploads, logs, and binaries are excluded.
+Let uploads finish before expecting those changes on another computer.
+Transfer this private directory securely; it contains the vault encryption
+secret and account credentials.
+
+To mount the same remote vault on another computer, restore this backup or
+state retained by the uninstall wizard with a fresh interactive installation:
+
+```sh
+./contrib/degoo/degoo-rc install --wizard \
+  --restore-directory ~/private-backups/rclone-degoo
+```
+
+`--restore-directory` is available only with `--wizard`. Restore requires the
+default install root to be absent; if it exists, the wizard refuses and leaves
+both it and the backup untouched. The wizard asks you to confirm the recovered
+folder ID and name and use the saved mount settings as defaults. It preserves
+the original vault password, salt, chunk size, and object cap. It restores
+retained private account and configuration files and, when present, copies the
+saved cache into the new install. Cache identity is rebound locally for the new
+path, including when the cache is moved to another machine; the source backup
+is left intact. Pending uploads remain in the cache for later retry.
+
+If you do not pass `--restore-directory`, the wizard offers an optional backup
+directory prompt; leave it blank for a normal installation. The restore uses
+the regular cache-settings step with the saved values as defaults and adds no
+separate cache-tuning prompts.
+
+The account check lists Degoo folders using saved credentials. A successful
+authenticated listing skips the account password prompt. If Degoo explicitly
+rejects the saved login, the wizard asks you to log in and tests the account
+connection again. Provider or network errors stop setup with their connection
+failure; they are not reported as a wrong password. This check verifies Degoo
+account authentication, not the vault password or the ability to decrypt
+remote files. Restoring an existing encrypted folder requires its original
+`vault.json`; the wizard cannot replace its encryption settings with a new key.
 
 ## Defaults
 
@@ -428,13 +477,19 @@ changes can be recovered. If you choose not to retain a vault config, type
 `DISCARD` to confirm losing the local secret. Type `REMOVE` to confirm local
 cleanup.
 
-To resume uploads, restore the retained backup contents into
-`~/.local/share/rclone-degoo`, then run this from a source checkout:
+To resume uploads from a retained backup, install the client into a fresh
+default install root with the wizard and pass the backup directory:
 
 ```sh
-./contrib/degoo/degoo-rc install \
-  --binary ~/.local/share/rclone-degoo/bin/rclone --upgrade --no-wizard
+./contrib/degoo/degoo-rc install --wizard \
+  --restore-directory ~/private-backups/rclone-degoo
 ```
+
+The restore copies selected private state into the new installation; do not
+manually copy the backup over the install path. The original backup remains
+available if recovery needs to be retried. `--restore-directory` requires a
+fresh install and is rejected when the default root already exists. It cannot
+be used with `--no-wizard`.
 
 The cleanup stops the owned service before disabling it, removes its systemd
 links, reloads the user manager, and removes the contained configuration,

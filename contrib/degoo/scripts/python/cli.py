@@ -17,6 +17,7 @@ BASE = Path(__file__).resolve().parents[2]
 COMMANDS = {
     "install": "Install or upgrade the client and configure a vault with a guided wizard.",
     "uninstall": "Inventory or remove the local installation, with optional state retention.",
+    "backup-config": "Back up configuration and credentials only, without file data or cached uploads.",
     "login": "Sign in to Degoo without saving the account password.",
     "setup": "Select or create a dedicated remote folder and configure vault encryption.",
     "mount": "Mount the vault in the foreground with transparent encryption and decryption.",
@@ -30,10 +31,11 @@ COMMANDS = {
     "trash": "List account-wide trash without deleting anything.",
     "empty-trash": "Permanently delete all account trash after confirmation; supports dry-run.",
 }
-PYTHON_COMMANDS = {"install", "uninstall", "login", "setup", "service", "info", "logs"}
+PYTHON_COMMANDS = {"install", "uninstall", "backup-config", "login", "setup", "service", "info", "logs"}
 DETAILS = {
     "install": "With no parameters, starts the wizard. Installs into ~/.local/share/rclone-degoo and links ~/.local/bin/degoo-rc. An unattended install needs --binary and --no-wizard. Upgrade preserves configuration and cached writes.",
     "uninstall": "With no parameters in a terminal, starts guided cleanup. --inventory is read-only. Removal affects local installation files and owned service/PATH links; remote files remain. Pending writes require retaining both cache and matching configuration.",
+    "backup-config": "Creates a private configuration and credentials backup without stopping the mount. --directory selects a new destination outside the install. File data, cache, and pending uploads are excluded. Restore with install --wizard --restore-directory PATH.",
     "login": "Prompts visibly for account email and a hidden password. Saves tokens and remembers only the email. Vault encryption settings and pending writes are preserved.",
     "setup": "Use --folder-id for an existing dedicated vault or --parent-id DEVICE_ID --name VAULT_NAME to create one. Account root ID 0 is not a vault or creation parent. Reusing encrypted data requires its original --vault-config.",
     "mount": "Uses the contained vault configuration, cache settings, and mount directory. Keep only one writer using the cache; stop the user service before a foreground mount. Writes persist locally first and upload asynchronously. Ctrl+C ends the foreground session.",
@@ -74,7 +76,7 @@ def show_help(command: str | None = None) -> int:
         return 0
     print(f"{COMMANDS[command]}\n", flush=True)
     if command in PYTHON_COMMANDS:
-        module = importlib.import_module(command)
+        module = importlib.import_module(command.replace("-", "_"))
         parser = module.build_parser()
         parser.prog = f"degoo-rc {command}"
         for action in parser._actions:
@@ -140,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         return show_help(command)
     root = root_directory()
     if command in PYTHON_COMMANDS:
-        module = importlib.import_module(command)
+        module = importlib.import_module(command.replace("-", "_"))
         if command != "install":
             parameters = ["--root", str(root), *parameters]
         return module.main(parameters)

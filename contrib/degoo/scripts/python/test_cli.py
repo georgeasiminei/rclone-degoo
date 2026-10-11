@@ -72,6 +72,19 @@ class CLITest(unittest.TestCase):
         self.assertIn("degoo-rc help", result.stderr)
         self.assertEqual(self.run_cli("stop", "unexpected").returncode, 2)
 
+    def test_backup_config_dispatch_creates_portable_configuration_only(self):
+        result = self.run_cli("install", "--binary", str(self.binary), "--folder-id", "test-vault-id", "--no-wizard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        destination = self.home / "portable configuration"
+        result = self.run_cli("backup-config", "--directory", str(destination))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((destination / "config/vault.json").is_file())
+        self.assertEqual(json.loads((destination / "install.json").read_text())["root_folder_id"], "test-vault-id")
+        self.assertEqual(set(path.name for path in destination.iterdir()), {"config", "install.json"})
+        secret = json.loads((destination / "config/vault.json").read_text())["password"]
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        self.assertIn("excluded", result.stdout.lower())
+
     def test_installed_path_link_dispatches_mount_flags_without_splitting(self):
         self.install()
         link = self.home / ".local/bin/degoo-rc"
