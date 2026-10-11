@@ -117,15 +117,58 @@ class InfoTest(unittest.TestCase):
         self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", lines[2])
         self.assertIn("log in before cloud operations", lines[2])
 
-    def test_legacy_mount_settings_report_effective_write_back_default(self) -> None:
-        settings = install.DEFAULT_MOUNT_SETTINGS.copy()
-        settings.pop("write_back")
+    def test_legacy_mount_settings_report_effective_defaults_for_missing_fields(self) -> None:
+        settings = {
+            key: install.DEFAULT_MOUNT_SETTINGS[key]
+            for key in ("cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval", "verify_upload")
+        }
         self.write_private(self.root / "config/mount.json", settings)
 
         summary = "\n".join(info._settings_summary(self.root))
 
         self.assertIn("Delay before uploading closed files: 5s.", summary)
-        self.assertNotIn("Delay before uploading closed files: unknown", summary)
+        self.assertIn("Cache maximum size: 60G", summary)
+        self.assertIn("Read buffer size: 16Mi", summary)
+        self.assertIn("Read chunk size: 128Mi", summary)
+        self.assertIn("Read chunk size limit: off", summary)
+        self.assertIn("Read chunk streams: 8", summary)
+        self.assertIn("Directory cache time: 30m", summary)
+        self.assertIn("Attribute cache timeout: 1s", summary)
+        self.assertIn("Transfers: 4", summary)
+        self.assertIn("Bandwidth limit: off", summary)
+        self.assertIn("Network timeout: 5m", summary)
+        self.assertIn("Upload verification: disabled", summary)
+
+    def test_mount_settings_summary_reports_saved_custom_tuning(self) -> None:
+        settings = install.DEFAULT_MOUNT_SETTINGS | {
+            "buffer_size": "32Mi",
+            "read_ahead": "2Mi",
+            "read_chunk_size": "64Mi",
+            "read_chunk_size_limit": "256Mi",
+            "read_chunk_streams": 0,
+            "dir_cache_time": "45m",
+            "attr_timeout": "2s",
+            "transfers": 6,
+            "bwlimit": "10M:20M",
+            "timeout": "6m",
+        }
+        self.write_private(self.root / "config/mount.json", settings)
+
+        summary = "\n".join(info._settings_summary(self.root))
+
+        for expected in (
+            "Read buffer size: 32Mi",
+            "Read ahead: 2Mi",
+            "Read chunk size: 64Mi",
+            "Read chunk size limit: 256Mi",
+            "Read chunk streams: 0",
+            "Directory cache time: 45m",
+            "Attribute cache timeout: 2s",
+            "Transfers: 6",
+            "Bandwidth limit: 10M:20M",
+            "Network timeout: 6m",
+        ):
+            self.assertIn(expected, summary)
 
     def test_write_back_microsecond_units_are_reported(self) -> None:
         for value in ("1µs", "1μs"):
@@ -198,7 +241,7 @@ class InfoTest(unittest.TestCase):
             report = info.report(self.root, self.manifest)
         self.assertIn("My Device / Vault", report)
         self.assertIn("enabled; active", report)
-        self.assertIn("20G", report)
+        self.assertIn("60G", report)
         self.assertIn("1Gi", report)
         self.assertIn("3 files", report)
         self.assertIn("Approximate cache allocation", report)

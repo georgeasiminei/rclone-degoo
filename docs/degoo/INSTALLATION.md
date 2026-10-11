@@ -43,7 +43,10 @@ go build -o build/rclone .
 ```
 
 Go 1.26 or newer is required only for this source-build path. In a terminal,
-the source command starts the wizard. To select a binary explicitly:
+the source command starts the wizard. A detected executable beside the launcher,
+in the archive's `bin/` directory, or in the source build location is validated
+and reused without a binary-path prompt. If it is missing or invalid, the
+wizard offers the existing build/path flow. To select a binary explicitly:
 
 ```sh
 ./contrib/degoo/degoo-rc install --wizard --binary /path/to/rclone
@@ -166,19 +169,47 @@ its directories to owner-only access (`0700`) and private config files to
 `0600`. The wizard offers to enable the systemd user service by default when a
 user manager responds. It does not enable lingering automatically.
 
-For a new vault, the default chunk size is 1 GiB of plaintext and the
+For a new vault, the default chunk size is 128 MiB of plaintext and the
 provisional maximum encrypted object size is 19 GiB. The provider's live limit
 above 20 GiB has not been established. The initial `config/mount.json` values
 are:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `cache_max_size` | `20G` | Soft target for the amount of cached data. Open and dirty files are not evicted to meet it. |
-| `cache_min_free_space` | `20G` | Keep this much free space on the filesystem holding the cache when evicting clean data. |
-| `cache_max_age` | `10m` | Maximum age for clean cached data before it becomes eligible for eviction. |
+| `cache_max_size` | `60G` | Soft target for the amount of cached data. Open and dirty files are not evicted to meet it. |
+| `cache_min_free_space` | `60G` | Keep this much free space on the filesystem holding the cache when evicting clean data. |
+| `cache_max_age` | `750h` | Maximum age for clean cached data before it becomes eligible for eviction. |
 | `cache_poll_interval` | `5s` | How often the local cache cleaner checks for stale clean files. |
-| `write_back` | `1s` | Wait after a file closes before attempting its upload. Must be positive. |
-| `verify_upload` | `true` | Download each encrypted upload and compare its size and SHA-256 before publication. |
+| `write_back` | `5s` | Wait after a file closes before attempting its upload. Must be positive. |
+| `verify_upload` | `false` | Enable download of each encrypted upload and compare its size and SHA-256 before publication. |
+| `buffer_size` | `16Mi` | RAM read buffer per open file. |
+| `read_ahead` | `1Mi` | Additional advance download into the full VFS disk cache. |
+| `read_chunk_size` | `128Mi` | Network read-request window, independent of stored vault chunks. |
+| `read_chunk_size_limit` | `off` | Maximum adaptive read-window growth when `read_chunk_streams` is zero. |
+| `read_chunk_streams` | `8` | Concurrent fixed-size read streams; zero selects adaptive single-stream reads. |
+| `dir_cache_time` | `30m` | Directory metadata freshness interval; mount changes appear immediately. |
+| `attr_timeout` | `1s` | Kernel file/directory attribute caching interval. |
+| `transfers` | `4` | Maximum simultaneous background file uploads. |
+| `bwlimit` | `off` | Aggregate bandwidth limit; accepts rclone rates and timetables. |
+| `timeout` | `5m` | Network I/O idle timeout, not a total transfer deadline. |
+
+The additional buffering, reading, directory, attribute, concurrency, bandwidth,
+and timeout settings are configured only by editing `config/mount.json`; the
+wizard adds no prompts for them. Existing values survive wizard upgrades.
+Missing fields use the defaults above. Explicit command-line flags take
+precedence. Restart the mount or service after editing this private file.
+Eight read streams are a starting point for a fast connection, not a throughput
+guarantee: each can request a 128 MiB range, so scattered reads may waste
+bandwidth. Set `read_chunk_streams` to zero for adaptive single-stream reads,
+or reduce streams and `read_chunk_size` when partial reads dominate. The
+`read_ahead` value does not cap parallel request sizes.
+
+Cache size and free-space targets are independent. With a 40 GiB cache and
+100 GiB free, neither 60 GiB target triggers eviction. With only 50 GiB free,
+the cleaner tries to reclaim 10 GiB from clean, closed cached files. Open and
+pending files remain protected; these targets cannot guarantee against a full
+disk. Cache age is measured since last access, and size or free-space pressure
+can evict clean files before that age is reached.
 
 Change these values in `config/mount.json` and restart the mount or service to
 apply them. Set `write_back` to a shorter duration to queue closed files sooner.

@@ -113,8 +113,9 @@ setting absent on other machines. If a custom salt was used, it must also be
 preserved exactly. Mounting the same folder with different encryption settings
 does not migrate or decrypt its existing files.
 
-Pass `--settings /private/path/mount.json` for persistent cache and verification
-settings; the file must be owner-private, just like the vault configuration.
+Pass `--settings /private/path/mount.json` for persistent cache, read, network,
+and verification settings; the file must be owner-private, just like the vault
+configuration.
 Explicit mount flags override corresponding settings. `--verify-upload=false`
 skips full SHA-256 download verification before publication while retaining
 metadata and publication checks. It defaults to true and is independent of
@@ -126,15 +127,15 @@ the encryption password and cache identity.
 operation promises that Degoo has already received the file. Keep the cache
 directory across restarts and login failures. Dirty files are reloaded by VFS
 and uploaded when the same vault is mounted again with working credentials.
-New installs set `write_back` to one second, which starts a closed file's upload
-sooner than rclone's five-second default when a transfer slot is available.
+New installs set `write_back` to five seconds, matching rclone's default.
+Uploads begin when that delay expires and a transfer slot is available.
 Existing settings without this field retain the five-second default. The value
 must be positive and finite; `0s`, negative durations, and `off` are refused to
 preserve background uploads and retries. Failed attempts double their retry
-delay, starting from `write_back`. Upload verification downloads and hashes
-each encrypted object before publishing it;
-set `verify_upload` to `false` in the private mount settings to skip that extra
-readback while retaining metadata and publication checks.
+delay, starting from `write_back`. Upload verification, when enabled, downloads
+and hashes each encrypted object before publishing it. New installer settings
+use `verify_upload: false` to skip that extra readback while retaining metadata
+and publication checks.
 
 ```sh
 ./rclone degoo status ~/.config/rclone-degoo/vault.json

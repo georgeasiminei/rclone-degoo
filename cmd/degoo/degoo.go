@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rclone/rclone/backend/chunker"
 	"github.com/rclone/rclone/backend/crypt"
@@ -25,6 +26,7 @@ import (
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/cmd/mountlib"
 	rfs "github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -59,12 +61,22 @@ type VaultConfig struct {
 }
 
 type mountSettings struct {
-	CacheMaxSize      *string `json:"cache_max_size,omitempty"`
-	CacheMinFreeSpace *string `json:"cache_min_free_space,omitempty"`
-	CacheMaxAge       *string `json:"cache_max_age,omitempty"`
-	CachePollInterval *string `json:"cache_poll_interval,omitempty"`
-	WriteBack         *string `json:"write_back,omitempty"`
-	VerifyUpload      *bool   `json:"verify_upload,omitempty"`
+	CacheMaxSize       *string `json:"cache_max_size,omitempty"`
+	CacheMinFreeSpace  *string `json:"cache_min_free_space,omitempty"`
+	CacheMaxAge        *string `json:"cache_max_age,omitempty"`
+	CachePollInterval  *string `json:"cache_poll_interval,omitempty"`
+	WriteBack          *string `json:"write_back,omitempty"`
+	VerifyUpload       *bool   `json:"verify_upload,omitempty"`
+	BufferSize         *string `json:"buffer_size,omitempty"`
+	ReadAhead          *string `json:"read_ahead,omitempty"`
+	ReadChunkSize      *string `json:"read_chunk_size,omitempty"`
+	ReadChunkSizeLimit *string `json:"read_chunk_size_limit,omitempty"`
+	ReadChunkStreams   *int    `json:"read_chunk_streams,omitempty"`
+	DirCacheTime       *string `json:"dir_cache_time,omitempty"`
+	AttrTimeout        *string `json:"attr_timeout,omitempty"`
+	Transfers          *int    `json:"transfers,omitempty"`
+	BwLimit            *string `json:"bwlimit,omitempty"`
+	Timeout            *string `json:"timeout,omitempty"`
 }
 
 func init() {
@@ -126,8 +138,9 @@ VFS caching are enforced. fsync commits to the local cache; uploads finish
 asynchronously. Keep the cache until pending uploads complete. Use degoo status
 to count locally pending files. Only one process may use a vault cache at a time.
 Live Degoo behavior is experimental; use a disposable vault first. Upload readback
-verification is enabled by default. The private --settings file may set cache
-limits, write_back, and verify_upload; explicit command-line flags take precedence.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
+verification is enabled by default. The private --settings file may set cache,
+read, mount, and network controls, plus write_back and verify_upload; explicit
+command-line flags take precedence.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
 		return mountVault(c.Context(), args[0], args[1], settingsFile, c.Flags(), verifyUpload)
 	}}
 	mountlib.AddFlags(mount.Flags())
@@ -220,13 +233,64 @@ func readMountSettings(filename string) (*mountSettings, error) {
 }
 
 func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, verifyUploadFlag bool) (bool, error) {
-	var cacheMaxSize rfs.SizeSuffix
+	return s.applyWithConfig(options, nil, nil, flags, verifyUploadFlag)
+}
+
+func (s *mountSettings) applyWithConfig(options *vfscommon.Options, mountOptions *mountlib.Options, configOptions *rfs.ConfigInfo, flags *pflag.FlagSet, verifyUploadFlag bool) (bool, error) {
+	var bufferSize, readAhead, readChunkSize, readChunkSizeLimit, cacheMaxSize, cacheMinFreeSpace rfs.SizeSuffix
+	var readChunkStreams, transfers int
+	var dirCacheTime, attrTimeout, timeout rfs.Duration
+	var bwLimit rfs.BwTimetable
+	var err error
+	if bufferSize, err = parseMountSize("buffer_size", s.BufferSize); err != nil {
+		return false, err
+	}
+	if s.BufferSize != nil && bufferSize < 0 {
+		return false, errors.New("invalid buffer_size: must be zero or greater")
+	}
+	if readAhead, err = parseMountSize("read_ahead", s.ReadAhead); err != nil {
+		return false, err
+	}
+	if s.ReadAhead != nil && readAhead < 0 {
+		return false, errors.New("invalid read_ahead: must be zero or greater")
+	}
+	if readChunkSize, err = parseMountSize("read_chunk_size", s.ReadChunkSize); err != nil {
+		return false, err
+	}
+	if readChunkSizeLimit, err = parseMountSize("read_chunk_size_limit", s.ReadChunkSizeLimit); err != nil {
+		return false, err
+	}
+	if s.ReadChunkStreams != nil {
+		readChunkStreams = *s.ReadChunkStreams
+		if readChunkStreams < 0 {
+			return false, errors.New("invalid read_chunk_streams: must be zero or greater")
+		}
+	}
+	if dirCacheTime, err = parseMountDuration("dir_cache_time", s.DirCacheTime); err != nil {
+		return false, err
+	}
+	if attrTimeout, err = parseMountDuration("attr_timeout", s.AttrTimeout); err != nil {
+		return false, err
+	}
+	if s.Transfers != nil {
+		transfers = *s.Transfers
+		if transfers <= 0 {
+			return false, errors.New("invalid transfers: must be greater than zero")
+		}
+	}
+	if s.BwLimit != nil {
+		if err := bwLimit.Set(*s.BwLimit); err != nil {
+			return false, fmt.Errorf("invalid bwlimit: %w", err)
+		}
+	}
+	if timeout, err = parseMountDuration("timeout", s.Timeout); err != nil {
+		return false, err
+	}
 	if s.CacheMaxSize != nil {
 		if err := cacheMaxSize.Set(*s.CacheMaxSize); err != nil {
 			return false, fmt.Errorf("invalid cache_max_size: %w", err)
 		}
 	}
-	var cacheMinFreeSpace rfs.SizeSuffix
 	if s.CacheMinFreeSpace != nil {
 		if err := cacheMinFreeSpace.Set(*s.CacheMinFreeSpace); err != nil {
 			return false, fmt.Errorf("invalid cache_min_free_space: %w", err)
@@ -254,19 +318,74 @@ func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, 
 		}
 	}
 	if s.CacheMaxSize != nil && !flagChanged(flags, "vfs-cache-max-size") {
-		options.CacheMaxSize = cacheMaxSize
+		if options != nil {
+			options.CacheMaxSize = cacheMaxSize
+		}
 	}
 	if s.CacheMinFreeSpace != nil && !flagChanged(flags, "vfs-cache-min-free-space") {
-		options.CacheMinFreeSpace = cacheMinFreeSpace
+		if options != nil {
+			options.CacheMinFreeSpace = cacheMinFreeSpace
+		}
 	}
 	if s.CacheMaxAge != nil && !flagChanged(flags, "vfs-cache-max-age") {
-		options.CacheMaxAge = cacheMaxAge
+		if options != nil {
+			options.CacheMaxAge = cacheMaxAge
+		}
 	}
 	if s.CachePollInterval != nil && !flagChanged(flags, "vfs-cache-poll-interval") {
-		options.CachePollInterval = cachePollInterval
+		if options != nil {
+			options.CachePollInterval = cachePollInterval
+		}
 	}
 	if s.WriteBack != nil && !flagChanged(flags, "vfs-write-back") {
-		options.WriteBack = writeBack
+		if options != nil {
+			options.WriteBack = writeBack
+		}
+	}
+	if options != nil {
+		if !flagChanged(flags, "vfs-read-ahead") {
+			options.ReadAhead = rfs.Mebi
+		}
+		if !flagChanged(flags, "vfs-read-chunk-streams") {
+			options.ChunkStreams = 8
+		}
+		if !flagChanged(flags, "dir-cache-time") {
+			options.DirCacheTime = rfs.Duration(30 * time.Minute)
+		}
+		if s.ReadAhead != nil && !flagChanged(flags, "vfs-read-ahead") {
+			options.ReadAhead = readAhead
+		}
+		if s.ReadChunkSize != nil && !flagChanged(flags, "vfs-read-chunk-size") {
+			options.ChunkSize = readChunkSize
+		}
+		if s.ReadChunkSizeLimit != nil && !flagChanged(flags, "vfs-read-chunk-size-limit") {
+			options.ChunkSizeLimit = readChunkSizeLimit
+		}
+		if s.ReadChunkStreams != nil && !flagChanged(flags, "vfs-read-chunk-streams") {
+			options.ChunkStreams = readChunkStreams
+		}
+		if s.DirCacheTime != nil && !flagChanged(flags, "dir-cache-time") {
+			options.DirCacheTime = dirCacheTime
+		}
+	}
+	if mountOptions != nil {
+		if s.AttrTimeout != nil && !flagChanged(flags, "attr-timeout") {
+			mountOptions.AttrTimeout = attrTimeout
+		}
+	}
+	if configOptions != nil {
+		if s.BufferSize != nil && !flagChanged(flags, "buffer-size") {
+			configOptions.BufferSize = bufferSize
+		}
+		if s.BwLimit != nil && !flagChanged(flags, "bwlimit") {
+			configOptions.BwLimit = bwLimit
+		}
+		if s.Timeout != nil && !flagChanged(flags, "timeout") {
+			configOptions.Timeout = timeout
+		}
+		if s.Transfers != nil && !flagChanged(flags, "transfers") {
+			configOptions.Transfers = transfers
+		}
 	}
 	verifyUpload := true
 	if s.VerifyUpload != nil {
@@ -278,6 +397,31 @@ func (s *mountSettings) apply(options *vfscommon.Options, flags *pflag.FlagSet, 
 	return verifyUpload, nil
 }
 
+func parseMountSize(name string, value *string) (rfs.SizeSuffix, error) {
+	var parsed rfs.SizeSuffix
+	if value == nil {
+		return parsed, nil
+	}
+	if err := parsed.Set(*value); err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	return parsed, nil
+}
+
+func parseMountDuration(name string, value *string) (rfs.Duration, error) {
+	var parsed rfs.Duration
+	if value == nil {
+		return parsed, nil
+	}
+	if err := parsed.Set(*value); err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("invalid %s: must be zero or greater", name)
+	}
+	return parsed, nil
+}
+
 func validateWriteBack(writeBack rfs.Duration) error {
 	if writeBack <= 0 || writeBack == rfs.DurationOff {
 		return errors.New("must be a positive finite duration")
@@ -286,7 +430,56 @@ func validateWriteBack(writeBack rfs.Duration) error {
 }
 
 func flagChanged(flags *pflag.FlagSet, name string) bool {
-	return flags != nil && flags.Changed(name)
+	return (flags != nil && flags.Changed(name)) || (pflag.CommandLine != nil && pflag.CommandLine.Changed(name))
+}
+
+func applyMountBandwidth(settings *mountSettings, flags *pflag.FlagSet, configOptions *rfs.ConfigInfo) (func(), error) {
+	if settings.BwLimit == nil || flagChanged(flags, "bwlimit") {
+		return func() {}, nil
+	}
+	global := rfs.GetConfig(context.Background())
+	if len(global.BwLimit) > 1 {
+		return nil, errors.New("cannot apply mount.json bwlimit while a global bwlimit timetable is active; remove the global timetable or use its CLI value")
+	}
+	previous := global.BwLimit.LimitAt(time.Now()).Bandwidth
+	schedule := append(rfs.BwTimetable(nil), configOptions.BwLimit...)
+	current := schedule.LimitAt(time.Now()).Bandwidth
+	accounting.TokenBucket.SetBwLimit(current)
+	if len(schedule) <= 1 {
+		return func() { accounting.TokenBucket.SetBwLimit(previous) }, nil
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	ticker := time.NewTicker(time.Minute)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ticker.Stop()
+		runMountBandwidthTicker(runCtx, schedule, current, ticker.C, accounting.TokenBucket.SetBwLimit)
+	}()
+	return func() {
+		cancel()
+		ticker.Stop()
+		<-done
+		accounting.TokenBucket.SetBwLimit(previous)
+	}, nil
+}
+
+func runMountBandwidthTicker(ctx context.Context, schedule rfs.BwTimetable, current rfs.BwPair, ticks <-chan time.Time, setLimit func(rfs.BwPair)) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now, ok := <-ticks:
+			if !ok {
+				return
+			}
+			next := schedule.LimitAt(now).Bandwidth
+			if next != current {
+				setLimit(next)
+				current = next
+			}
+		}
+	}
 }
 
 func mountRawConfig(remote string, verify bool) (*rfs.RegInfo, string, string, configmap.Mapper, error) {
@@ -454,20 +647,27 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, 
 	if err != nil {
 		return err
 	}
+	mountCtx, configOptions := rfs.AddConfig(ctx)
 	options := vfscommon.Opt
-	verifyUpload, err := settings.apply(&options, flags, verifyUploadFlag)
+	mountOptions := mountlib.Opt
+	verifyUpload, err := settings.applyWithConfig(&options, &mountOptions, configOptions, flags, verifyUploadFlag)
 	if err != nil {
 		return err
 	}
 	if err := validateWriteBack(options.WriteBack); err != nil {
 		return fmt.Errorf("invalid vfs-write-back: %w", err)
 	}
+	restoreBandwidth, err := applyMountBandwidth(settings, flags, configOptions)
+	if err != nil {
+		return err
+	}
+	defer restoreBandwidth()
 	lock, err := lockCache(c)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = lock.Close() }()
-	base, err := cache.Get(ctx, c.Remote)
+	base, err := cache.Get(mountCtx, c.Remote)
 	if err != nil {
 		return err
 	}
@@ -480,7 +680,7 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, 
 	}
 	// Bind the cache to the configured remote above. The verification setting is
 	// scoped to the mounted raw filesystem and must not change the cache identity.
-	mountBase, err := newMountRawFs(ctx, c.Remote, verifyUpload)
+	mountBase, err := newMountRawFs(mountCtx, c.Remote, verifyUpload)
 	if err != nil {
 		return err
 	}
@@ -488,7 +688,7 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, 
 	if !ok || mountDF.RootFolderID() != df.RootFolderID() {
 		return errors.New("verification override did not preserve the configured Degoo vault remote")
 	}
-	stack, err := newStack(ctx, mountBase, c)
+	stack, err := newStack(mountCtx, mountBase, c)
 	if err != nil {
 		return err
 	}
@@ -507,8 +707,8 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile string, 
 	}
 	options.CacheMode = vfscommon.CacheModeFull
 	options.PollInterval = 0
-	mnt := mountlib.NewMountPoint(guardedMount, mountpoint, stack, &mountlib.Opt, &options)
-	mnt.Ctx = ctx
+	mnt := mountlib.NewMountPoint(guardedMount, mountpoint, stack, &mountOptions, &options)
+	mnt.Ctx = mountCtx
 	rfs.Logf(nil, "Vault writes are saved in the local cache; remote uploads complete asynchronously. Keep the cache for recovery.")
 	_, err = mnt.Mount()
 	if err != nil {

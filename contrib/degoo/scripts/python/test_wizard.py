@@ -26,7 +26,7 @@ class WizardTest(unittest.TestCase):
                 with self.assertRaises(wizard.WizardError):
                     wizard._prompt_cache_settings({}, input_fn=lambda _: next(answers))
 
-    def test_write_back_prompt_uses_one_second_default_for_legacy_settings(self) -> None:
+    def test_write_back_prompt_uses_five_second_default_for_legacy_settings(self) -> None:
         answers = iter(("", "", "", "", "", ""))
         legacy = {
             key: value
@@ -36,7 +36,59 @@ class WizardTest(unittest.TestCase):
 
         settings = wizard._prompt_cache_settings(legacy, input_fn=lambda _: next(answers))
 
-        self.assertEqual(settings["write_back"], "1s")
+        self.assertEqual(settings["write_back"], "5s")
+
+    def test_choose_binary_skips_prompt_for_valid_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "rclone"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o700)
+            with (
+                mock.patch.object(wizard, "_default_binary", return_value=binary),
+                mock.patch.object(wizard.installer, "validate_binary") as validate,
+            ):
+                result = wizard._choose_binary(mock.Mock(binary=None), input_fn=lambda _: self.fail("unexpected binary prompt"))
+            self.assertEqual(result, (str(binary), None))
+            validate.assert_called_once_with(binary)
+
+    def test_choose_binary_prompts_when_default_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "rclone"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o700)
+            alternate = Path(temporary) / "alternate"
+            alternate.write_text("#!/bin/sh\nexit 0\n")
+            alternate.chmod(0o700)
+            prompts = []
+            with (
+                mock.patch.object(wizard, "_default_binary", return_value=binary),
+                mock.patch.object(wizard.installer, "validate_binary", side_effect=[wizard.installer.InstallError("missing Degoo support"), None]),
+            ):
+                result = wizard._choose_binary(mock.Mock(binary=None), input_fn=lambda prompt: prompts.append(prompt) or str(alternate))
+            self.assertEqual(result, (str(alternate), None))
+            self.assertEqual(len(prompts), 1)
+
+    def test_cache_prompts_preserve_config_only_tuning(self) -> None:
+        settings = dict(wizard.installer.DEFAULT_MOUNT_SETTINGS)
+        settings.update(read_ahead="2Mi", read_chunk_streams=6, dir_cache_time="45m", transfers=2)
+        prompts = []
+        result = wizard._prompt_cache_settings(settings, input_fn=lambda prompt: prompts.append(prompt) or "")
+        self.assertEqual(result["read_ahead"], "2Mi")
+        self.assertEqual(result["read_chunk_streams"], 6)
+        self.assertEqual(result["dir_cache_time"], "45m")
+        self.assertEqual(result["transfers"], 2)
+        self.assertEqual(len(prompts), 6)
+
+    def test_cache_prompts_preserve_rclone_off_and_day_durations(self) -> None:
+        settings = dict(wizard.installer.DEFAULT_MOUNT_SETTINGS)
+        settings.update(cache_max_size="off", cache_min_free_space="off", cache_max_age="30d")
+        result = wizard._prompt_cache_settings(settings, input_fn=lambda _: "")
+        self.assertEqual(result["cache_max_size"], "off")
+        self.assertEqual(result["cache_min_free_space"], "off")
+        self.assertEqual(result["cache_max_age"], "30d")
+
+    def test_new_vault_chunk_default_matches_deployment(self) -> None:
+        self.assertEqual(wizard._new_vault_sizes(None, input_fn=lambda _: ""), {"chunk_size": "128Mi", "max_object_size": "19Gi"})
 
     def test_default_binary_uses_distribution_bin_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -51,6 +103,23 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.installer, "expected_root", return_value=root / "installed"),
             ):
                 self.assertEqual(wizard._default_binary(), binary)
+
+    def test_default_binary_prefers_executable_beside_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "contrib/degoo"
+            package.mkdir(parents=True)
+            adjacent = package / "rclone"
+            built = root / "build/rclone"
+            built.parent.mkdir()
+            for candidate in (adjacent, built):
+                candidate.write_text("#!/bin/sh\nexit 0\n")
+                candidate.chmod(0o755)
+            with (
+                mock.patch.object(wizard, "_source_repo", return_value=root),
+                mock.patch.object(wizard, "_source_roots", return_value=[package, root]),
+            ):
+                self.assertEqual(wizard._default_binary(), adjacent)
 
     def test_default_binary_prefers_source_build_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -596,7 +665,7 @@ class WizardTest(unittest.TestCase):
             login_call.assert_called_once()
             self.assertEqual(capture.read_text(encoding="utf-8").splitlines(), ["device-123", "rclone-degoo-vault"])
             vault = json.loads((root / "config/vault.json").read_text(encoding="utf-8"))
-            self.assertEqual(vault["chunk_size"], "1Gi")
+            self.assertEqual(vault["chunk_size"], "128Mi")
             self.assertEqual(vault["max_object_size"], "19Gi")
             self.assertTrue(vault["password"])
             settings = json.loads((root / "config/mount.json").read_text(encoding="utf-8"))

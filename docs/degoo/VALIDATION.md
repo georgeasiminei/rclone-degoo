@@ -8,6 +8,31 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Config-only mount tuning and installer defaults
+
+The installer defaults match the last deployment: 60 GiB cache size and
+free-space targets, 750-hour retention, five-second cache cleanup and write-back,
+disabled upload readback verification, and 128 MiB plaintext storage chunks.
+Read-ahead defaults to 1 MiB, read streams to eight, and directory caching to
+30 minutes. Additional read, buffer, attribute, transfer, bandwidth, and idle
+timeout settings are available in the private mount JSON without new prompts.
+A detected Degoo-enabled binary is validated and reused without a path prompt.
+
+Offline checks passed:
+
+- Full `RCLONE_CONFIG=/notfound go test -timeout 20m ./...`, with the new test
+  binary and contained FUSE helper on `PATH`.
+- `go build`, `go test -race ./cmd/degoo/...`, and scoped golangci-lint v2.14.0
+  with zero lint issues.
+- All 147 Python helper tests and the packaging self-check, including current
+  and legacy config validation, upgrade preservation, and uninstall inventory.
+- Changed-file Markdown lint and `git diff --check`.
+
+Tests cover config defaults, explicit flag precedence, invalid values, active
+bandwidth limits, and cancellable timetable updates. The running deployment
+was not upgraded, and eight-stream throughput has not been benchmarked against
+Degoo. Parallel read ranges can exceed the configured extra read-ahead amount.
+
 ## Upload timing and registration recovery
 
 The 2026-10-11 upload-delay investigation found two registration failures in

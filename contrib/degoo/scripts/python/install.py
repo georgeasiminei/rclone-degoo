@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+from decimal import Decimal, InvalidOperation
 import errno
 import fcntl
 import hashlib
@@ -31,25 +32,41 @@ COMPATIBILITY_SHELL_FILES = (*SOURCE_SHELL_FILES, *GENERATED_SHELL_FILES)
 LEGACY_GENERATED_SHELL_FILES = COMPATIBILITY_SHELL_FILES
 MAX_CONFIG_SIZE = 1024 * 1024
 DEFAULT_MOUNT_SETTINGS = {
-    "cache_max_size": "20G",
-    "cache_min_free_space": "20G",
-    "cache_max_age": "10m",
+    "cache_max_size": "60G",
+    "cache_min_free_space": "60G",
+    "cache_max_age": "750h",
     "cache_poll_interval": "5s",
-    "write_back": "1s",
-    "verify_upload": True,
+    "write_back": "5s",
+    "verify_upload": False,
+    "buffer_size": "16Mi",
+    "read_ahead": "1Mi",
+    "read_chunk_size": "128Mi",
+    "read_chunk_size_limit": "off",
+    "read_chunk_streams": 8,
+    "dir_cache_time": "30m",
+    "attr_timeout": "1s",
+    "transfers": 4,
+    "bwlimit": "off",
+    "timeout": "5m",
 }
+REQUIRED_MOUNT_SETTINGS = frozenset(
+    {"cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval", "verify_upload"}
+)
+MOUNT_SIZE_SETTINGS = frozenset(
+    {"cache_max_size", "cache_min_free_space", "buffer_size", "read_ahead", "read_chunk_size", "read_chunk_size_limit"}
+)
+MOUNT_SIZE_OFF_FIELDS = frozenset({"cache_max_size", "cache_min_free_space", "read_chunk_size", "read_chunk_size_limit"})
+MOUNT_DURATION_SETTINGS = frozenset(
+    {"cache_max_age", "cache_poll_interval", "dir_cache_time", "attr_timeout", "timeout"}
+)
+MOUNT_COUNT_SETTINGS = {"read_chunk_streams": (0, (1 << 31) - 1), "transfers": (1, (1 << 31) - 1)}
 MAX_WRITE_BACK_DURATION_NS = (1 << 63) - 1
-WRITE_BACK_DURATION_UNITS_NS = {
-    "ns": 1,
-    "us": 1_000,
-    "µs": 1_000,
-    "μs": 1_000,
-    "ms": 1_000_000,
-    "s": 1_000_000_000,
-    "m": 60_000_000_000,
-    "h": 3_600_000_000_000,
-}
-WRITE_BACK_DURATION_COMPONENT = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|μs|ms|s|m|h)")
+SIZE_NUMBER = r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+SIZE_SUFFIX = r"(?:b|[kmgtpe](?:ib?)?)?"
+MOUNT_SIZE_VALUE = re.compile(rf"(?:off|{SIZE_NUMBER}{SIZE_SUFFIX})\Z", re.IGNORECASE)
+MOUNT_DURATION_COMPONENT = re.compile(r"((?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(ns|us|µs|μs|ms|s|m|h|d|w|M|y)")
+MOUNT_DURATION_NUMBER = re.compile(rf"{SIZE_NUMBER}\Z")
+BW_RATE = re.compile(rf"(?P<tx>off|{SIZE_NUMBER}{SIZE_SUFFIX})(?::(?P<rx>off|{SIZE_NUMBER}{SIZE_SUFFIX}))?\Z", re.IGNORECASE)
 FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount2.9", "fusermount3"}
 LEGACY_LOG_FILES = ("mount.log", "login.log", "setup.log", "status.log", "wizard-folders.log")
 
@@ -60,24 +77,144 @@ class InstallError(Exception):
 
 def is_valid_write_back_duration(value: Any) -> bool:
     """Report whether value is a positive delay other than Go's off sentinel."""
-    if not isinstance(value, str) or not value or len(value) > 64:
-        return False
+    total_ns = _mount_duration_ns(value)
+    return total_ns is not None and int(total_ns) > 0
+
+
+def _mount_duration_ns(value: Any) -> Decimal | None:
+    """Parse a nonnegative rclone duration to nanoseconds, or return None."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or any(character in value for character in "\r\n\x00")
+        or value == "off"
+    ):
+        return None
+    units_ns = {
+        "ns": Decimal(1),
+        "us": Decimal(1_000),
+        "µs": Decimal(1_000),
+        "μs": Decimal(1_000),
+        "ms": Decimal(1_000_000),
+        "s": Decimal(1_000_000_000),
+        "m": Decimal(60_000_000_000),
+        "h": Decimal(3_600_000_000_000),
+        "d": Decimal(86_400_000_000_000),
+        "w": Decimal(604_800_000_000_000),
+        "M": Decimal(2_592_000_000_000_000),
+        "y": Decimal(31_536_000_000_000_000),
+    }
+    if MOUNT_DURATION_NUMBER.fullmatch(value):
+        try:
+            total_ns = Decimal(value) * units_ns["s"]
+        except InvalidOperation:
+            return None
+        return total_ns if total_ns < MAX_WRITE_BACK_DURATION_NS else None
     position = 0
-    total_ns = 0
-    for match in WRITE_BACK_DURATION_COMPONENT.finditer(value):
+    total_ns = Decimal(0)
+    for match in MOUNT_DURATION_COMPONENT.finditer(value):
         if match.start() != position:
-            return False
+            return None
         amount, unit = match.groups()
-        whole, _, fraction = amount.partition(".")
-        unit_ns = WRITE_BACK_DURATION_UNITS_NS[unit]
-        component_ns = int(whole) * unit_ns
-        if fraction:
-            component_ns += (int(fraction) * unit_ns) // (10 ** len(fraction))
-        total_ns += component_ns
+        try:
+            total_ns += Decimal(amount) * units_ns[unit]
+        except InvalidOperation:
+            return None
         if total_ns >= MAX_WRITE_BACK_DURATION_NS:
-            return False
+            return None
         position = match.end()
-    return position == len(value) and total_ns > 0
+    return total_ns if position == len(value) and position > 0 else None
+
+
+def is_valid_mount_duration(value: Any) -> bool:
+    """Report whether value can be parsed as a nonnegative rclone duration."""
+    if isinstance(value, str) and value == "off":
+        return True
+    return _mount_duration_ns(value) is not None
+
+
+def is_valid_mount_size(value: Any, *, allow_off: bool = True) -> bool:
+    """Report whether value can be parsed as an rclone size setting."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or any(character in value for character in "\r\n\x00")
+    ):
+        return False
+    if not MOUNT_SIZE_VALUE.fullmatch(value):
+        return False
+    if value.casefold() == "off":
+        return allow_off
+    number = re.match(SIZE_NUMBER, value)
+    assert number is not None
+    try:
+        amount = Decimal(number.group())
+    except InvalidOperation:
+        return False
+    suffix = value[number.end() :]
+    if suffix.casefold() == "b":
+        multiplier = 1
+    elif suffix:
+        power = "kmgtpe".find(suffix[0].casefold()) + 1
+        if power < 1:
+            return False
+        multiplier = 1024**power
+    else:
+        multiplier = 1024 if amount else 1
+    try:
+        return amount >= 0 and amount * multiplier < MAX_WRITE_BACK_DURATION_NS
+    except InvalidOperation:
+        return False
+
+
+def is_valid_bwlimit(value: Any) -> bool:
+    """Report whether value follows rclone's bandwidth value or timetable syntax."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or any(character in value for character in "\r\n\x00")
+    ):
+        return False
+    slots = value.replace(";", " ").split()
+    if not slots:
+        return False
+    for slot in slots:
+        if "," not in slot:
+            if len(slots) != 1:
+                return False
+            rates = [slot]
+        else:
+            time_spec, rate = slot.split(",", 1)
+            if "," in rate:
+                return False
+            day, separator, clock = time_spec.partition("-")
+            if separator:
+                weekdays = {
+                    "mon", "monday", "tue", "tuesday", "wed", "wednesday", "thu", "thursday",
+                    "fri", "friday", "sat", "saturday", "sun", "sunday",
+                }
+                if day.casefold() not in weekdays:
+                    return False
+            else:
+                clock = time_spec
+            if not re.fullmatch(r"[0-9]{2}:[0-9]{2}", clock):
+                return False
+            hour, minute = (int(part) for part in clock.split(":"))
+            if hour > 23 or minute > 59:
+                return False
+            rates = [rate]
+        for rate in rates:
+            match = BW_RATE.fullmatch(rate)
+            if match is None:
+                return False
+            if not is_valid_mount_size(match.group("tx")):
+                return False
+            if match.group("rx") is not None and not is_valid_mount_size(match.group("rx")):
+                return False
+    return True
 
 
 def home_directory() -> Path:
@@ -516,7 +653,7 @@ def create_vault_config(root: Path, imported: bytes | None) -> bytes:
         "remote": f"{REMOTE_NAME}:",
         "password": secrets.token_urlsafe(32),
         "cache_dir": str(root / "cache"),
-        "chunk_size": "1Gi",
+        "chunk_size": "128Mi",
         "max_object_size": "19Gi",
     }
     return (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -524,14 +661,23 @@ def create_vault_config(root: Path, imported: bytes | None) -> bytes:
 
 def validate_mount_settings(raw: bytes) -> None:
     settings = parse_json_object(raw, "config/mount.json is invalid")
-    expected_fields = set(DEFAULT_MOUNT_SETTINGS)
-    if set(settings) not in (expected_fields, expected_fields - {"write_back"}):
+    supported_fields = set(DEFAULT_MOUNT_SETTINGS)
+    if REQUIRED_MOUNT_SETTINGS - set(settings) or set(settings) - supported_fields:
         raise InstallError("config/mount.json must contain the supported cache and upload settings")
-    for field in ("cache_max_size", "cache_min_free_space", "cache_max_age", "cache_poll_interval"):
-        if not isinstance(settings[field], str) or not settings[field] or any(character in settings[field] for character in "\r\n\x00"):
+    for field in MOUNT_SIZE_SETTINGS:
+        if field in settings and not is_valid_mount_size(settings[field], allow_off=field in MOUNT_SIZE_OFF_FIELDS):
+            raise InstallError(f"config/mount.json has an invalid {field}")
+    for field in MOUNT_DURATION_SETTINGS:
+        if field in settings and not is_valid_mount_duration(settings[field]):
+            raise InstallError(f"config/mount.json has an invalid {field}")
+    for field, (minimum, maximum) in MOUNT_COUNT_SETTINGS.items():
+        value = settings.get(field)
+        if field in settings and (type(value) is not int or value < minimum or value > maximum):
             raise InstallError(f"config/mount.json has an invalid {field}")
     if "write_back" in settings and not is_valid_write_back_duration(settings["write_back"]):
         raise InstallError("config/mount.json has an invalid write_back setting")
+    if "bwlimit" in settings and not is_valid_bwlimit(settings["bwlimit"]):
+        raise InstallError("config/mount.json has an invalid bwlimit setting")
     if type(settings["verify_upload"]) is not bool:
         raise InstallError("config/mount.json has an invalid verify_upload setting")
 

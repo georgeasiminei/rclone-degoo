@@ -16,9 +16,11 @@ import (
 
 	"github.com/rclone/rclone/backend/degoo/auth"
 	_ "github.com/rclone/rclone/backend/local"
+	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/object"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/spf13/pflag"
@@ -151,6 +153,195 @@ func TestMountSettingsValidationAndFlagPrecedence(t *testing.T) {
 	require.True(t, verifyUpload, "verification defaults on when settings and flags are absent")
 	require.Equal(t, fs.Duration(time.Hour), defaults.CacheMaxAge)
 	require.Equal(t, fs.Duration(time.Minute), defaults.CachePollInterval)
+}
+
+func TestMountSettingsDefaultsAndNewValues(t *testing.T) {
+	apply := func(settings *mountSettings, flags *pflag.FlagSet) (vfscommon.Options, mountlib.Options, fs.ConfigInfo, error) {
+		vfsOptions := vfscommon.Options{
+			ChunkSize:      128 * fs.Mebi,
+			ChunkSizeLimit: -1,
+			DirCacheTime:   fs.Duration(5 * time.Minute),
+		}
+		mountOptions := mountlib.Options{AttrTimeout: fs.Duration(time.Second)}
+		configOptions := fs.ConfigInfo{BufferSize: 16 * fs.Mebi, Transfers: 4, Timeout: fs.Duration(5 * time.Minute)}
+		_, err := settings.applyWithConfig(&vfsOptions, &mountOptions, &configOptions, flags, true)
+		return vfsOptions, mountOptions, configOptions, err
+	}
+
+	empty, err := readMountSettings("")
+	require.NoError(t, err)
+	vfsOptions, mountOptions, configOptions, err := apply(empty, nil)
+	require.NoError(t, err)
+	require.Equal(t, 16*fs.Mebi, configOptions.BufferSize)
+	require.Equal(t, fs.Mebi, vfsOptions.ReadAhead)
+	require.Equal(t, 128*fs.Mebi, vfsOptions.ChunkSize)
+	require.Equal(t, fs.SizeSuffix(-1), vfsOptions.ChunkSizeLimit)
+	require.Equal(t, 8, vfsOptions.ChunkStreams)
+	require.Equal(t, fs.Duration(30*time.Minute), vfsOptions.DirCacheTime)
+	require.Equal(t, fs.Duration(time.Second), mountOptions.AttrTimeout)
+	require.Equal(t, 4, configOptions.Transfers)
+	require.Empty(t, configOptions.BwLimit, "an empty bandwidth timetable means unlimited")
+	require.Equal(t, fs.Duration(5*time.Minute), configOptions.Timeout)
+
+	legacyFilename := filepath.Join(t.TempDir(), "private", "mount.json")
+	require.NoError(t, auth.WritePrivateFile(legacyFilename, []byte(`{"cache_max_age":"10m","write_back":"17s","verify_upload":false}`)))
+	legacySettings, err := readMountSettings(legacyFilename)
+	require.NoError(t, err)
+	legacyVFSOptions, legacyMountOptions, legacyConfigOptions, err := apply(legacySettings, nil)
+	require.NoError(t, err)
+	require.Equal(t, fs.Mebi, legacyVFSOptions.ReadAhead)
+	require.Equal(t, 128*fs.Mebi, legacyVFSOptions.ChunkSize)
+	require.Equal(t, fs.SizeSuffix(-1), legacyVFSOptions.ChunkSizeLimit)
+	require.Equal(t, 8, legacyVFSOptions.ChunkStreams)
+	require.Equal(t, fs.Duration(30*time.Minute), legacyVFSOptions.DirCacheTime)
+	require.Equal(t, fs.Duration(time.Second), legacyMountOptions.AttrTimeout)
+	require.Equal(t, fs.Duration(17*time.Second), legacyVFSOptions.WriteBack)
+	require.Equal(t, fs.Duration(10*time.Minute), legacyVFSOptions.CacheMaxAge)
+	require.Equal(t, 4, legacyConfigOptions.Transfers)
+	require.Equal(t, fs.Duration(5*time.Minute), legacyConfigOptions.Timeout)
+
+	filename := filepath.Join(t.TempDir(), "private", "mount.json")
+	require.NoError(t, auth.WritePrivateFile(filename, []byte(`{"buffer_size":"32Mi","read_ahead":"2Mi","read_chunk_size":"64Mi","read_chunk_size_limit":"1Gi","read_chunk_streams":3,"dir_cache_time":"45m","attr_timeout":"250ms","transfers":6,"bwlimit":"off","timeout":"7m"}`)))
+	settings, err := readMountSettings(filename)
+	require.NoError(t, err)
+	vfsOptions, mountOptions, configOptions, err = apply(settings, nil)
+	require.NoError(t, err)
+	require.Equal(t, 32*fs.Mebi, configOptions.BufferSize)
+	require.Equal(t, 2*fs.Mebi, vfsOptions.ReadAhead)
+	require.Equal(t, 64*fs.Mebi, vfsOptions.ChunkSize)
+	require.Equal(t, fs.Gibi, vfsOptions.ChunkSizeLimit)
+	require.Equal(t, 3, vfsOptions.ChunkStreams)
+	require.Equal(t, fs.Duration(45*time.Minute), vfsOptions.DirCacheTime)
+	require.Equal(t, fs.Duration(250*time.Millisecond), mountOptions.AttrTimeout)
+	require.Equal(t, 6, configOptions.Transfers)
+	require.Len(t, configOptions.BwLimit, 1)
+	bandwidth := configOptions.BwLimit.LimitAt(time.Now()).Bandwidth
+	require.False(t, bandwidth.IsSet(), `"off" is the canonical unlimited value`)
+	require.Equal(t, fs.Duration(7*time.Minute), configOptions.Timeout)
+}
+
+func TestMountSettingsNewCLIFlagPrecedence(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "private", "mount.json")
+	content := `{"buffer_size":"32Mi","read_ahead":"2Mi","read_chunk_size":"64Mi","read_chunk_size_limit":"1Gi","read_chunk_streams":3,"dir_cache_time":"45m","attr_timeout":"250ms","transfers":6,"bwlimit":"off","timeout":"7m"}`
+	require.NoError(t, auth.WritePrivateFile(filename, []byte(content)))
+	settings, err := readMountSettings(filename)
+	require.NoError(t, err)
+
+	flags := pflag.NewFlagSet("mount", pflag.ContinueOnError)
+	for _, name := range []string{
+		"buffer-size", "vfs-read-ahead", "vfs-read-chunk-size", "vfs-read-chunk-size-limit",
+		"vfs-read-chunk-streams", "dir-cache-time", "attr-timeout", "transfers", "bwlimit", "timeout",
+	} {
+		flags.String(name, "", "")
+		require.NoError(t, flags.Set(name, "cli-value"))
+	}
+
+	vfsOptions := vfscommon.Options{
+		ReadAhead:      7 * fs.Mebi,
+		ChunkSize:      96 * fs.Mebi,
+		ChunkSizeLimit: 2 * fs.Gibi,
+		ChunkStreams:   5,
+		DirCacheTime:   fs.Duration(90 * time.Minute),
+	}
+	mountOptions := mountlib.Options{AttrTimeout: fs.Duration(3 * time.Second)}
+	configOptions := fs.ConfigInfo{
+		BufferSize: 64 * fs.Mebi,
+		Transfers:  9,
+		BwLimit:    fs.BwTimetable{},
+		Timeout:    fs.Duration(11 * time.Minute),
+	}
+	_, err = settings.applyWithConfig(&vfsOptions, &mountOptions, &configOptions, flags, true)
+	require.NoError(t, err)
+	require.Equal(t, 7*fs.Mebi, vfsOptions.ReadAhead)
+	require.Equal(t, 96*fs.Mebi, vfsOptions.ChunkSize)
+	require.Equal(t, 2*fs.Gibi, vfsOptions.ChunkSizeLimit)
+	require.Equal(t, 5, vfsOptions.ChunkStreams)
+	require.Equal(t, fs.Duration(90*time.Minute), vfsOptions.DirCacheTime)
+	require.Equal(t, fs.Duration(3*time.Second), mountOptions.AttrTimeout)
+	require.Equal(t, 64*fs.Mebi, configOptions.BufferSize)
+	require.Equal(t, 9, configOptions.Transfers)
+	require.Empty(t, configOptions.BwLimit)
+	require.Equal(t, fs.Duration(11*time.Minute), configOptions.Timeout)
+}
+
+func TestMountSettingsNewInvalidValuesAreRejectedWithoutGlobalMutation(t *testing.T) {
+	for _, content := range []string{
+		`{"buffer_size":"not-a-size"}`,
+		`{"buffer_size":"off"}`,
+		`{"read_ahead":"not-a-size"}`,
+		`{"read_ahead":"off"}`,
+		`{"read_chunk_size":"not-a-size"}`,
+		`{"read_chunk_size_limit":"not-a-size"}`,
+		`{"read_chunk_streams":-1}`,
+		`{"dir_cache_time":"not-a-duration"}`,
+		`{"attr_timeout":"not-a-duration"}`,
+		`{"transfers":0}`,
+		`{"bwlimit":"not-a-bandwidth"}`,
+		`{"timeout":"not-a-duration"}`,
+	} {
+		filename := filepath.Join(t.TempDir(), "private", "mount.json")
+		require.NoError(t, auth.WritePrivateFile(filename, []byte(content)))
+		settings, err := readMountSettings(filename)
+		require.NoError(t, err)
+		_, globalOptions := fs.AddConfig(context.Background())
+		before := *fs.GetConfig(context.Background())
+		_, err = settings.applyWithConfig(&vfscommon.Options{}, &mountlib.Options{}, globalOptions, nil, true)
+		require.Error(t, err, "invalid mount setting %s must be rejected", content)
+		require.Equal(t, before, *fs.GetConfig(context.Background()), "failed validation must not mutate global config")
+	}
+}
+
+func TestMountSettingsBandwidthChangesRuntimeLimiter(t *testing.T) {
+	settings := &mountSettings{BwLimit: stringPointer("2Mi")}
+	configOptions := &fs.ConfigInfo{}
+	_, err := settings.applyWithConfig(&vfscommon.Options{}, &mountlib.Options{}, configOptions, nil, true)
+	require.NoError(t, err)
+	call := rc.Calls.Get("core/bwlimit")
+	require.NotNil(t, call)
+	before, err := call.Fn(context.Background(), rc.Params{})
+	require.NoError(t, err)
+	oldSchedule := append(fs.BwTimetable(nil), fs.GetConfig(context.Background()).BwLimit...)
+	restore, err := applyMountBandwidth(settings, nil, configOptions)
+	require.NoError(t, err)
+	require.Equal(t, oldSchedule, fs.GetConfig(context.Background()).BwLimit, "the mount must not mutate global config")
+	out, err := call.Fn(context.Background(), rc.Params{})
+	require.NoError(t, err)
+	require.Equal(t, "2Mi", out["rate"])
+	restore()
+	out, err = call.Fn(context.Background(), rc.Params{})
+	require.NoError(t, err)
+	require.Equal(t, before["rate"], out["rate"], "the previous runtime limit must be restored")
+}
+
+func TestMountBandwidthTickerUpdatesAndStops(t *testing.T) {
+	var schedule fs.BwTimetable
+	require.NoError(t, schedule.Set("Sun-00:00,1Mi Mon-00:00,2Mi"))
+	sunday := time.Date(2025, time.January, 5, 0, 0, 0, 0, time.UTC)
+	monday := sunday.Add(24 * time.Hour)
+	initial := schedule.LimitAt(sunday).Bandwidth
+	require.Equal(t, fs.BwPair{Tx: fs.Mebi, Rx: fs.Mebi}, initial)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	updates := make(chan fs.BwPair, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runMountBandwidthTicker(ctx, schedule, initial, ticks, func(limit fs.BwPair) { updates <- limit })
+	}()
+	ticks <- monday
+	select {
+	case got := <-updates:
+		require.Equal(t, fs.BwPair{Tx: 2 * fs.Mebi, Rx: 2 * fs.Mebi}, got)
+	case <-time.After(time.Second):
+		t.Fatal("bandwidth schedule did not update")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bandwidth schedule goroutine did not stop")
+	}
 }
 
 func TestMountSettingsWriteBack(t *testing.T) {
