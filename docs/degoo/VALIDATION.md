@@ -12,18 +12,16 @@ See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 
 Inspection confirmed that the installer already returned status `2` after an
 unconfirmed requested mount, but its normal-looking summary did not show a
-prominent error. At that time, its immutable-flag precheck skipped service
-startup and advised removing the flag. That behavior is superseded: the wizard
-now tries the service with the flag retained, and the mount guard leaves it
-unchanged. The earlier recovery after temporarily clearing the flag produced a
-connected mount, an active running service, and a successful local health
-report with no queued uploads. No remote file data was written during this
-recovery.
+prominent error. The service was retrying after the immutable external
+mountpoint blocked unprivileged FUSE mounting. Clearing that flag and starting
+the owned service produced a connected mount, an active running service, and
+a successful local health report with no queued uploads. No remote file data
+was written during this recovery.
 
-At the time, 250 Python helper tests, the package self-check, scoped Markdown
-lint, Python syntax checks, and `git diff --check` passed. Regressions covered
-explicit startup errors, service rejection, disconnected and unknown mounts,
-final mount-state observation races, read-only immutable-flag inspection, and
+All 250 Python helper tests, the package self-check, scoped Markdown lint,
+Python syntax checks, and `git diff --check` passed. Regressions cover explicit
+startup errors, service rejection, disconnected and unknown mounts, final
+mount-state observation races, read-only immutable-flag inspection, and
 successful installation when the user chooses manual startup.
 
 ## Incomplete uninstall and recovery
@@ -78,11 +76,13 @@ this follow-up. A local vault binding that had used a
 folder name where an opaque provider folder ID was required was corrected after
 confirming that the prior cache contained only its lock file, with no identity
 or cached file data. No actual provider ID or private path is recorded here.
-These events do not establish reliable automatic renewal. The earlier wizard
-treated an immutable flag as a blocker and directed the user to clear it; this
-was stricter than necessary when the directory remained owned and writable by
-the mounting user. The native FUSE smoke test verified mode-based protection
-on its temporary mountpoint. Earlier live smoke tests used
+These events do not establish reliable automatic renewal. An immutable flag on
+the current mountpoint prevented an ordinary-user FUSE mount because the FUSE
+helper requires write access; the mount reports a `sudo chattr -i` instruction
+before retrying. The targeted test simulated this access failure and verified
+the instruction, and the native FUSE smoke test verified mode-based protection
+on its temporary mountpoint. No privileged flag change was made, so final
+health of the installed mount remains pending. Earlier live smoke tests used
 generated data in a dedicated disposable folder; they do not establish
 long-term token renewal by themselves.
 
@@ -623,3 +623,70 @@ Offline checks on 2026-10-11 passed:
 No live cloud benchmark was run. These checks establish command behavior and
 packaging, not cloud throughput or a cold-cache download. VFS upload state is
 used for write completion without an independent remote integrity audit.
+
+## Immutable mount helper review correction
+
+The historical startup and mount-protection records above describe the earlier
+implementation. The recorded live recovery mounted only after the immutable
+flag was cleared. The native FUSE smoke test used a temporary mutable
+mountpoint; neither result established that a normal FUSE helper can mount an
+immutable directory. Owner-writable mode `0700` is not enough: Linux rejects
+the required write-access check for an immutable directory, and standard
+`fusermount3` refuses the mount.
+
+This review adds a manually built, root-owned setuid helper at
+`/usr/local/libexec/rclone-degoo/fusermount3`. It is restricted to an empty
+`/mnt/degoo` owned by the caller and not writable by group or other users; the
+default directory remains owner-private. It uses the caller's user ID for the
+kernel mount, preserves the immutable flag, and leaves rclone running as the
+ordinary user. It rejects `allow_other` and `allow_root`. The immutable legacy
+in-install `mount/` path is not supported; migrate to `/mnt/degoo` to use the
+helper. The [helper README](../../contrib/degoo/immutable-mount/README.md) has
+the manual build and installation commands. After installation, run
+`degoo-rc service enable` to retry setup. For an already enabled service, run
+`degoo-rc service restart`.
+
+Native retained-flag acceptance passed on Linux:
+
+- `bin/test-degoo-immutable-mount.sh` compiled the helper and test binary, then
+  used a private mount namespace with a generated caller-owned immutable
+  `/mnt/degoo` and a root-installed helper isolated to that namespace.
+- An ordinary UID 1000 client wrote and read encrypted `localStack` data,
+  unmounted and remounted, and read the same data again. `FS_IOC_GETFLAGS`
+  through a retained directory descriptor showed the immutable flag before,
+  during, and after mounting. An unmounted `os.WriteFile` failed with `EPERM`.
+- A closed FUSE communication peer after kernel mount verified error cleanup:
+  the helper unmounted the failed mount, retained the immutable flag, and
+  unmounted writes still failed with `EPERM`.
+- The Go integration test also passed:
+
+  ```sh
+  go test ./cmd/degoo -run '^TestMountpointRealImmutableFlagRetained$' \
+    -degoo-immutable-test -count=1
+  ```
+
+These checks used generated local data and did not contact Degoo or customer
+files. The helper was installed only inside the private test namespace; no
+host-level helper, mount, or system configuration was changed. This verifies
+the local Linux mount and cleanup behavior, not live provider compatibility.
+
+Additional offline checks passed:
+
+- All 262 Python installer and helper tests passed.
+- `go vet ./cmd/degoo` and the full `go build` passed.
+- The helper C compilation and parser checks passed.
+- `python3 bin/package-degoo.py --self-check` passed.
+
+The first full-suite attempt used the host-installed `rclone`, which lacked a
+test command expected by the suite, and did not have the FUSE helper alias on
+`PATH`. After preparing a directory with the freshly built `rclone` and a
+`fusermount3` symlink to `/usr/bin/fusermount`, the targeted archive, Docker,
+and S3 packages passed. The full credential-free suite then passed with exit
+status 0:
+
+```sh
+PATH=/tmp/degoo-review-tools:$PATH \
+  RCLONE_CONFIG=/notfound go test ./...
+```
+
+`golangci-lint` was unavailable, so Go lint was not run.

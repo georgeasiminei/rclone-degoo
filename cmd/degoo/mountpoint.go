@@ -21,6 +21,8 @@ type mountpointGuard struct {
 
 const fsImmutableFlag = 0x10 // FS_IMMUTABLE_FL from linux/fs.h.
 
+const immutableMountHelper = "/usr/local/libexec/rclone-degoo/fusermount3"
+
 func protectMountpoint(path string) (*mountpointGuard, error) {
 	if err := os.MkdirAll(path, 0700); err != nil {
 		return nil, mountpointSetupError(path, err)
@@ -80,12 +82,61 @@ func (guard *mountpointGuard) prepare() error {
 		return errors.New("mount directory contains ordinary local files that are not queued for upload; copy them to a safe location, remove them from this directory, then mount and copy them back")
 	}
 	if guard.immutable {
-		if err := unix.Access(guard.file.Name(), unix.W_OK); err != nil {
-			return fmt.Errorf("mount directory is not writable by the current user; ensure it is owned by that user with owner write access (the immutable flag may remain set)")
-		}
 		return nil
 	}
 	return guard.file.Chmod(guard.mode | 0200)
+}
+
+func validateImmutableMountHelper(path string) error {
+	current := filepath.Clean(path)
+	for {
+		var stat unix.Stat_t
+		if err := unix.Lstat(current, &stat); err != nil {
+			return err
+		}
+		if stat.Uid != 0 || stat.Mode&unix.S_IFMT == unix.S_IFLNK || stat.Mode&0022 != 0 {
+			return fmt.Errorf("%s must be root-owned without symlinks or group/other write access", current)
+		}
+		if current == path {
+			if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&unix.S_ISUID == 0 || stat.Mode&0111 != 0111 {
+				return errors.New("immutable mount helper must be a regular setuid executable")
+			}
+		} else if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+			return fmt.Errorf("%s is not a directory", current)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+func (guard *mountpointGuard) useImmutableMountHelper() (func(), error) {
+	if !guard.immutable {
+		return func() {}, nil
+	}
+	path, err := filepath.Abs(guard.file.Name())
+	if err != nil {
+		return nil, err
+	}
+	if filepath.Clean(path) != "/mnt/degoo" {
+		return nil, errors.New("immutable mounting supports /mnt/degoo; migrate the contained install with degoo-rc install --mountpoint /mnt/degoo while preserving its cache")
+	}
+	if err := validateImmutableMountHelper(immutableMountHelper); err != nil {
+		return nil, fmt.Errorf("immutable mountpoint needs the administrator-installed helper at %s: %w; build and install it using immutable-mount/README.md from the Degoo install or source package, then retry service enable with the immutable flag retained", immutableMountHelper, err)
+	}
+	oldPath, present := os.LookupEnv("PATH")
+	if err := os.Setenv("PATH", filepath.Dir(immutableMountHelper)+":"+oldPath); err != nil {
+		return nil, err
+	}
+	return func() {
+		if present {
+			_ = os.Setenv("PATH", oldPath)
+		} else {
+			_ = os.Unsetenv("PATH")
+		}
+	}, nil
 }
 
 func (guard *mountpointGuard) protect() error {

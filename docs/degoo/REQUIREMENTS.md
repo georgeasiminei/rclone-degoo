@@ -46,10 +46,28 @@ These points are the binding product requirements recorded from the user.
   If it cannot, it prints `sudo mkdir`, `chown`, `chmod 700`, and `chattr +i`
   commands for the user to run. The mount refuses to cover ordinary local
   files in an unmounted mount directory. Users may keep the immutable flag set
-  while mounted and unmounted; the installer must not reject it preemptively or
-  ask the user to clear it. The mount leaves that flag unchanged and uses the
-  retained directory handle to protect the underlying mount directory when the
-  immutable flag is absent.
+  on `/mnt/degoo` while mounted and unmounted; the installer must not ask them
+  to clear it. Standard `fusermount3` cannot mount there: the immutable flag
+  prevents its required write-access check even when the directory is
+  owner-writable. Retaining the flag requires a manually installed, root-owned,
+  setuid helper at `/usr/local/libexec/rclone-degoo/fusermount3`. The helper is
+  limited to an empty `/mnt/degoo` owned by the invoking user and not writable
+  by group or other users. The default directory remains owner-private. The
+  helper preserves the flag, mounts with that user's ID, and does not support
+  `allow_other` or `allow_root`; rclone itself runs as the ordinary user.
+  Mount launch must validate the helper's path, ownership, permissions, and
+  setuid bit before selecting it, and must not install or modify privileged
+  files automatically.
+  When `/mnt/degoo` is immutable and no valid helper is available, show its
+  [build and install instructions](../../contrib/degoo/immutable-mount/README.md)
+  and the service command to retry after setup. When the flag is absent, the
+  mount guard protects the underlying directory through its retained directory
+  handle.
+- The privileged helper only accepts `/mnt/degoo`; it cannot mount the legacy
+  in-install `mount/` path. An upgrade that needs to retain an immutable flag
+  must run `degoo-rc install --mountpoint /mnt/degoo` to migrate the saved path
+  while preserving the cache, after making the old underlying mount directory
+  empty. This is a documented limitation of immutable legacy mounts.
 - Changing an existing install from the legacy in-install `mount` directory to
   `/mnt/degoo` is refused while the old directory contains files. The
   installer and maintenance helpers accept only these two mountpoint choices.

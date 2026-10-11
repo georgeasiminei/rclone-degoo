@@ -29,6 +29,7 @@ SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "servi
 DEFAULT_MOUNTPOINT = "/mnt/degoo"
 SOURCE_SHELL_FILES = ("install.sh", "trash.sh", "uninstall.sh")
 GENERATED_SHELL_FILES = ("info.sh", "logs.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh")
+IMMUTABLE_MOUNT_FILES = ("helper.c", "README.md")
 COMPATIBILITY_SHELL_FILES = (*SOURCE_SHELL_FILES, *GENERATED_SHELL_FILES)
 LEGACY_GENERATED_SHELL_FILES = COMPATIBILITY_SHELL_FILES
 MAX_CONFIG_SIZE = 1024 * 1024
@@ -1028,6 +1029,7 @@ def _install(args: argparse.Namespace) -> int:
         ensure_private_directory(root / name)
     ensure_private_directory(root / "scripts")
     ensure_private_directory(root / "scripts/python")
+    ensure_private_directory(root / "immutable-mount")
     if manifest is None:
         manifest = {
             "version": 1,
@@ -1088,6 +1090,16 @@ def _install(args: argparse.Namespace) -> int:
     copy_binary(args.binary, root / "bin/rclone")
     validate_binary(root / "bin/rclone")
     source_root = Path(__file__).absolute().parent.parent.parent
+    for source_name in IMMUTABLE_MOUNT_FILES:
+        source = source_root / "immutable-mount" / source_name
+        try:
+            source_info = os.lstat(source)
+        except OSError:
+            raise InstallError("the immutable mount helper sources are missing") from None
+        if not stat.S_ISREG(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+            raise InstallError("the immutable mount helper sources are unsafe")
+        destination = root / "immutable-mount" / source_name
+        write_private_file(destination, source.read_bytes(), replace=os.path.lexists(destination))
     for source_name in SOURCE_FILES:
         source = Path(__file__).absolute().parent / source_name
         try:

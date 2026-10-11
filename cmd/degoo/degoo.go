@@ -736,6 +736,13 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 		if v.Opt.CacheMode != vfscommon.CacheModeFull || v.Stats()["diskCache"] == nil {
 			return nil, nil, "", errors.New("durable VFS cache unavailable; refusing to mount")
 		}
+		if guard != nil {
+			restorePath, err := guard.useImmutableMountHelper()
+			if err != nil {
+				return nil, nil, "", err
+			}
+			defer restorePath()
+		}
 		return mountFn(v, mountpoint, opt)
 	}
 	options.CacheMode = vfscommon.CacheModeFull
