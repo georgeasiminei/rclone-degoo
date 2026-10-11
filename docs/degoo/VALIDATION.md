@@ -8,6 +8,22 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Explicit installation startup errors
+
+Inspection confirmed that the installer already returned status `2` after an
+unconfirmed requested mount, but its normal-looking summary did not show a
+prominent error. The service was retrying after the immutable external
+mountpoint blocked unprivileged FUSE mounting. Clearing that flag and starting
+the owned service produced a connected mount, an active running service, and
+a successful local health report with no queued uploads. No remote file data
+was written during this recovery.
+
+All 250 Python helper tests, the package self-check, scoped Markdown lint,
+Python syntax checks, and `git diff --check` passed. Regressions cover explicit
+startup errors, service rejection, disconnected and unknown mounts, final
+mount-state observation races, read-only immutable-flag inspection, and
+successful installation when the user chooses manual startup.
+
 ## Incomplete uninstall and recovery
 
 Read-only inspection found an immutable legacy mount directory and a remaining
