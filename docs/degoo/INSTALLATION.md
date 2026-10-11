@@ -542,6 +542,20 @@ changes can be recovered. If you choose not to retain a vault config, type
 `DISCARD` to confirm losing the local secret. Type `REMOVE` to confirm local
 cleanup.
 
+Uninstall reports success only after verifying that the installation directory
+and its owned command and service links are absent. A cleanup failure returns
+a nonzero exit status and reports that uninstall is incomplete. Selected
+backups and the external `/mnt/degoo` mountpoint are preserved intentionally.
+Interrupting cleanup also reports incomplete removal once deletion is requested.
+An immutable legacy `mount/` directory must be unlocked before deletion; the
+error supplies a `sudo chattr -i` command. Retry uninstall after clearing that
+flag. The directory check runs before removing service or command links.
+
+If an earlier cleanup removed the service links but left the installation,
+the install wizard queries systemd to verify that the unit is absent and
+inactive before allowing an upgrade. Missing links alone do not prove the
+service has stopped; an unrelated loaded unit is never stopped.
+
 To resume uploads from a retained backup, install the client into a fresh
 default install root with the wizard and pass the backup directory:
 

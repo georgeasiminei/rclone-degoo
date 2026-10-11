@@ -8,6 +8,28 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Incomplete uninstall and recovery
+
+Read-only inspection found an immutable legacy mount directory and a remaining
+installation whose service and command links had been removed. Systemd
+reported the unit as `not-found` and `inactive`, with an empty fragment path.
+Mount-directory blockers are checked before disabling or unlinking services;
+final cleanup checks reject success if the root or an owned link remains. A failed
+removal exits nonzero and clearly reports incomplete cleanup.
+
+All 244 Python helper tests, the package self-check, scoped Markdown lint,
+Python syntax checks, and `git diff --check` passed. Read-only preflights on the
+remaining installation produced the immutable-flag recovery command and
+accepted the verified absent, inactive service for upgrade.
+
+Fixture regressions cover immutable-directory rejection before link removal,
+read-only directory deletion, failed or ineffective deletion, reappearing
+owned links, preservation of the external mount directory, and upgrade after
+service links disappear. A launcher regression checks error exit propagation
+and preservation of an ordinary local file. Further regressions cover unrecorded
+command links, interrupted cleanup, and local files in an unused contained
+mount directory. No live customer data was deleted to validate this fix.
+
 ## Upload status and protected mountpoint follow-up
 
 The follow-up's final offline validation passed:

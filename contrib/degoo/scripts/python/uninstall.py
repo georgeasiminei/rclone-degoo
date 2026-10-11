@@ -13,6 +13,7 @@ import shlex
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,8 @@ EXPECTED_MANIFEST_PATHS = {
     "pidfile": "mount.pid",
 }
 FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount2.9", "fusermount3"}
+FS_IMMUTABLE_FL = 0x00000010
+FS_IOC_GETFLAGS = (2 << 30) | (struct.calcsize("@L") << 16) | (ord("f") << 8) | 1
 
 
 class CleanupError(Exception):
@@ -583,6 +586,37 @@ def _mount_state(root: Path, points: set[str]) -> bool:
     return active
 
 
+def _check_mount_directory_removable(path: Path) -> None:
+    """Refuse cleanup while the install-owned mount directory is immutable."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise CleanupError("the isolated mountpoint attributes could not be inspected safely") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise CleanupError("the isolated mountpoint changed before cleanup")
+        value = bytearray(struct.calcsize("@L"))
+        try:
+            fcntl.ioctl(fd, FS_IOC_GETFLAGS, value, True)
+        except OSError as exc:
+            if exc.errno in {errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOSYS}:
+                return
+            raise CleanupError(
+                "the isolated mountpoint immutable flag could not be checked safely; "
+                f"if `lsattr -d -- {shlex.quote(str(path))}` shows +i, clear it with "
+                f"`sudo chattr -i -- {shlex.quote(str(path))}` and retry"
+            ) from None
+        if struct.unpack_from("@L", value)[0] & FS_IMMUTABLE_FL:
+            raise CleanupError(
+                "the isolated legacy mountpoint is immutable; clear it and retry with "
+                f"`sudo chattr -i -- {shlex.quote(str(path))}`"
+            )
+    finally:
+        os.close(fd)
+
+
 def _service_paths(root: Path, manifest: dict[str, Any]) -> tuple[Path, Path]:
     config_text = manifest.get("service_config_home") or ""
     if not config_text:
@@ -674,11 +708,14 @@ def _path_link_target(path: Path, root: Path) -> bool:
 
 
 def _remove_owned_path_link(root: Path, manifest: dict[str, Any]) -> bool:
-    """Remove only the recorded command link while it still points into this install."""
+    """Remove a recorded or exact-target command link owned by this install."""
     link = expected_path_link()
-    if manifest.get("path_link") != str(link) or not os.path.lexists(link):
+    recorded = manifest.get("path_link") == str(link)
+    if not os.path.lexists(link):
         return False
     if not _path_link_target(link, root):
+        if not recorded:
+            return False
         raise CleanupError("the recorded PATH command link changed before cleanup")
     parent_fd = -1
     try:
@@ -800,7 +837,7 @@ def _check_service_fragment(state: dict[str, str], allowed: set[str]) -> None:
         raise CleanupError("systemd could not verify that the owned service is inactive")
 
 
-def _stop_owned_service(root: Path, manifest: dict[str, Any]) -> set[str]:
+def _stop_owned_service(root: Path, manifest: dict[str, Any], *, disable: bool = True) -> set[str]:
     links, recorded = _owned_service_links(root, manifest)
     if not links and not recorded:
         return set()
@@ -820,7 +857,7 @@ def _stop_owned_service(root: Path, manifest: dict[str, Any]) -> set[str]:
         result = _systemctl_user("stop", "rclone-degoo.service")
         if result.returncode != 0:
             raise CleanupError("the owned user service could not be stopped safely")
-        if links:
+        if links and disable:
             result = _systemctl_user("disable", "rclone-degoo.service")
             if result.returncode != 0:
                 raise CleanupError("the owned user service could not be disabled safely")
@@ -1059,6 +1096,20 @@ def _require_empty_mount_directory(root: Path) -> None:
         raise CleanupError("the isolated mount directory could not be inspected") from None
 
 
+def _require_empty_contained_mount_directory(root: Path) -> None:
+    """Refuse cleanup when the unused install-contained mount directory has data."""
+    mount_directory = root / "mount"
+    _check_directory(mount_directory)
+    try:
+        with os.scandir(mount_directory) as iterator:
+            if next(iterator, None) is not None:
+                raise CleanupError("the unused contained mount directory contains local files")
+    except CleanupError:
+        raise
+    except OSError:
+        raise CleanupError("the unused contained mount directory could not be inspected") from None
+
+
 def _remove_root(root: Path) -> None:
     """Remove only the validated install root using Python's safe rmtree path."""
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
@@ -1073,6 +1124,21 @@ def _remove_root(root: Path) -> None:
         current = os.lstat(root)
         if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
             raise CleanupError("the install root changed before removal")
+        root_fd = os.open(
+            root.name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            opened = os.fstat(root_fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise CleanupError("the install root changed before removal")
+            _make_tree_directories_writable(root_fd)
+        finally:
+            os.close(root_fd)
+        current = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            raise CleanupError("the install root changed before removal")
         shutil.rmtree(root)
     except CleanupError:
         raise
@@ -1080,6 +1146,102 @@ def _remove_root(root: Path) -> None:
         raise CleanupError("the isolated local install could not be removed safely") from None
     finally:
         os.close(parent_fd)
+
+
+def _make_install_tree_writable(root: Path) -> None:
+    """Prepare only the validated install tree for safe recursive removal."""
+    _check_directory(root.parent)
+    parent_fd = os.open(root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    root_fd = -1
+    try:
+        before = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022:
+            raise CleanupError("the install root changed before removal")
+        root_fd = os.open(
+            root.name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(root_fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise CleanupError("the install root changed before removal")
+        _make_tree_directories_writable(root_fd)
+        current = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            raise CleanupError("the install root changed before removal")
+    except CleanupError:
+        raise
+    except OSError:
+        raise CleanupError("read-only install directories could not be prepared for removal") from None
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _make_tree_directories_writable(directory_fd: int) -> None:
+    """Add owner write permission to validated install directories before removal."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        directory = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+            raise CleanupError("an install directory changed before removal")
+        mode = stat.S_IMODE(directory.st_mode) | stat.S_IWUSR
+        if mode != stat.S_IMODE(directory.st_mode):
+            os.fchmod(directory_fd, mode)
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                    raise CleanupError("an install directory changed before removal")
+                child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+                try:
+                    current = os.fstat(child_fd)
+                    if (
+                        not stat.S_ISDIR(current.st_mode)
+                        or current.st_uid != os.getuid()
+                        or current.st_mode & 0o022
+                        or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                    ):
+                        raise CleanupError("an install directory changed before removal")
+                    mode = stat.S_IMODE(current.st_mode) | stat.S_IWUSR
+                    if mode != stat.S_IMODE(current.st_mode):
+                        os.fchmod(child_fd, mode)
+                    _make_tree_directories_writable(child_fd)
+                finally:
+                    os.close(child_fd)
+    except CleanupError:
+        raise
+    except OSError:
+        raise CleanupError("read-only install directories could not be prepared for removal") from None
+
+
+def _verify_cleanup(
+    root: Path,
+    owned_service_links: list[Path],
+    owned_path_link: bool,
+) -> None:
+    """Verify that the install root and its owned external links are absent."""
+    if _entry_exists(root):
+        raise CleanupError("the install root remains after cleanup")
+    for path in owned_service_links:
+        if _entry_exists(path):
+            raise CleanupError("an owned user service link remains after cleanup")
+    if owned_path_link and _entry_exists(expected_path_link()):
+        raise CleanupError("the owned PATH command link remains after cleanup")
+
+
+def _entry_exists(path: Path) -> bool:
+    """Check an entry without treating inspection errors as absence."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise CleanupError("cleanup results could not be verified safely") from None
+    return True
 
 
 def _service_inventory(root: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1243,6 +1405,18 @@ def uninstall(args: argparse.Namespace) -> int:
         return 0
 
     _validate_recorded_path_link(root, layout["manifest"])
+    direct_service_link, wanted_service_link = _service_paths(root, layout["manifest"])
+    service_links, recorded_service_links = _owned_service_links(root, layout["manifest"])
+    owned_service_links = [
+        path
+        for path in (direct_service_link, wanted_service_link)
+        if path in service_links or str(path) in recorded_service_links
+    ]
+    expected_link = expected_path_link()
+    owned_path_link = (
+        layout["manifest"].get("path_link") == str(expected_link)
+        or _path_link_target(expected_link, root)
+    )
 
     keep_config = args.keep_config
     keep_cache = args.keep_cache
@@ -1269,14 +1443,33 @@ def uninstall(args: argparse.Namespace) -> int:
         if pending_state and not (keep_config and keep_cache):
             raise CleanupError("pending local uploads remain; the install and cache were preserved")
 
+    legacy_mountpoint = installer.configured_mountpoint(root, layout["manifest"]) == root / "mount"
+    if not mounted:
+        _require_empty_mount_directory(root)
+    if not legacy_mountpoint:
+        # The external mount is managed separately; root/mount remains part of
+        # the install and must be empty before stopping services or removing links.
+        _require_empty_contained_mount_directory(root)
+
+    defer_mountpoint_check = mounted and legacy_mountpoint
+    if not defer_mountpoint_check:
+        _check_mount_directory_removable(root / "mount")
+
     # Check once before stopping a service, then check again under the cache lock.
-    previously_owned_service = _stop_owned_service(root, layout["manifest"])
+    previously_owned_service = _stop_owned_service(
+        root,
+        layout["manifest"],
+        disable=not defer_mountpoint_check,
+    )
     if _mount_state(root, read_mountpoints()):
         _unmount(root)
     # Recheck the whole mount namespace after unmounting and before touching the cache.
     if _mount_state(root, read_mountpoints()):
         raise CleanupError("the isolated mount remains active")
     _require_empty_mount_directory(root)
+    if defer_mountpoint_check:
+        _check_mount_directory_removable(root / "mount")
+        previously_owned_service.update(_stop_owned_service(root, layout["manifest"]))
 
     # The isolated install always binds this cache to the fixed remote name.
     # Holding rclone's flock prevents a new mount from racing the status check.
@@ -1313,9 +1506,11 @@ def uninstall(args: argparse.Namespace) -> int:
                 keep_logs=keep_logs,
                 pending=pending_state,
             )
+        _make_install_tree_writable(root)
         # Reload and verify systemd while the install layout is still retryable.
         service_cleanup = _remove_owned_service_links(root, latest["manifest"], previously_owned_service)
         path_link_cleanup = _remove_owned_path_link(root, latest["manifest"])
+        owned_path_link = owned_path_link or path_link_cleanup
         # Removing the empty mountpoint first makes a concurrent re-mount fail
         # before recursive deletion can traverse a mounted filesystem.
         try:
@@ -1325,6 +1520,7 @@ def uninstall(args: argparse.Namespace) -> int:
         if _mount_state(root, read_mountpoints()):
             raise CleanupError("a mount became active during cleanup")
         _remove_root(root)
+        _verify_cleanup(root, owned_service_links, owned_path_link)
     finally:
         os.close(lock_fd)
 
@@ -1400,22 +1596,38 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return _wizard(args)
         except CleanupError as exc:
-            print(f"uninstall refused: {exc}", file=sys.stderr)
+            print(_format_failure(args, str(exc)), file=sys.stderr)
             return 2
         except OSError:
-            print("uninstall refused: filesystem access failed safely", file=sys.stderr)
+            print(_format_failure(args, "filesystem access failed safely"), file=sys.stderr)
             return 2
         except (EOFError, KeyboardInterrupt):
+            if args.delete_local:
+                print(_format_failure(args, "cleanup was interrupted"), file=sys.stderr)
+                return 2
             print("Cancelled; the local install was left unchanged.")
             return 1
     try:
         return uninstall(args)
     except CleanupError as exc:
-        print(f"uninstall refused: {exc}", file=sys.stderr)
+        print(_format_failure(args, str(exc)), file=sys.stderr)
         return 2
     except OSError:
-        print("uninstall refused: filesystem access failed safely", file=sys.stderr)
+        print(_format_failure(args, "filesystem access failed safely"), file=sys.stderr)
         return 2
+
+
+def _format_failure(args: argparse.Namespace, reason: str) -> str:
+    """Describe whether a requested removal left its local install behind."""
+    if not args.delete_local:
+        return f"uninstall refused: {reason}"
+    try:
+        root_remains = _entry_exists(Path(args.root))
+    except CleanupError:
+        return f"uninstall incomplete: {reason}; the local install root could not be verified"
+    if root_remains:
+        return f"uninstall incomplete: {reason}; local install remains at {args.root}"
+    return f"uninstall incomplete: {reason}; the install root is absent"
 
 
 if __name__ == "__main__":

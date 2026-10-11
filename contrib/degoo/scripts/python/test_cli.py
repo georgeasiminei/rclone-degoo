@@ -73,6 +73,22 @@ class CLITest(unittest.TestCase):
         self.assertIn("degoo-rc help", result.stderr)
         self.assertEqual(self.run_cli("stop", "unexpected").returncode, 2)
 
+    def test_failed_uninstall_propagates_incomplete_cleanup_through_launcher(self):
+        self.install()
+        local_file = self.root / "mount" / "not-uploaded.txt"
+        local_file.write_text("generated ordinary local file", encoding="utf-8")
+        local_file.chmod(0o600)
+        link = self.home / ".local/bin/degoo-rc"
+
+        result = self.run_cli("uninstall", "--delete-local", launcher=link)
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("incomplete", result.stderr.lower())
+        self.assertNotIn("Removed the isolated local Degoo install", result.stdout)
+        self.assertTrue(self.root.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(local_file.read_text(), "generated ordinary local file")
+
     def test_backup_config_dispatch_creates_portable_configuration_only(self):
         result = self.run_cli("install", "--binary", str(self.binary), "--folder-id", "test-vault-id", "--no-wizard")
         self.assertEqual(result.returncode, 0, result.stderr)
