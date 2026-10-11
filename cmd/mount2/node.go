@@ -479,6 +479,13 @@ var _ = (fusefs.NodeRenamer)((*Node)(nil))
 // small, it should return ERANGE and the size of the attribute.
 // If not defined, Getxattr will return ENOATTR.
 func (n *Node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	if n.node.VFS().Opt.UploadStatus {
+		file, ok := n.node.(*vfs.File)
+		if !ok || attr != vfs.UploadStatusXattr {
+			return 0, syscall.ENODATA
+		}
+		return copyXattr(dest, file.UploadStatus())
+	}
 	return 0, syscall.ENOSYS // we never implement this
 }
 
@@ -488,6 +495,9 @@ var _ fusefs.NodeGetxattrer = (*Node)(nil)
 // setxattr(2) for information about flags.
 // If not defined, Setxattr will return ENOATTR.
 func (n *Node) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	if n.node.VFS().Opt.UploadStatus {
+		return syscall.EPERM
+	}
 	return syscall.ENOSYS // we never implement this
 }
 
@@ -496,6 +506,9 @@ var _ fusefs.NodeSetxattrer = (*Node)(nil)
 // Removexattr should delete the given attribute.
 // If not defined, Removexattr will return ENOATTR.
 func (n *Node) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	if n.node.VFS().Opt.UploadStatus {
+		return syscall.EPERM
+	}
 	return syscall.ENOSYS // we never implement this
 }
 
@@ -506,7 +519,25 @@ var _ fusefs.NodeRemovexattrer = (*Node)(nil)
 // and the correct size.  If not defined, return an empty list and
 // success.
 func (n *Node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	if n.node.VFS().Opt.UploadStatus {
+		if _, ok := n.node.(*vfs.File); ok {
+			return copyXattr(dest, vfs.UploadStatusXattr+"\x00")
+		}
+		return 0, 0
+	}
 	return 0, syscall.ENOSYS // we never implement this
+}
+
+func copyXattr(dest []byte, value string) (uint32, syscall.Errno) {
+	size := uint32(len(value))
+	if len(dest) == 0 {
+		return size, 0
+	}
+	if len(dest) < len(value) {
+		return size, syscall.ERANGE
+	}
+	copy(dest, value)
+	return size, 0
 }
 
 var _ fusefs.NodeListxattrer = (*Node)(nil)

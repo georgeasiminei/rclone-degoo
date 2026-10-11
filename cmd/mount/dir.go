@@ -28,6 +28,22 @@ type Dir struct {
 // Check interface satisfied
 var _ fusefs.Node = (*Dir)(nil)
 
+// Getxattr returns no attributes for directories when upload status is enabled.
+func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	if d.VFS().Opt.UploadStatus {
+		return fuse.ErrNoXattr
+	}
+	return syscall.ENOSYS
+}
+
+// Listxattr returns an empty attribute list for directories when upload status is enabled.
+func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+	if d.VFS().Opt.UploadStatus {
+		return nil
+	}
+	return syscall.ENOSYS
+}
+
 // Attr updates the attributes of a directory
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 	defer log.Trace(d, "")("attr=%+v, err=%v", a, &err)

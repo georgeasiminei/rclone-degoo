@@ -33,6 +33,7 @@ PYTHON_HELPERS = (
     "restore.py",
     "backup_config.py",
     "sync.py",
+    "status.py",
 )
 DOC_FILES = (
     "API_EVIDENCE.md",
@@ -645,7 +646,15 @@ def self_check(root: Path) -> None:
             "LC_ALL": "C",
         }
         install_result = subprocess.run(
-            [str(extracted / "degoo-rc"), "install", "--binary", str(extracted / "bin/rclone"), "--no-wizard"],
+            [
+                str(extracted / "degoo-rc"),
+                "install",
+                "--binary",
+                str(extracted / "bin/rclone"),
+                "--no-wizard",
+                "--mountpoint",
+                "mount",
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

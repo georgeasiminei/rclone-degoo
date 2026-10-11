@@ -1,7 +1,8 @@
 # Degoo backend requirements handoff
 
-Status: requirements recorded on 2026-10-09; implementation and offline
-validation are tracked in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+Status: requirements recorded on 2026-10-09; implemented operational behavior
+and current validation are tracked in
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) and [VALIDATION.md](VALIDATION.md).
 
 This document gives a future implementation agent the user’s requirements for
 a Degoo filesystem in the `rclone-degoo` fork. It separates those requirements
@@ -36,6 +37,40 @@ These points are the binding product requirements recorded from the user.
 - Backup-only behavior is not the goal. Existing Degoo files are not part of
   the encrypted vault unless explicitly copied into it.
 - Windows-specific support is outside the initial acceptance scope.
+
+### Mountpoint safety and upload status
+
+- New contained installs use `/mnt/degoo` as the default mountpoint. An upgrade
+  keeps its recorded mountpoint unless the user explicitly changes it.
+- The installer attempts to create `/mnt/degoo` as an owner-private directory.
+  If it cannot, it prints `sudo mkdir`, `chown`, `chmod 700`, and `chattr +i`
+  commands for the user to run. The mount refuses to cover ordinary local
+  files in an unmounted mount directory. An immutable flag can block
+  unprivileged FUSE mounting when the mountpoint needs write access; the mount
+  reports a `chattr -i` command to run before retrying. With the immutable flag
+  cleared, the mount removes write permissions through the retained directory
+  handle after mounting and on failure or unmount.
+- Changing an existing install from the legacy in-install `mount` directory to
+  `/mnt/degoo` is refused while the old directory contains files. The
+  installer and maintenance helpers accept only these two mountpoint choices.
+  Uninstall removes the contained client but preserves the external
+  `/mnt/degoo` directory.
+- The generic VFS upload-status attribute is opt-in with
+  `--vfs-upload-status` (default `false`). The contained Degoo mount enables it
+  and exposes the read-only `user.rclone.upload-status` attribute with values
+  `pending`, `uploading`, `uploaded`, or `unknown`.
+- `uploaded` means VFS knows the current file version has a remote
+  representation after writeback. It is not a new remote read or integrity
+  audit. Files created directly under an unmounted mountpoint are ordinary
+  local files: they are local-only and are never queued for cloud upload.
+- `degoo-rc status` reports authentication failures before mount, service, and
+  pending-upload health. An unhealthy report returns a nonzero exit status;
+  `--json` provides machine-readable output. Per-file status is available for
+  a selected file or directory. The private mount socket reports aggregate
+  queued, uploading, and retrying counts only.
+- Runtime status and Degoo diagnostics use the private `status.log` and
+  `diagnostics.log` files. Command failures are kept concise, without Cobra
+  usage blocks, and displayed log lines redact recognized credentials.
 
 ### Encryption and names
 
@@ -177,6 +212,14 @@ the Degoo behavior and observed object limit at the time of testing.
   native Degoo files outside it remain untouched.
 - Verify configured cache, chunk, secret, auth-state, and mount settings are
   honored.
+- Verify a new install defaults to `/mnt/degoo`, existing upgrades retain the
+  recorded mountpoint, migration refuses a nonempty old mount directory, and
+  uninstall preserves the external directory. Confirm unmounted ordinary files
+  are reported as local-only and cannot be mistaken for queued uploads.
+- Verify the VFS status attribute is read-only, disabled by default for generic
+  mounts, enabled by the Degoo mount, and reports the current version's state
+  without claiming a fresh remote audit. Verify unhealthy `degoo-rc status`
+  exits nonzero and reports authentication failures first.
 
 Live endpoint availability, refresh behavior, and object limits can change.
 Do not claim them as guaranteed from this requirements document alone.

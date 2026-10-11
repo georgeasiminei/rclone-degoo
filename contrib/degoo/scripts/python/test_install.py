@@ -58,8 +58,108 @@ class InstallTest(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = install.main(["--binary", str(self.binary), *args])
+            code = install.main(["--binary", str(self.binary), "--mountpoint", "mount", *args])
         return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_new_install_defaults_to_external_mountpoint(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(install, "prepare_mountpoint") as prepare_mountpoint:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = install.main(["--binary", str(self.binary), "--folder-id", "dedicated-folder-123"])
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        prepare_mountpoint.assert_called_once_with(Path(install.DEFAULT_MOUNTPOINT))
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["mountpoint"], install.DEFAULT_MOUNTPOINT)
+        wrapper = (self.root / "scripts/mount.sh").read_text(encoding="utf-8")
+        self.assertIn(f"MOUNTPOINT={shlex.quote(install.DEFAULT_MOUNTPOINT)}", wrapper)
+
+    def test_prepare_mountpoint_creates_private_directory(self) -> None:
+        mountpoint = self.base / "external" / "degoo"
+
+        install.prepare_mountpoint(mountpoint)
+
+        self.assertTrue(mountpoint.is_dir())
+        self.assertEqual(stat.S_IMODE(mountpoint.stat().st_mode), 0o700)
+
+    def test_mountpoint_permission_instructions_precede_install_mutation(self) -> None:
+        mountpoint = self.base / "restricted" / "degoo"
+        with mock.patch.object(install, "DEFAULT_MOUNTPOINT", str(mountpoint)), mock.patch.object(
+            Path, "mkdir", side_effect=PermissionError("permission denied")
+        ):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = install.main(["--binary", str(self.binary)])
+
+        self.assertEqual(code, 2)
+        self.assertIn("could not be created or is not owner-private", stderr.getvalue())
+        self.assertIn(f"sudo mkdir -p -- {mountpoint}", stderr.getvalue())
+        self.assertIn("sudo chown --", stderr.getvalue())
+        self.assertIn("sudo chmod 700 --", stderr.getvalue())
+        self.assertIn("sudo chattr +i --", stderr.getvalue())
+        self.assertFalse(self.root.exists())
+
+    def test_upgrade_without_mountpoint_preserves_legacy_location(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(install, "prepare_mountpoint") as prepare_mountpoint:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = install.main(["--binary", str(self.binary), "--upgrade"])
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        prepare_mountpoint.assert_not_called()
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["mountpoint"], "mount")
+        wrapper = (self.root / "scripts/mount.sh").read_text(encoding="utf-8")
+        self.assertIn(f"MOUNTPOINT={shlex.quote(str(self.root / 'mount'))}", wrapper)
+
+    def test_external_mountpoint_is_not_prepared_when_upgrade_lock_is_rejected(self) -> None:
+        external_mountpoint = self.base / "external" / "degoo"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(install, "DEFAULT_MOUNTPOINT", str(external_mountpoint)):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = install.main(["--binary", str(self.binary), "--folder-id", "dedicated-folder-123"])
+            self.assertEqual(code, 0, stderr.getvalue())
+            self.assertTrue(external_mountpoint.is_dir())
+
+            lock_fd = install._acquire_upgrade_lock(self.root)
+            try:
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(install, "prepare_mountpoint") as prepare_mountpoint:
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        code = install.main(["--binary", str(self.binary), "--upgrade"])
+
+                self.assertEqual(code, 2)
+                self.assertIn("cache is active", stderr.getvalue())
+                prepare_mountpoint.assert_not_called()
+            finally:
+                os.close(lock_fd)
+
+    def test_mountpoint_migration_refuses_nonempty_legacy_directory(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        local_file = self.root / "mount" / "b.txt"
+        local_file.write_text("pending local data\n", encoding="utf-8")
+        external_mountpoint = self.base / "external" / "degoo"
+        with mock.patch.object(install, "DEFAULT_MOUNTPOINT", str(external_mountpoint)):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = install.main(
+                    ["--binary", str(self.binary), "--upgrade", "--mountpoint", str(external_mountpoint)]
+                )
+
+        self.assertEqual(code, 2)
+        self.assertIn("recover local files from the old mountpoint", stderr.getvalue())
+        self.assertEqual(local_file.read_text(encoding="utf-8"), "pending local data\n")
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["mountpoint"], "mount")
 
     def test_complete_install_creates_private_state_and_escaped_wrappers(self) -> None:
         code, stdout, stderr = self.invoke("--folder-id", "dedicated-folder-123", "--folder-name", "Vault")
@@ -180,6 +280,32 @@ class InstallTest(unittest.TestCase):
         args = capture.read_text(encoding="utf-8").splitlines()
         levels = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--log-level"]
         self.assertEqual(levels, ["NOTICE", "INFO"])
+
+    def test_location_and_folders_wrappers_log_to_private_diagnostics(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        capture = self.base / "helper argv"
+        fake_binary = self.root / "bin/rclone"
+        fake_binary.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE_ARGS\"\n",
+            encoding="ascii",
+        )
+        fake_binary.chmod(0o700)
+        env = {**os.environ, "CAPTURE_ARGS": str(capture)}
+
+        for helper in ("location.sh", "folders.sh"):
+            with self.subTest(helper=helper):
+                result = subprocess.run(
+                    [str(self.root / "scripts" / helper)], env=env, capture_output=True, check=False
+                )
+                self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+                args = capture.read_text(encoding="utf-8").splitlines()
+                self.assertIn("--log-file", args)
+                self.assertEqual(args[args.index("--log-file") + 1], str(self.root / "logs/diagnostics.log"))
+                self.assertIn("--log-level", args)
+                self.assertEqual(args[args.index("--log-level") + 1], "NOTICE")
+                self.assertIn("degoo", args)
+                self.assertIn("location" if helper == "location.sh" else "folders", args)
 
     def test_stop_wrapper_only_skips_unmount_for_mountpoint_exit_32(self) -> None:
         code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
@@ -320,9 +446,29 @@ class InstallTest(unittest.TestCase):
         manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["root_folder_id"], "created-folder-123")
         self.assertEqual(manifest["remote_folder_name"], "My Vault")
+        self.assertEqual(manifest["parent_folder_id"], "device-container")
         self.assertTrue(manifest["remote_created_by_setup"])
         self.assertTrue((self.root / "config/vault.json").exists())
         self.assertTrue((self.root / "config/rclone.conf").exists())
+
+    def test_upgrade_preserves_setup_folder_ancestry(self) -> None:
+        code, _, stderr = self.invoke()
+        self.assertEqual(code, 0, stderr)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = setup.main(
+                ["--root", str(self.root), "--parent-id", "device-container-alpha", "--name", "My Vault"]
+            )
+        self.assertEqual(result, 0, stderr.getvalue())
+
+        code, _, stderr = self.invoke("--upgrade")
+
+        self.assertEqual(code, 0, stderr)
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["root_folder_id"], "created-folder-123")
+        self.assertEqual(manifest["remote_folder_name"], "My Vault")
+        self.assertEqual(manifest["parent_folder_id"], "device-container-alpha")
 
     def test_setup_uses_private_umask_for_logged_command(self) -> None:
         code, _, stderr = self.invoke()
@@ -475,6 +621,7 @@ class InstallTest(unittest.TestCase):
             "setup.log": b"setup bytes with legacy mode\n",
             "status.log": b"status bytes\n",
             "wizard-folders.log": b"wizard bytes\n",
+            "diagnostics.log": b"diagnostic metadata\n",
         }
         for name, content in log_contents.items():
             path = self.root / "logs" / name
@@ -672,7 +819,7 @@ class ServiceTest(unittest.TestCase):
         self.binary = self.base / "rclone"
         InstallTest.write_binary(self.binary)
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(install.main(["--binary", str(self.binary), "--folder-id", "service-test-folder"]), 0)
+            self.assertEqual(install.main(["--binary", str(self.binary), "--folder-id", "service-test-folder", "--mountpoint", "mount"]), 0)
         self.root = self.home / ".local/share/rclone-degoo"
         self.unit_link = self.home / ".config/systemd/user/rclone-degoo.service"
         self.wanted_link = self.home / ".config/systemd/user/default.target.wants/rclone-degoo.service"

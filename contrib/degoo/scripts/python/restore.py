@@ -38,7 +38,6 @@ MANIFEST_PATHS = {
     "vault_config": "config/vault.json",
     "rclone_config": "config/rclone.conf",
     "cache_dir": "cache",
-    "mountpoint": "mount",
     "pidfile": "mount.pid",
 }
 
@@ -138,6 +137,10 @@ def _validate_manifest(root: Path) -> tuple[dict[str, Any], str, str, str]:
     for field_name, expected in MANIFEST_PATHS.items():
         if manifest.get(field_name) != expected:
             raise RestoreError("the retained metadata contains an unexpected local path")
+    try:
+        installer.configured_mountpoint(root, manifest)
+    except installer.InstallError as exc:
+        raise RestoreError(str(exc)) from None
     if not isinstance(manifest.get("remote_created_by_setup"), bool):
         raise RestoreError("the retained install metadata is incomplete")
 

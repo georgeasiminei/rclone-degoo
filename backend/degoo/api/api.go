@@ -344,6 +344,17 @@ func (err *Error) Error() string {
 	} else {
 		message = err.operation + ": Degoo API request failed"
 	}
+	if len(err.graphQLErrors) != 0 {
+		classes := make([]string, 0, len(err.graphQLErrors))
+		seen := make(map[string]bool)
+		for _, gqlErr := range err.graphQLErrors {
+			if !seen[gqlErr.typ] {
+				classes = append(classes, gqlErr.typ)
+				seen[gqlErr.typ] = true
+			}
+		}
+		message += " (" + strings.Join(classes, ", ") + ")"
+	}
 	if diagnostic := authDiagnostic(err.err); diagnostic != "" {
 		message += ": " + diagnostic
 	}
@@ -400,6 +411,10 @@ func (wire graphQLErrorWire) normalized() graphQLError {
 		typ = "ServiceUnavailableException"
 	case strings.Contains(classification, "internal"):
 		typ = "InternalFailure"
+	case strings.Contains(classification, "validation"):
+		typ = "ValidationException"
+	case strings.Contains(classification, "notfound"), strings.Contains(classification, "not found"):
+		typ = "NotFoundException"
 	}
 	return graphQLError{message: "GraphQL request failed", typ: typ}
 }

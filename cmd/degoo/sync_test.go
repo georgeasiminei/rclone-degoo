@@ -149,6 +149,23 @@ func TestSyncEndpointRefreshesRemoteAndPreservesPendingWrite(t *testing.T) {
 	require.Equal(t, "pending local bytes", string(pendingBytes))
 }
 
+func TestSyncEndpointReportsOnlyUploadCounters(t *testing.T) {
+	run := fstest.NewRunIndividual(t)
+	mountedVFS := newSyncTestVFS(t, run.Fremote, true)
+	_, socketPath := newSyncTestEndpoint(t, mountedVFS, func() {})
+	handle, err := mountedVFS.OpenFile("private-filename.txt", os.O_CREATE|os.O_WRONLY, 0600)
+	require.NoError(t, err)
+	_, err = handle.Write([]byte("generated pending data"))
+	require.NoError(t, err)
+	require.NoError(t, handle.Close())
+	code, data := syncRequestOverSocket(t, socketPath, http.MethodGet, "/status", "")
+	require.Equal(t, http.StatusOK, code)
+	var status uploadQueueStatus
+	require.NoError(t, json.Unmarshal(data, &status))
+	require.Equal(t, uploadQueueStatus{Queued: 1}, status)
+	require.NotContains(t, string(data), "private-filename")
+}
+
 func TestSyncEndpointRefreshesDeepTargetWithoutForgettingSiblings(t *testing.T) {
 	if *fstest.RemoteName != "" {
 		t.Skip("requires a local test remote")

@@ -34,7 +34,7 @@ func TestAncestorFolders(t *testing.T) {
 	_, err = ancestorFolders(context.Background(), get, "missing")
 	require.ErrorContains(t, err, "mismatched")
 	_, err = ancestorFolders(context.Background(), func(context.Context, string) (api.Item, error) { return api.Item{}, errors.New("unavailable") }, "vault")
-	require.EqualError(t, err, "unavailable")
+	require.EqualError(t, err, `inspect ancestor folder ID "vault": unavailable`)
 }
 
 func TestWriteFolders(t *testing.T) {

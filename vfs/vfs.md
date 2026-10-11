@@ -197,6 +197,29 @@ FAT/exFAT do not. Rclone will perform very badly if the cache
 directory is on a filesystem which doesn't support sparse files and it
 will log an ERROR message if one is detected.
 
+### VFS Upload Status
+
+The `--vfs-upload-status` flag exposes the VFS's current upload state as the
+read-only `user.rclone.upload-status` extended attribute on mounted files. It
+defaults to `false`; generic mounts must opt in. The Degoo vault mount enables
+it automatically.
+
+```text
+    --vfs-upload-status bool  Expose current file upload state as an extended attribute (default false)
+```
+
+When available, the attribute value is one of:
+
+- `pending`: the current local file version is dirty or queued for upload.
+- `uploading`: the current version is being uploaded.
+- `uploaded`: VFS knows that writeback completed for the current version and
+  has a remote representation.
+- `unknown`: status reporting is disabled or VFS cannot establish the state.
+
+`uploaded` is a local VFS status hint; reading the attribute does not query or
+revalidate the remote object. An external remote change may make the remote
+copy differ from the version VFS last published.
+
 #### Fingerprinting
 
 Various parts of the VFS use fingerprinting to see if a local file

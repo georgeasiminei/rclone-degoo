@@ -124,7 +124,15 @@ def _run_create(root: Path, parent_id: str, name: str) -> str:
     return _validate_identifier(text, "created folder ID")
 
 
-def _finish_install(root: Path, folder_id: str, name: str, *, created: bool, vault_config: str | None) -> int:
+def _finish_install(
+    root: Path,
+    folder_id: str,
+    name: str,
+    *,
+    created: bool,
+    vault_config: str | None,
+    parent_folder_id: str | None = None,
+) -> int:
     command = [
         sys.executable,
         str(root / "scripts/python/install.py"),
@@ -138,6 +146,8 @@ def _finish_install(root: Path, folder_id: str, name: str, *, created: bool, vau
     ]
     if created:
         command.append("--folder-created-by-setup")
+    if parent_folder_id:
+        command.extend(("--parent-folder-id", parent_folder_id))
     if vault_config:
         command.extend(("--vault-config", vault_config))
     try:
@@ -158,7 +168,14 @@ def run(args: argparse.Namespace) -> int:
     parent_id = _validate_identifier(args.parent_id, "--parent-id")
     name = _validate_name(args.name or "")
     folder_id = _run_create(root, parent_id, name)
-    code = _finish_install(root, folder_id, name, created=True, vault_config=args.vault_config)
+    code = _finish_install(
+        root,
+        folder_id,
+        name,
+        created=True,
+        vault_config=args.vault_config,
+        parent_folder_id=parent_id,
+    )
     if code != 0:
         print(
             "The folder was created, but local setup did not finish. Re-run with "

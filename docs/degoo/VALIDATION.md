@@ -8,6 +8,58 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Upload status and protected mountpoint follow-up
+
+The follow-up's final offline validation passed:
+
+- `RCLONE_CONFIG=/notfound go test ./...` passed with the freshly built binary
+  and contained FUSE helper alias first on `PATH`.
+- Targeted backend, Degoo command, both mount implementations, and VFS package
+  tests passed, including the VFS upload-status race checks.
+- Scoped `golangci-lint` reported zero issues.
+- All 228 Python helper tests and the package self-check passed.
+- The native FUSE upload-status and underlying mount-directory permission
+  smoke test passed with race detection.
+- The seven Degoo Markdown documents passed markdownlint, and `git diff
+  --check` passed.
+
+These checks cover authentication-first health output and nonzero exit status,
+JSON and file-path status, the read-only VFS upload-status attribute, unmounted
+local-only files, aggregate queue counts, default and legacy mountpoint
+handling, refusal to cover local files, immutable-flag access instructions,
+and protected permissions after mount failure or unmount. The VFS document is
+a section fragment whose first line is a level-three heading; standalone
+markdownlint reports the pre-existing MD041 rule for that heading.
+
+An expired-token refresh initially returned HTTP 401; an earlier probe had
+recorded HTTP 403. Authentication was later renewed, and read-only provider
+queries confirmed the intended folder. No cloud writes were attempted during
+this follow-up. A local vault binding that had used a
+folder name where an opaque provider folder ID was required was corrected after
+confirming that the prior cache contained only its lock file, with no identity
+or cached file data. No actual provider ID or private path is recorded here.
+These events do not establish reliable automatic renewal. An immutable flag on
+the current mountpoint prevented an ordinary-user FUSE mount because the FUSE
+helper requires write access; the mount reports a `sudo chattr -i` instruction
+before retrying. The targeted test simulated this access failure and verified
+the instruction, and the native FUSE smoke test verified mode-based protection
+on its temporary mountpoint. No privileged flag change was made, so final
+health of the installed mount remains pending. Earlier live smoke tests used
+generated data in a dedicated disposable folder; they do not establish
+long-term token renewal by themselves.
+
+New contained installs use `/mnt/degoo`; upgrades preserve their saved
+mountpoint. The installer supports `/mnt/degoo` and the legacy in-install
+`mount` location, refuses migration while the old underlying directory is
+nonempty, and leaves the external directory on uninstall. An immutable
+mountpoint can block unprivileged FUSE mounting. After clearing it, the mount
+guard protects the directory by removing write permissions after mount and on
+failure or unmount. The VFS attribute is disabled by default for generic mounts
+and enabled by `rclone degoo mount`.
+`uploaded` reports the current VFS version's known remote representation; it is
+not a fresh cloud integrity check. Ordinary files under an unmounted
+mountpoint are local-only and never enter the upload queue.
+
 ## Scoped mount refresh and remote cache staleness
 
 `degoo-rc sync LOCAL_PATH` requests a recursive metadata refresh through the

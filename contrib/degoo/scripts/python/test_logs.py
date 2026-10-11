@@ -61,6 +61,8 @@ class LogsTest(unittest.TestCase):
         (self.root / "logs/setup.log").chmod(0o600)
         (self.root / "logs/status.log").write_text("status error details\n", encoding="utf-8")
         (self.root / "logs/status.log").chmod(0o600)
+        (self.root / "logs/diagnostics.log").write_text("Degoo folder query details\n", encoding="utf-8")
+        (self.root / "logs/diagnostics.log").chmod(0o600)
 
         output = logs.report(self.root)
 
@@ -70,6 +72,7 @@ class LogsTest(unittest.TestCase):
         self.assertIn("login completed", output)
         self.assertIn("setup error details", output)
         self.assertIn("status error details", output)
+        self.assertIn("Degoo folder query details", output)
         self.assertIn("journalctl --user -u rclone-degoo.service -n 100 --no-pager", output)
 
     def test_missing_logs_are_reported_without_reading_other_files(self) -> None:
@@ -83,6 +86,7 @@ class LogsTest(unittest.TestCase):
         self.assertIn("No login.log yet", output)
         self.assertIn("No setup.log yet", output)
         self.assertIn("No status.log yet", output)
+        self.assertIn("No diagnostics.log yet", output)
         self.assertNotIn("never-display-this", output)
 
     def test_log_symlinks_and_non_private_files_are_refused(self) -> None:
@@ -136,29 +140,73 @@ class LogsTest(unittest.TestCase):
         os.utime(auth_path, (auth_time, auth_time))
         stamp = datetime.fromtimestamp(now).strftime("%Y/%m/%d %H:%M:%S")
         log_path = self.root / "logs/mount.log"
-        log_path.write_text(f"{stamp} ERROR : degoo login required (auth HTTP 403)\n", encoding="utf-8")
+        log_path.write_text(
+            f"{stamp} ERROR : GetOverlay4: cannot obtain access token: degoo login required (auth HTTP 401)\n",
+            encoding="utf-8",
+        )
         log_path.chmod(0o600)
 
+        self.assertIn("[redacted] login required", logs._read_log_lines(self.root / "logs", "mount.log")[0])
         self.assertTrue(logs.auth_required_after(self.root / "logs", auth_time, now=now))
         self.assertFalse(logs.auth_required_after(self.root / "logs", now, now=now))
+
+    def test_report_compacts_cobra_usage_and_summarizes_authentication(self) -> None:
+        auth_path = self.root / "config/auth.json"
+        auth_path.write_text('{"token":"opaque-token","refresh_token":"private-refresh"}', encoding="utf-8")
+        auth_path.chmod(0o600)
+        auth_time = datetime.now().timestamp() - 120
+        os.utime(auth_path, (auth_time, auth_time))
+        stamp = datetime.fromtimestamp(auth_time + 60).strftime("%Y/%m/%d %H:%M:%S")
+        log_path = self.root / "logs/mount.log"
+        log_path.write_text(
+            f"{stamp} ERROR : GetOverlay4: cannot obtain access token: degoo login required (auth HTTP 401)\n"
+            "Usage:\n"
+            "  rclone degoo mount [flags]\n"
+            "Flags:\n"
+            "      --vfs-cache-mode string   Cache mode\n"
+            "      --help                   Help for mount\n",
+            encoding="utf-8",
+        )
+        log_path.chmod(0o600)
+
+        output = logs.report(self.root)
+
+        self.assertTrue(output.startswith("AUTHENTICATION ERROR:"))
+        self.assertIn("cannot obtain access token", output)
+        self.assertIn("Cobra usage output omitted", output)
+        self.assertNotIn("--vfs-cache-mode", output)
+        self.assertIn("rejected as requiring login", output)
+        self.assertNotIn("private-refresh", output)
 
     def test_auth_marker_rejects_unstamped_or_unrecognized_lines(self) -> None:
         auth_time = 1_800_000_000
         log_path = self.root / "logs/mount.log"
         log_path.write_text(
             "degoo login required without a logger timestamp\n"
-            "2026/10/10 12:00:00 ERROR : degoo token refresh failed (HTTP 403)\n",
+            "2026/10/10 12:00:00 ERROR : degoo token refresh failed (HTTP 403)\n"
+            "2026/10/10 12:00:00 ERROR : unrelated [redacted] login required (auth HTTP 401)\n",
             encoding="utf-8",
         )
         log_path.chmod(0o600)
         now = datetime(2026, 10, 10, 12, 5).timestamp()
         self.assertFalse(logs.auth_required_after(self.root / "logs", auth_time, now=now))
-
         log_path.write_text("", encoding="utf-8")
         status_log = self.root / "logs/status.log"
         status_log.write_text("2026/10/10 12:00:00 ERROR : degoo login required (auth HTTP 403)\n", encoding="utf-8")
         status_log.chmod(0o600)
         self.assertFalse(logs.auth_required_after(self.root / "logs", auth_time, now=now))
+
+    def test_diagnostics_log_auth_marker_is_considered(self) -> None:
+        auth_time = 1_800_000_000
+        event_time = auth_time + 60
+        stamp = datetime.fromtimestamp(event_time).strftime("%Y/%m/%d %H:%M:%S")
+        log_path = self.root / "logs/diagnostics.log"
+        log_path.write_text(
+            f"{stamp} ERROR : GetOverlay4: cannot obtain access token: degoo login required (auth HTTP 401)\n",
+            encoding="utf-8",
+        )
+        log_path.chmod(0o600)
+        self.assertTrue(logs.auth_required_after(self.root / "logs", auth_time, now=event_time + 60))
 
     def test_cli_help_describes_follow_and_default_tail(self) -> None:
         stdout = io.StringIO()
@@ -167,6 +215,7 @@ class LogsTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("last 100 lines", stdout.getvalue())
         self.assertIn("--follow", stdout.getvalue())
+        self.assertIn("diagnostic logs", " ".join(stdout.getvalue().split()))
 
     def test_follow_waits_for_a_log_created_after_start(self) -> None:
         output = io.StringIO()

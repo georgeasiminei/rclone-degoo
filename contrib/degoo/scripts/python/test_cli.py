@@ -38,7 +38,7 @@ class CLITest(unittest.TestCase):
 
     def run_cli(self, *args, launcher=None):
         return subprocess.run(
-            [str(launcher or self.launcher), *args], env=self.env,
+            [str(launcher or self.launcher), *args, *(["--mountpoint", "mount"] if args and args[0] == "install" and "--binary" in args else [])], env=self.env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=30, check=False,
         )
@@ -67,6 +67,7 @@ class CLITest(unittest.TestCase):
         self.assertIn("--inventory", help_result.stdout)
         self.assertIn("--parent-id", self.run_cli("setup", "help").stdout)
         self.assertIn("--follow", self.run_cli("logs", "help").stdout)
+        self.assertIn("account-authentication summary", self.run_cli("logs", "help").stdout)
         result = self.run_cli("misspelled")
         self.assertEqual(result.returncode, 2)
         self.assertIn("degoo-rc help", result.stderr)

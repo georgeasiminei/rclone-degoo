@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show recent mount, login, setup, and status logs for a contained Degoo vault."""
+"""Show recent contained command logs and auth status for a Degoo vault."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from urllib.parse import urlsplit, urlunsplit
 import install as installer
 
 
-LOG_NAMES = ("mount.log", "login.log", "setup.log", "status.log")
-AUTH_LOG_NAMES = ("mount.log", "login.log")
+LOG_NAMES = ("mount.log", "login.log", "setup.log", "status.log", "diagnostics.log")
+AUTH_LOG_NAMES = ("mount.log", "login.log", "diagnostics.log")
 DEFAULT_LINES = 100
 MAX_LOG_BYTES = 4 * 1024 * 1024
 MAX_LINE_BYTES = 16 * 1024
@@ -26,7 +26,22 @@ AUTH_MARKER_AGE = 7 * 24 * 60 * 60
 AUTH_MARKER_FUTURE_SKEW = 5 * 60
 LOG_STAMP = re.compile(
     r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\s+"
-    r"(?:ERROR|CRITICAL|WARNING|NOTICE|INFO|DEBUG)\s*:\s+.*\bdegoo login required\b",
+    r"(?:ERROR|CRITICAL|WARNING|NOTICE|INFO|DEBUG)\s*:\s+.*"
+    r"(?:\bdegoo login required\b|\bcannot obtain access token\s*:\s*\[redacted\]\s+login required\b)",
+    re.IGNORECASE,
+)
+LOG_ENTRY_PREFIX = re.compile(
+    r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\s+"
+    r"(?:ERROR|CRITICAL|WARNING|NOTICE|INFO|DEBUG)\s*:\s*",
+    re.IGNORECASE,
+)
+USAGE_HEADER = re.compile(
+    r"^(?:Usage|Flags|Global Flags|Available Commands|Inherited Flags|Examples):\s*$",
+    re.IGNORECASE,
+)
+USAGE_BODY = re.compile(
+    r"^(?:Usage:|Flags:|Global Flags:|Available Commands:|Inherited Flags:|Examples:|Aliases:|"
+    r"rclone(?:\s|$)|-[A-Za-z0-9]|--[A-Za-z0-9]|[ \t]{2,}\S)",
     re.IGNORECASE,
 )
 URL_PATTERN = re.compile(r"(?i)\bhttps?://[^\s\"'<>]+")
@@ -156,7 +171,57 @@ def _tail_fd(fd: int, count: int) -> list[str]:
     lines = data.splitlines()
     if start and lines:
         lines[0] = b"[older log content omitted] " + lines[0]
-    return [_clean_line(line) for line in lines[-count:]]
+    cleaned = [_clean_line(line) for line in lines]
+    return _compact_cobra_usage(cleaned)[-count:]
+
+
+def _message(line: str) -> str:
+    """Return a logger message without its timestamp and severity prefix."""
+    return LOG_ENTRY_PREFIX.sub("", line, count=1)
+
+
+def _is_usage_header(line: str) -> bool:
+    return bool(USAGE_HEADER.match(_message(line).strip()))
+
+
+def _is_usage_content(line: str) -> bool:
+    return bool(USAGE_BODY.match(_message(line)))
+
+
+def _compact_cobra_usage(lines: list[str]) -> list[str]:
+    """Keep command errors while replacing Cobra's multiline usage with one note."""
+    output: list[str] = []
+    in_usage = False
+    omitted = 0
+    for line in lines:
+        if in_usage:
+            if LOG_ENTRY_PREFIX.match(line) and not _is_usage_content(line):
+                in_usage = False
+            else:
+                omitted += 1
+                continue
+        if _is_usage_header(line):
+            in_usage = True
+            omitted += 1
+            continue
+        output.append(line)
+    if omitted:
+        output.append(f"[Cobra usage output omitted: {omitted} lines; see this log file for the full log.]")
+    return output
+
+
+def _authentication_summary(root: Path) -> str:
+    """Return the highest-priority local account-authentication status."""
+    try:
+        import info as info_reporter
+
+        auth_path = root / "config" / "auth.json"
+        error = info_reporter.authentication_error(auth_path, logs_dir=root / "logs")
+        if error:
+            return f"AUTHENTICATION ERROR: {error}"
+        return f"Account auth summary: {info_reporter.authentication_status(auth_path, logs_dir=root / 'logs')}"
+    except (ImportError, OSError):
+        return "Account auth summary: unavailable; run degoo-rc info for the local authentication summary"
 
 
 def _read_log_lines(log_dir: Path, name: str, count: int = DEFAULT_LINES) -> list[str] | None:
@@ -201,7 +266,7 @@ def auth_required_after(log_dir: Path, auth_mtime: float, *, now: float | None =
 
 def _prepare(root: Path) -> tuple[str, dict[str, int]]:
     """Read initial tails and leave existing descriptors at their append point."""
-    output: list[str] = []
+    output: list[str] = [_authentication_summary(root), ""]
     descriptors: dict[str, int] = {}
     log_dir = root / "logs"
     try:
@@ -224,7 +289,7 @@ def _prepare(root: Path) -> tuple[str, dict[str, int]]:
 
 
 def report(root: Path) -> str:
-    """Return recent contained mount, login, setup, and status log lines."""
+    """Return recent contained command log lines and the safe auth summary."""
     root = validate_root(str(root))
     output, descriptors = _prepare(root)
     for fd in descriptors.values():
@@ -236,6 +301,7 @@ def _follow(root: Path, descriptors: dict[str, int]) -> None:
     """Print appended lines, waiting for log files that have not been created yet."""
     pending = {name: b"" for name in descriptors}
     offsets = {name: os.lseek(fd, 0, os.SEEK_CUR) for name, fd in descriptors.items()}
+    in_usage: dict[str, bool] = {name: False for name in descriptors}
     waiting = set(LOG_NAMES) - set(descriptors)
     log_dir = root / "logs"
     try:
@@ -253,6 +319,7 @@ def _follow(root: Path, descriptors: dict[str, int]) -> None:
                 descriptors[name] = fd
                 pending[name] = b""
                 offsets[name] = 0
+                in_usage[name] = False
                 waiting.remove(name)
                 print(f"[{name}] is available; following new lines.", flush=True)
                 emitted = True
@@ -274,7 +341,17 @@ def _follow(root: Path, descriptors: dict[str, int]) -> None:
                 split = data.split(b"\n")
                 pending[name] = split.pop()
                 for raw in split:
-                    print(f"[{name}] {_clean_line(raw)}", flush=True)
+                    line = _clean_line(raw)
+                    if in_usage[name]:
+                        if LOG_ENTRY_PREFIX.match(line) and not _is_usage_content(line):
+                            in_usage[name] = False
+                        else:
+                            continue
+                    if _is_usage_header(line):
+                        in_usage[name] = True
+                        print(f"[{name}] [Cobra usage output omitted; see this log file for the full log.]", flush=True)
+                        continue
+                    print(f"[{name}] {line}", flush=True)
                 if len(pending[name]) > MAX_LINE_BYTES:
                     print(f"[{name}] {_clean_line(pending[name])}", flush=True)
                     pending[name] = b""
@@ -287,7 +364,7 @@ def _follow(root: Path, descriptors: dict[str, int]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Show the last 100 lines of the contained mount, login, setup, and status logs."
+        description="Show the last 100 lines of mount, login, setup, status, and Degoo diagnostic logs."
     )
     parser.add_argument("--root", default=str(installer.expected_root()), help="contained install root")
     parser.add_argument(
@@ -317,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
             _follow(root, descriptors)
         elif args.follow:
             print(
-                "Waiting for mount.log, login.log, setup.log, or status.log; service "
+                "Waiting for contained logs; service "
                 "messages can be followed with journalctl --user -fu rclone-degoo.service.",
                 flush=True,
             )

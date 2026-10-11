@@ -506,6 +506,32 @@ func TestGraphQLErrorDoesNotExposeEchoedToken(t *testing.T) {
 	}
 }
 
+func TestGraphQLErrorShowsSafeClassification(t *testing.T) {
+	for _, test := range []struct {
+		typ, want string
+	}{
+		{"ValidationException", "ValidationException"},
+		{"NotFoundException", "NotFoundException"},
+		{"ThrottlingException", "ThrottlingException"},
+		{"ServiceUnavailableException", "ServiceUnavailableException"},
+		{"InternalFailure", "InternalFailure"},
+		{"private-provider-type", "GraphQLException"},
+	} {
+		t.Run(test.typ, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writeJSON(t, writer, map[string]any{"errors": []any{map[string]any{
+					"message":   "provider echoed private-token and private-path",
+					"errorType": test.typ,
+				}}})
+			}))
+			defer server.Close()
+			_, err := newTestClient(server, &testTokens{initial: "private-token"}).GetItem(context.Background(), "17")
+			require.ErrorContains(t, err, "GraphQL request failed ("+test.want+")")
+			require.NotContains(t, err.Error(), "private-")
+		})
+	}
+}
+
 func TestHTTPErrorDoesNotExposeBodyAndCarriesBoundedRetryAfter(t *testing.T) {
 	const secretToken = "echoed-secret-token"
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

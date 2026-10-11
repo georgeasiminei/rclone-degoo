@@ -365,7 +365,7 @@ def _wait_for_mount(
 ) -> str:
     """Wait for the contained mountpoint to appear and respond to stat."""
     return _wait_for_mount_state(
-        root / "mount",
+        installer.configured_mountpoint(root),
         "mounted",
         timeout=timeout,
         interval=interval,
@@ -454,7 +454,7 @@ def _recover_disconnected_mount(
         ) from None
 
     try:
-        state = _observed_mount_state(root / "mount")
+        state = _observed_mount_state(installer.configured_mountpoint(root))
         if state == "not mounted":
             return
         if state.startswith("unknown ("):
@@ -471,7 +471,7 @@ def _recover_disconnected_mount(
         binary = _trusted_fusermount()
         if binary is None:
             raise _mount_state_error(root, "a trusted fusermount binary is unavailable")
-        state = _observed_mount_state(root / "mount")
+        state = _observed_mount_state(installer.configured_mountpoint(root))
         if state == "not mounted":
             return
         if state.startswith("unknown ("):
@@ -481,7 +481,7 @@ def _recover_disconnected_mount(
         result: subprocess.CompletedProcess[bytes] | None = None
         try:
             result = subprocess.run(
-                [str(binary), "-u", "-z", str(root / "mount")],
+                [str(binary), "-u", "-z", str(installer.configured_mountpoint(root))],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -490,7 +490,7 @@ def _recover_disconnected_mount(
             )
         except (OSError, subprocess.TimeoutExpired):
             pass
-        state = _wait_for_mount_state(root / "mount", "not mounted", timeout=MOUNT_STATE_TIMEOUT)
+        state = _wait_for_mount_state(installer.configured_mountpoint(root), "not mounted", timeout=MOUNT_STATE_TIMEOUT)
         if state != "not mounted":
             if state.startswith("unknown ("):
                 raise _mount_state_error(root, "the kernel mount state is unavailable after lazy unmount")
@@ -508,7 +508,7 @@ def _prepare_upgrade_mount(
     input_fn: Callable[[str], str],
 ) -> None:
     """Stop this install's service or mount before replacing its executable."""
-    mountpoint = root / "mount"
+    mountpoint = installer.configured_mountpoint(root)
     mount_state = _mounted_state(mountpoint)
     service_state = local_info.service_status(root, manifest)
     service_configured = service_state != "not configured for this install"
@@ -584,7 +584,7 @@ def _completion_summary(
     startup_wait_state: str | None = None,
 ) -> str:
     """Print actionable local paths and observed state without cloud access."""
-    mountpoint = root / "mount"
+    mountpoint = installer.configured_mountpoint(root)
     print("\nInstallation summary:")
     print(f"  Install root: {_shell_path(root)}")
     mount_state = _observed_mount_state(mountpoint)
