@@ -31,11 +31,12 @@ only when it still points to this install. A fresh installed root has
 checkout and the extracted archive use `degoo-rc` as their sole installer and
 maintenance entrypoint. Examples here use `degoo-rc`.
 
-The command set is `install`, `uninstall`, `login`, `setup`, `mount`, `stop`,
-`status`, `location`, `folders`, `service`, `info`, `logs`, `trash`, and
-`empty-trash`. Service actions are `enable`, `disable`, `start`, `stop`,
-`restart`, and `status`. Existing command options remain available. `trash`
-lists account trash; `empty-trash` separately performs account-wide deletion.
+The command set is `install`, `uninstall`, `backup-config`, `login`, `setup`,
+`mount`, `stop`, `status`, `benchmark`, `sync`, `location`, `folders`,
+`service`, `info`, `logs`, `trash`, and `empty-trash`. Service actions are
+`enable`, `disable`, `start`, `stop`, `restart`, and `status`. Existing command
+options remain available. `trash` lists account trash; `empty-trash`
+separately performs account-wide deletion.
 
 For the recommended contained installer, persistent user service, cached-email
 login, mount settings, and complete local cleanup, see
@@ -244,6 +245,57 @@ private token file. Logging in again can therefore restore a running mount
 without changing its vault secret or discarding pending writes. Rejected
 refresh errors report `degoo login required` and a sanitized HTTP status;
 passwords and provider response bodies stay out of logs.
+
+## Mounted throughput benchmark
+
+`degoo-rc benchmark` measures a mounted file read or write. The default path is
+`<mount>/benchmark.bin`; an explicit relative path is resolved from the current
+working directory. The selected path must stay inside the mounted vault. Writes
+create a new file and refuse to overwrite an existing path. Reads require an
+existing, nonempty regular file.
+
+```text
+degoo-rc benchmark write [FILENAME] [--size SIZE] [--block-size SIZE]
+  [--timeout SECONDS] [--poll-interval SECONDS] [--no-delete]
+degoo-rc benchmark read [FILENAME] [--block-size SIZE] [--timeout SECONDS]
+  [--buffered] [--drop-caches] [--no-delete]
+```
+
+```sh
+# Create a generated 2 GiB file and retain it for the read benchmark:
+degoo-rc benchmark write --no-delete
+degoo-rc benchmark read
+
+# Use a named path and tune write size and block size:
+degoo-rc benchmark write /mnt/degoo/benchmark.bin --size 8GiB --block-size 32MiB --timeout 7200 --no-delete
+
+# Try a buffered read if direct I/O is unsupported on this mount:
+degoo-rc benchmark read /mnt/degoo/benchmark.bin --buffered
+
+# Show all options for either mode:
+degoo-rc benchmark write --help
+degoo-rc benchmark read --help
+```
+
+Both successful modes delete the selected file by default. `--no-delete` keeps
+it after success; every failed or interrupted run preserves the file. `--size`
+(write only) defaults to 2GiB. `--block-size` defaults to 16MiB. Both options
+accept bytes or binary K/M/G/T suffixes such as `512KiB` and `2GiB`.
+`--timeout` defaults to 3600 seconds and bounds the I/O and, for writes, the
+upload wait together. Writes check upload state every second by default;
+`--poll-interval` changes that interval.
+
+Reads request direct I/O by default to bypass the kernel page cache. Use
+`--buffered` to allow kernel-cached reads. `--drop-caches` explicitly invokes
+`sudo` to drop Linux system caches before timing; it does not clear rclone's
+disk cache. A direct read may still be served by rclone's disk cache, so a
+benchmark does not guarantee a cloud download.
+
+Write timing includes the local write, `fsync`, close, writeback delay, and the
+wait until VFS reports this file version as `uploaded`. It measures the
+mounted write path through VFS completion; that state is not an independent
+cloud integrity check. A timeout or other failure leaves the benchmark file
+available for inspection with `degoo-rc status` and `degoo-rc logs`.
 
 ## Account trash
 

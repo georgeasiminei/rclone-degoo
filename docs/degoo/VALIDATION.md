@@ -604,3 +604,22 @@ ancestry, suppresses raw provider errors, and may renew authentication.
 - The updated secret-free Linux archive passed its packager self-check and an
   offline install, local report, and complete uninstall using the real binary
   under a temporary home. The archive includes the backend license notice.
+
+## Mounted benchmark command
+
+Offline checks on 2026-10-11 passed:
+
+- All 263 Python helper tests passed, including 13 benchmark tests with actual
+  small local `dd` reads and writes. Upload state and mount validation were
+  mocked; tests cover exact sizes, cleanup, retention, failed I/O, bounded
+  upload waiting, unsafe paths, and concurrent changes preventing deletion.
+- The package self-check passed with `benchmark.py` included in the archive
+  and installer. Benchmark discovery and both subcommand help pages passed.
+- Changed Markdown lint, shell alias syntax, and `git diff --check` passed.
+- The local installation received the benchmark helper and command dispatch;
+  its help pages passed. The superseded shell benchmark definitions were
+  removed from the local aliases file.
+
+No live cloud benchmark was run. These checks establish command behavior and
+packaging, not cloud throughput or a cold-cache download. VFS upload state is
+used for write completion without an independent remote integrity audit.

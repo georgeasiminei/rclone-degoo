@@ -72,6 +72,17 @@ These points are the binding product requirements recorded from the user.
   `diagnostics.log` files. Command failures are kept concise, without Cobra
   usage blocks, and displayed log lines redact recognized credentials.
 
+### Mounted benchmarks
+
+- Provide `degoo-rc benchmark read` and `degoo-rc benchmark write` in place of
+  shell benchmark aliases, with parameters for the selected file and test size
+  or I/O settings.
+- Delete the selected benchmark file after a successful test by default.
+  Support `--no-delete`, especially on writes so the file remains for a read
+  test. Preserve files when a benchmark fails or is interrupted.
+- Include upload completion in write timing and explain the distinction
+  between local persistence, VFS upload state, and independent cloud checks.
+
 ### Encryption and names
 
 - Encrypt every user file before sending its content to Degoo.

@@ -34,6 +34,7 @@ PYTHON_HELPERS = (
     "backup_config.py",
     "sync.py",
     "status.py",
+    "benchmark.py",
 )
 DOC_FILES = (
     "API_EVIDENCE.md",
@@ -48,7 +49,7 @@ SHELL_LAUNCHERS = (
     "scripts/install.sh", "scripts/uninstall.sh", "scripts/trash.sh",
 )
 CLI_COMMANDS = (
-    "install", "uninstall", "backup-config", "sync", "login", "setup", "mount", "stop", "status",
+    "install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "mount", "stop", "status",
     "location", "folders", "service", "info", "logs", "trash", "empty-trash",
 )
 PACKAGE_ENTRIES = (
