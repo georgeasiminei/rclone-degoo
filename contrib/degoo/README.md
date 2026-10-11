@@ -32,14 +32,17 @@ Before each action, the wizard checks the prerequisites for the selected
 binary, mountpoint, and service path. It distinguishes missing dependencies
 from inaccessible or misconfigured ones, lists optional components such as
 systemd, and prints system-specific setup, verification, and retry commands.
-This includes FUSE tools, `util-linux`, and `/dev/fuse` access. An immutable
-`/mnt/degoo` requires the manually installed root helper; the wizard can show
-build and installation instructions from the private install root but never
-clears the flag or changes privileged helper files itself. A known blocker
-prevents service enablement and readiness reporting, while completed
-configuration and pending cache data remain available for retry. See
+This includes FUSE tools, `util-linux`, and `/dev/fuse` access. For an
+immutable `/mnt/degoo` without a valid helper, the wizard stops before service
+startup and prints one administrator command. It preserves the flag; the
+command builds as the invoking user and installs only the fixed helper. If
+GCC is missing, the wizard prints the detected package command. After setup,
+continue as the normal user: with systemd, run `degoo-rc service enable` and
+then check `degoo-rc info`. Without systemd, run `degoo-rc mount` in one
+terminal and check `degoo-rc info` from another. Completed configuration and
+pending cache data remain available for retry. See
 [installation prerequisite recovery](../../docs/degoo/INSTALLATION.md) for
-examples and verification steps.
+commands and verification steps.
 
 ## Install
 
@@ -286,9 +289,9 @@ You may leave `chattr +i` set on `/mnt/degoo` while mounted and unmounted. The
 flag blocks the write-access check required by standard `fusermount3`, even
 when the directory is owner-writable. Mounting with the flag retained requires
 the administrator-installed helper in
-[immutable-mount/README.md](immutable-mount/README.md); the installer never
-clears the flag or installs privileged files. The helper is limited to an
-empty `/mnt/degoo` owned by the invoking user and not writable by group or
+[immutable-mount/README.md](immutable-mount/README.md); the wizard never clears
+the flag or installs privileged files automatically. The helper is limited to
+an empty `/mnt/degoo` owned by the invoking user and not writable by group or
 other users; the default directory remains owner-private. It mounts with that
 user's ID, rejects `allow_other` and `allow_root`, and leaves rclone running as
 the ordinary user. The mount launcher checks the helper's root ownership,
@@ -297,10 +300,44 @@ mount. Ordinary mutable mounts continue using the system FUSE helper. When the
 immutable flag is absent, the mount protects the underlying directory by
 removing write permissions after mounting and on failure or unmount.
 
-After an administrator installs the helper, retry a new service setup with
-`degoo-rc service enable`. If the service is already enabled, restart it with
-`degoo-rc service restart`. If the systemd user manager is unavailable, run
-`degoo-rc mount` for a foreground mount after repairing the blocker.
+When the wizard reports that the helper is missing or invalid, run its single
+administrator command. With the default install root, it is:
+
+```sh
+sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup
+```
+
+From a source checkout or extracted archive, run `sudo ./degoo-rc mount-setup`
+from its root directory instead.
+
+After it completes, continue as the normal user, without `sudo`:
+
+With a systemd user manager, enable the service and inspect the result:
+
+```sh
+degoo-rc service enable
+degoo-rc info
+```
+
+Without a systemd user manager, use this administrator setup command so it
+prints the foreground continuation:
+
+```sh
+sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup --foreground
+```
+
+From a source checkout or extracted archive, use
+`sudo ./degoo-rc mount-setup --foreground` from its root directory. Then start
+the mount as your normal user in one terminal:
+
+```sh
+degoo-rc mount
+```
+
+Run `degoo-rc info` from another terminal. For an already enabled service, run
+`degoo-rc service restart` and then `degoo-rc info` as the normal user.
+`mount-setup` preserves the immutable flag and does not mount or start a
+service as root.
 The installed `degoo-rc` command is available on `PATH`:
 
 ```sh
@@ -378,10 +415,13 @@ untouched. Empty shared directories under the user systemd config path may remai
 
 Use `degoo-rc help` to list commands. Run `degoo-rc COMMAND help` for that
 command's options and examples. The interface includes `install`, `uninstall`,
-`login`, `setup`, `mount`, `stop`, `status`, `location`, `folders`, `service`,
-`info`, `logs`, `trash`, and `empty-trash`. `service` accepts `enable`,
-`disable`, `start`, `stop`, `restart`, and `status`. Existing command options
-remain available; command help is the reference for their current parameters.
+`login`, `setup`, `mount`, `mount-setup`, `stop`, `status`, `location`,
+`folders`, `service`, `info`, `logs`, `trash`, and `empty-trash`. Run
+`mount-setup` explicitly with `sudo` to install the helper for an immutable
+`/mnt/degoo`; it does not mount the vault or start its service. `service`
+accepts `enable`, `disable`, `start`, `stop`, `restart`, and `status`. Existing
+command options remain available; command help is the reference for their
+current parameters.
 
 The installer places the entrypoint at
 `~/.local/share/rclone-degoo/degoo-rc` and creates

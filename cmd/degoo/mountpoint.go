@@ -124,7 +124,7 @@ func (guard *mountpointGuard) useImmutableMountHelper() (func(), error) {
 		return nil, errors.New("immutable mounting supports /mnt/degoo; migrate the contained install with degoo-rc install --mountpoint /mnt/degoo while preserving its cache")
 	}
 	if err := validateImmutableMountHelper(immutableMountHelper); err != nil {
-		return nil, fmt.Errorf("immutable mountpoint needs the administrator-installed helper at %s: %w; build and install it using immutable-mount/README.md from the Degoo install or source package, then retry service enable with the immutable flag retained", immutableMountHelper, err)
+		return nil, fmt.Errorf("immutable mountpoint needs the administrator-installed helper at %s: %w; run the installed degoo-rc mount-setup command with sudo, then run degoo-rc service enable as your normal user with the immutable flag retained", immutableMountHelper, err)
 	}
 	oldPath, present := os.LookupEnv("PATH")
 	if err := os.Setenv("PATH", filepath.Dir(immutableMountHelper)+":"+oldPath); err != nil {

@@ -728,3 +728,39 @@ Offline validation passed:
   checks.
 - The six changed Degoo Markdown files passed scoped markdownlint, and
   `git diff --check` passed.
+
+## Privileged immutable mount setup — 2026-10-11
+
+The wizard replaces its compiler and root install block with one explicit
+`sudo .../degoo-rc mount-setup` command, followed by clearly separated
+ordinary-user service or foreground-mount commands. The setup command builds
+as the sudo caller and installs only the fixed root-owned helper atomically.
+A valid helper is reusable without a compiler. Configuration, cache data,
+and the mountpoint's immutable flag are preserved.
+
+Validation completed:
+
+- All 309 contained Python tests passed. The setup tests cover sudo identity,
+  safe destination metadata, `nosuid`/`noexec`, missing compiler instructions,
+  real unprivileged GCC compilation, idempotence, shell quoting, refused
+  privilege changes, symlink preservation, and atomic write failure recovery.
+- The full credential-free `go test ./...` suite and a complete `go build`
+  passed. The host's FUSE 2 executable was exposed as `fusermount3` for the
+  existing mount tests; a locally built rclone was also available on `PATH`.
+- `bin/package-degoo.py --self-check` passed, and the complete binary was
+  packaged into an archive with launcher validation and a checksum sidecar.
+- `contrib/degoo/immutable-mount/test.sh` passed its C parser and helper checks.
+- `bin/test-degoo-immutable-mount.sh` passed in a private mount namespace.
+  The real `degoo-rc mount-setup` launcher worked with `HOME=/root`, compiled
+  as the calling account, installed a root:root mode-4755 helper, and succeeded
+  again without rebuilding. It repaired a helper symlink while preserving
+  its target and repaired an incorrectly owned world-writable helper file.
+  Generated encrypted data was written, read, unmounted, and read after
+  remounting while the underlying directory retained its immutable flag.
+  Unmounted writes and failed descriptor-send cleanup were also checked.
+- Python compilation, shell syntax, seven-file Markdown lint, and
+  `git diff --check` passed. Historical validation entries remain unchanged.
+
+These checks use disposable local encrypted data. They do not validate live
+Degoo behavior or install the helper on another server. `golangci-lint` was
+unavailable on the validation host.

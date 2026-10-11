@@ -297,34 +297,15 @@ class MountPrerequisitesTest(unittest.TestCase):
                 self.assertIsNotNone(reason)
                 self.assertIn(option, reason or "")
 
-    def test_setup_commands_quote_paths_and_only_install_manually(self) -> None:
+    def test_setup_commands_separate_sudo_setup_from_normal_user_start(self) -> None:
         root = self.base / "installer's files"
-        commands = prerequisites.setup_commands(root)
-
-        self.assertEqual(len(commands), 1)
-        script = commands[0]
-        self.assertIn(shlex.quote(str(root / "immutable-mount/helper.c")), script)
-        self.assertIn("mktemp -d", script)
-        self.assertIn("-D_FORTIFY_SOURCE=2", script)
-        self.assertIn("-fstack-protector-strong", script)
-        self.assertIn("-Wl,-z,relro,-z,now", script)
-        self.assertIn("trap 'rm -rf -- \"$build_dir\"' EXIT", script)
-        self.assertIn("trap 'exit 1' HUP INT TERM", script)
-        self.assertTrue(script.startswith("(\nset -eu\n"))
-        self.assertTrue(script.endswith("\n)"))
-        self.assertIn("sudo install -o root -g root -m 0755 -d", script)
-        self.assertIn("sudo install -o root -g root -m 4755", script)
-        self.assertIn("stat -c", script)
-        self.assertIn("namei -l", script)
-        self.assertIn("service enable", script)
-        self.assertIn(" info", script)
-        self.assertNotIn("chattr", script)
-        self.assertNotIn("chmod +i", script)
-
-        foreground_script = prerequisites.setup_commands(root, start_service=False)[0]
-        self.assertIn("stat -c", foreground_script)
-        self.assertNotIn("service enable", foreground_script)
-        self.assertNotIn("degoo-rc' info", foreground_script)
+        launcher = shlex.quote(str(root / "degoo-rc"))
+        self.assertEqual(prerequisites.setup_commands(root), [
+            f"sudo {launcher} mount-setup", f"{launcher} service enable", f"{launcher} info",
+        ])
+        self.assertEqual(prerequisites.setup_commands(root, start_service=False), [
+            f"sudo {launcher} mount-setup --foreground", f"{launcher} mount", f"{launcher} info",
+        ])
 
 
 if __name__ == "__main__":

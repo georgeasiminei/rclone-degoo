@@ -36,11 +36,13 @@ class WizardTest(unittest.TestCase):
         ):
             self.assertEqual(wizard._mount_preflight(root, Path("/mnt/degoo")), issues)
         text = output.getvalue()
-        self.assertIn("gcc", text)
-        self.assertIn("sudo install", text)
-        self.assertIn("4755", text)
+        self.assertIn("sudo " + shlex.quote(str(root / "degoo-rc")) + " mount-setup", text)
+        self.assertIn("without sudo", text)
+        self.assertNotIn("gcc -O2", text)
+        self.assertNotIn("sudo install", text)
         self.assertIn("service enable", text)
         self.assertIn("Keep the immutable flag set", text)
+        self.assertNotIn("namei", text)
         self.assertNotIn("chattr -i", text)
         run.assert_not_called()
 
@@ -83,7 +85,7 @@ class WizardTest(unittest.TestCase):
         ):
             wizard._mount_preflight(Path("/private/install"), Path("/mnt/degoo"))
         self.assertIn("re-extract the complete archive", output.getvalue())
-        self.assertNotIn("gcc -O2", output.getvalue())
+        self.assertNotIn("mount-setup", output.getvalue())
 
     def test_preflight_missing_legacy_directory_does_not_require_unsupported_flag(self) -> None:
         self.preflight.stop()
@@ -666,6 +668,7 @@ class WizardTest(unittest.TestCase):
         service_call.assert_not_called()
         mount_wait.assert_not_called()
         self.assertIn("immutable mount helper is missing", error_output.getvalue())
+        self.assertNotIn("Run the command block for the action you need", output.getvalue())
         self.assertIn("Mount point:", output.getvalue())
         self.assertIn("mounted", output.getvalue())
 

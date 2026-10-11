@@ -73,24 +73,58 @@ ask the administrator. Do not make the device world-writable as a workaround.
 
 An immutable `/mnt/degoo` needs the manually installed helper described in
 [immutable-mount/README.md](../../contrib/degoo/immutable-mount/README.md).
-When that helper is missing or invalid, the wizard checks for GCC and the
-helper source copied into the private install root, then prints build and
-`sudo install` commands from that root. A valid installed helper does not need
-GCC. Building runs as the ordinary account; only installing the root-owned
-mode-4755 helper and its root-owned
-mode-0755 directory requires administrator privileges. The wizard verifies
-the helper path, ownership, directory and file modes, setuid bit, and whether
-its filesystem is mounted `nosuid` or `noexec`; it also prints verification
-and service retry commands. This helper is not needed for a mutable mountpoint.
-The installer never clears the immutable flag or changes privileged helper files
-automatically. If compiler or source prerequisites are missing, the wizard
-explains which one and how to supply it while preserving the saved vault
-configuration and cache for retry.
+When the helper is missing or invalid, the wizard stops before the service
+prompt and prints one administrator command from the private install root:
 
-For a new setup, rerun the service step with `degoo-rc service enable` after
-repair. If the service is already enabled, use `degoo-rc service restart`.
-If the systemd user manager is unavailable, run `degoo-rc mount` for a
-foreground mount after repairing the blocker.
+```sh
+sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup
+```
+
+When the systemd user manager is unavailable, run the foreground setup
+command:
+
+```sh
+sudo "$HOME/.local/share/rclone-degoo/degoo-rc" mount-setup --foreground
+```
+
+`mount-setup` builds as the account that invoked `sudo`, then installs the
+fixed root-owned helper. It does not clear the immutable flag, mount the vault,
+or start a service as root. A valid installed helper does not require GCC. If
+GCC is missing, the wizard prints the detected distribution's compiler
+package command; install it and rerun the same `mount-setup` command. The
+wizard checks helper ownership, protected path modes, the setuid bit, and
+`nosuid` or `noexec` mount options. The
+[helper README](../../contrib/degoo/immutable-mount/README.md) explains the
+helper contract and includes optional advanced manual build steps.
+
+After `mount-setup` finishes, continue as your normal user; do not prefix
+these commands with `sudo`:
+
+When the systemd user manager is available, enable the service and inspect the
+result:
+
+```sh
+"$HOME/.local/share/rclone-degoo/degoo-rc" service enable
+"$HOME/.local/share/rclone-degoo/degoo-rc" info
+```
+
+Without systemd, start the mount as your normal user in one terminal:
+
+```sh
+"$HOME/.local/share/rclone-degoo/degoo-rc" mount
+```
+
+Run the status check as your normal user from another terminal:
+
+```sh
+"$HOME/.local/share/rclone-degoo/degoo-rc" info
+```
+
+For an already enabled service, run `degoo-rc service restart` as the normal
+user. When a known blocker prevents startup, the wizard prints these
+instructions without waiting for input and preserves the saved configuration
+and pending cache data for retry. The helper is not needed for a mutable
+mountpoint.
 The wizard reports setup as ready only after it confirms the requested mount.
 
 ## Start the installer

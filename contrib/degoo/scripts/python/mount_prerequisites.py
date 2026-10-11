@@ -208,10 +208,8 @@ def check(root: Path, mountpoint: Path) -> list[str]:
         helper_problem = _helper_problem(IMMUTABLE_HELPER)
         if helper_problem is not None:
             source = Path(root) / "immutable-mount" / "helper.c"
-            readme = Path(root) / "immutable-mount" / "README.md"
             issues.append(
-                f"immutable mount helper invalid: {IMMUTABLE_HELPER}: {helper_problem}. "
-                f"Build and install it manually using {readme}"
+                f"immutable mount helper invalid: {IMMUTABLE_HELPER}: {helper_problem}"
             )
             if not _helper_source_available(source):
                 issues.append(
@@ -227,27 +225,8 @@ def check(root: Path, mountpoint: Path) -> list[str]:
 
 
 def setup_commands(root: Path, *, start_service: bool = True) -> list[str]:
-    """Return a copyable shell block to build and manually install the helper."""
-    source = shlex.quote(str(Path(root) / "immutable-mount" / "helper.c"))
-    commands = [
-        "(",
-        "set -eu",
-        "command -v gcc >/dev/null 2>&1 || { printf '%s\\n' 'Install GCC using your distribution package manager, then retry.' >&2; exit 1; }",
-        f"source={source}",
-        "test -f \"$source\" || { printf '%s\\n' \"Helper source is missing: $source\" >&2; exit 1; }",
-        'build_dir=$(mktemp -d "${TMPDIR:-/tmp}/rclone-degoo-fusermount3.XXXXXXXX")',
-        "trap 'rm -rf -- \"$build_dir\"' EXIT",
-        "trap 'exit 1' HUP INT TERM",
-        "gcc -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -pie \\",
-        "  -Wl,-z,relro,-z,now -Wall -Wextra -Werror -std=c11 \\",
-        '  -o "$build_dir/fusermount3" "$source"',
-        f"sudo install -o root -g root -m 0755 -d -- {shlex.quote(str(HELPER_DIRECTORY))}",
-        f"sudo install -o root -g root -m 4755 -- \"$build_dir/fusermount3\" {shlex.quote(str(IMMUTABLE_HELPER))}",
-        f"stat -c '%U:%G %a %n' -- {shlex.quote(str(HELPER_DIRECTORY))} {shlex.quote(str(IMMUTABLE_HELPER))}",
-        f"if command -v namei >/dev/null 2>&1; then namei -l {shlex.quote(str(IMMUTABLE_HELPER))}; fi",
-    ]
-    if start_service:
-        launcher = shlex.quote(str(Path(root) / "degoo-rc"))
-        commands.extend((f"{launcher} service enable", f"{launcher} info"))
-    commands.append(")")
-    return ["\n".join(commands)]
+    """Return privileged setup followed by separate ordinary-user commands."""
+    launcher = shlex.quote(str(Path(root) / "degoo-rc"))
+    option = "" if start_service else " --foreground"
+    start = "service enable" if start_service else "mount"
+    return [f"sudo {launcher} mount-setup{option}", f"{launcher} {start}", f"{launcher} info"]
