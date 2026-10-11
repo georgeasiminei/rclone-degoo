@@ -12,11 +12,20 @@ provider queries confirmed the intended folder. A local vault binding that had
 used a folder name instead of an opaque provider folder ID was corrected after
 confirming its cache contained no identity or cached file data. No actual
 provider ID or private path is recorded here. This does not establish reliable
-automatic renewal; final mounted health verification is still pending. Live
-limits above 20 GiB, pagination beyond 1,000 entries, and upload recovery under
-Degoo's consistency model also remain unverified.
+automatic renewal. A later fresh installation mounted successfully after
+clearing the external mountpoint's immutable flag; local health reported no
+errors. Live limits above 20 GiB, pagination beyond 1,000 entries, and upload
+recovery under Degoo's consistency model also remain unverified.
 
 ## Implementation decisions and validation plan
+
+### Explicit installation startup errors
+
+When automatic startup is selected, a rejected service request or an
+unconfirmed connected mount ends installation with an explicit error and a
+nonzero exit status. Known immutable mountpoint flags are reported before
+requesting service startup, with the command needed to retry. Completed
+configuration and local cache are preserved. Manual startup remains optional.
 
 ### Complete local cleanup and interrupted-uninstall recovery
 
@@ -62,8 +71,9 @@ command errors omit Cobra usage blocks and redact recognized credentials.
 The final repository-wide test suite, scoped race and lint checks, Python
 helper tests, package self-check, native FUSE upload-status smoke test, and
 changed-document lint passed; details are recorded in [VALIDATION.md](VALIDATION.md).
-The installed mount's current health is still pending verification because an
-immutable mountpoint flag blocks ordinary-user FUSE mounting until cleared.
+The external mountpoint's immutable flag blocked ordinary-user FUSE mounting.
+After clearing it, the service reached a connected mount and the local health
+check returned success without writing remote file data.
 
 Upload timing separates the local close delay from transfer, registration,
 verification, and publication. The installer exposes a positive `write_back`

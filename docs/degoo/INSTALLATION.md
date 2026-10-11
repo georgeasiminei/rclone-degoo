@@ -355,8 +355,12 @@ disabled.
 The wizard finishes with a summary of the install directory, mount location,
 current mount state, helper commands, and log paths. A service start request
 does not establish that the mount is ready: the wizard waits briefly for the
-kernel's mount table to show the mount. If startup is still incomplete, it
-reports that state and gives commands to inspect status and logs. The default
+kernel's mount table to show a connected mount. If requested startup fails or
+remains unconfirmed, installation reports an explicit error and returns a
+nonzero exit status. Completed configuration remains available for retry.
+Known immutable-flag blockers include the exact `sudo chattr -i` command;
+other startup errors include commands to inspect status and logs. Choosing
+manual startup allows installation to finish without mounting. The default
 mount path is `/mnt/degoo`. Open that directory in a file manager or use it like
 any other directory while mounted. Ordinary files created there while the
 mount is absent remain local-only and are never uploaded; a mount refuses to

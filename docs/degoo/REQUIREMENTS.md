@@ -137,6 +137,10 @@ the separate vault secret, automatic renewal, and simple local-file setup.
   with the install and mount paths, actual mount state, helper commands, and
   log access. Make rejected authentication renewal visible with an actionable
   login-required message while preserving pending local changes.
+- When the user chooses to start the mount during installation, return a
+  nonzero exit status and an explicit error if startup fails or a connected
+  mount cannot be confirmed. Preserve completed configuration for recovery
+  and explain known startup blockers and retry commands.
 - Offer to keep selected local state during uninstall. Preserve pending
   changes and the configuration needed to recover them; remote removal is
   separate from removing the local installation.

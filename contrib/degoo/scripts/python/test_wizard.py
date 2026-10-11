@@ -280,6 +280,28 @@ class WizardTest(unittest.TestCase):
             mountinfo.write_bytes(b"x" * (wizard.MAX_MOUNTINFO_BYTES + 1))
             self.assertIn("unknown", wizard._mounted_state(Path("/tmp/degoo"), mountinfo))
 
+    def test_mountpoint_immutable_check_is_read_only_and_tolerates_unsupported_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            mountpoint = Path(temporary) / "mount"
+            mountpoint.mkdir(mode=0o700)
+            mode_before = mountpoint.stat().st_mode
+
+            def write_flags(value: int):
+                def ioctl(_fd: int, _request: int, flags: bytearray, _mutate: bool) -> None:
+                    wizard.struct.pack_into("@L", flags, 0, value)
+                return ioctl
+
+            with mock.patch.object(wizard.fcntl, "ioctl", side_effect=write_flags(wizard.FS_IMMUTABLE_FL)):
+                self.assertTrue(wizard._mountpoint_is_immutable(mountpoint))
+            with mock.patch.object(wizard.fcntl, "ioctl", side_effect=write_flags(0)):
+                self.assertFalse(wizard._mountpoint_is_immutable(mountpoint))
+            with mock.patch.object(wizard.fcntl, "ioctl", side_effect=OSError(errno.ENOTTY, "unsupported")):
+                self.assertFalse(wizard._mountpoint_is_immutable(mountpoint))
+            with mock.patch.object(wizard.fcntl, "ioctl") as ioctl:
+                self.assertFalse(wizard._mountpoint_is_immutable(mountpoint / "missing"))
+            ioctl.assert_not_called()
+            self.assertEqual(mountpoint.stat().st_mode, mode_before)
+
     def test_missing_package_prompt_defaults_to_install(self) -> None:
         with (
             mock.patch.object(wizard, "_package_manager", return_value=("/usr/bin/apt-get", ("install", "-y"))),
@@ -364,6 +386,7 @@ class WizardTest(unittest.TestCase):
             answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
+            error_output = io.StringIO()
             with (
                 mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
                 mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
@@ -378,6 +401,7 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_wait_for_mount", return_value="not mounted") as wait_mount,
                 mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
                 contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(error_output),
             ):
                 result = wizard._run(args, input_fn=lambda _: next(answers))
 
@@ -389,6 +413,10 @@ class WizardTest(unittest.TestCase):
         self.assertNotIn(f"Mount point: {mountpoint} — mounted", output.getvalue())
         self.assertIn("mount was not confirmed after up to 15 seconds", output.getvalue())
         self.assertIn("Recent mount, login, setup, and status logs", output.getvalue())
+        self.assertIn("Installation incomplete", error_output.getvalue())
+        self.assertIn("last check: not mounted", error_output.getvalue())
+        self.assertIn("logs", error_output.getvalue())
+        self.assertIn("service enable", error_output.getvalue())
         cli = shlex.quote(str(root / "degoo-rc"))
         self.assertIn(f"# Local status\n  {cli} info", output.getvalue())
         self.assertIn(f"{cli} logs --follow", output.getvalue())
@@ -399,6 +427,7 @@ class WizardTest(unittest.TestCase):
             answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
+            error_output = io.StringIO()
             failure = wizard.service.ServiceError("the service is linked, but could not start")
             with (
                 mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
@@ -413,6 +442,7 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
                 mock.patch.object(wizard.local_info, "service_status", return_value="enabled; failed"),
                 contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(error_output),
             ):
                 result = wizard._run(args, input_fn=lambda _: next(answers))
 
@@ -421,6 +451,160 @@ class WizardTest(unittest.TestCase):
         self.assertIn("Mount point:", output.getvalue())
         self.assertIn("degoo-rc service status", output.getvalue())
         self.assertIn("degoo-rc logs", output.getvalue())
+        self.assertIn("Installation incomplete", error_output.getvalue())
+        self.assertIn("degoo-rc logs", error_output.getvalue())
+        self.assertIn("degoo-rc service enable", error_output.getvalue())
+
+    def test_nonzero_service_start_result_is_reported_to_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            answers = iter([""] * 11)
+            args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+            error_output = io.StringIO()
+            with (
+                mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
+                mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                mock.patch.object(wizard.installer, "install", return_value=0),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
+                mock.patch.object(wizard.login, "run", return_value=0),
+                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard, "_save_settings"),
+                mock.patch.object(wizard.service, "run", return_value=3),
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="enabled; failed"),
+                contextlib.redirect_stderr(error_output),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = wizard._run(args, input_fn=lambda _: next(answers))
+
+        self.assertEqual(result, 3)
+        self.assertIn("Installation incomplete", error_output.getvalue())
+        self.assertIn("exit code 3", error_output.getvalue())
+
+    def test_unconfirmed_disconnected_and_unknown_mount_states_are_reported_to_stderr(self) -> None:
+        for state in ("disconnected (ENOTCONN)", "unknown (mount table unavailable)"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "install"
+                answers = iter([""] * 11)
+                args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+                error_output = io.StringIO()
+                with (
+                    mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
+                    mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                    mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                    mock.patch.object(wizard.installer, "install", return_value=0),
+                    mock.patch.object(wizard.connection, "check_connection", return_value=[]),
+                    mock.patch.object(wizard.login, "run", return_value=0),
+                    mock.patch.object(wizard.setup, "run", return_value=0),
+                    mock.patch.object(wizard, "_save_settings"),
+                    mock.patch.object(wizard.service, "run", return_value=0),
+                    mock.patch.object(wizard, "_wait_for_mount", return_value=state),
+                    mock.patch.object(wizard, "_observed_mount_state", return_value=state),
+                    mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
+                    contextlib.redirect_stderr(error_output),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    result = wizard._run(args, input_fn=lambda _: next(answers))
+
+                self.assertEqual(result, 2)
+                self.assertIn("Installation incomplete", error_output.getvalue())
+                self.assertIn(state, error_output.getvalue())
+
+    def test_final_mount_observation_controls_startup_failure_and_exit_code(self) -> None:
+        cases = (
+            ("mounted", "not mounted", 2, "not mounted"),
+            ("not mounted", "mounted", 0, None),
+        )
+        for waited_state, final_state, expected_code, error_state in cases:
+            with self.subTest(waited_state=waited_state, final_state=final_state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "install"
+                answers = iter([""] * 11)
+                args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+                error_output = io.StringIO()
+                with (
+                    mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
+                    mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                    mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                    mock.patch.object(wizard.installer, "install", return_value=0),
+                    mock.patch.object(wizard.connection, "check_connection", return_value=[]),
+                    mock.patch.object(wizard.login, "run", return_value=0),
+                    mock.patch.object(wizard.setup, "run", return_value=0),
+                    mock.patch.object(wizard, "_save_settings"),
+                    mock.patch.object(wizard.service, "run", return_value=0),
+                    mock.patch.object(wizard, "_wait_for_mount", return_value=waited_state),
+                    mock.patch.object(wizard, "_observed_mount_state", return_value=final_state),
+                    mock.patch.object(wizard.local_info, "service_status", return_value="enabled; active"),
+                    contextlib.redirect_stderr(error_output),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    result = wizard._run(args, input_fn=lambda _: next(answers))
+
+                self.assertEqual(result, expected_code)
+                if error_state is None:
+                    self.assertEqual(error_output.getvalue(), "")
+                else:
+                    self.assertIn("Installation incomplete", error_output.getvalue())
+                    self.assertIn(f"last check: {error_state}", error_output.getvalue())
+
+    def test_immutable_mountpoint_reports_manual_recovery_without_starting_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            answers = iter([""] * 11)
+            args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+            error_output = io.StringIO()
+            with (
+                mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
+                mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                mock.patch.object(wizard.installer, "install", return_value=0),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
+                mock.patch.object(wizard.login, "run", return_value=0),
+                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard, "_save_settings"),
+                mock.patch.object(wizard, "_mountpoint_is_immutable", return_value=True),
+                mock.patch.object(wizard.service, "run") as service_call,
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="not configured for this install"),
+                contextlib.redirect_stderr(error_output),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = wizard._run(args, input_fn=lambda _: next(answers))
+
+        self.assertEqual(result, 2)
+        service_call.assert_not_called()
+        self.assertIn("Installation incomplete", error_output.getvalue())
+        self.assertIn("immutable", error_output.getvalue())
+        self.assertIn(f"sudo chattr -i -- {root / 'mount'}", error_output.getvalue())
+        self.assertIn("degoo-rc service enable", error_output.getvalue())
+
+    def test_declining_systemd_start_keeps_manual_install_successful(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+            error_output = io.StringIO()
+
+            def answer(prompt: str) -> str:
+                return "n" if prompt.startswith("Enable and start the systemd user service?") else ""
+
+            with (
+                mock.patch.object(wizard, "_check_runtime", return_value=(True, True)),
+                mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                mock.patch.object(wizard.installer, "install", return_value=0),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
+                mock.patch.object(wizard.login, "run", return_value=0),
+                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard, "_save_settings"),
+                mock.patch.object(wizard.service, "run") as service_call,
+                contextlib.redirect_stderr(error_output),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = wizard._run(args, input_fn=answer)
+
+        self.assertEqual(result, 0)
+        service_call.assert_not_called()
+        self.assertEqual(error_output.getvalue(), "")
 
     def test_upgrade_stops_owned_service_even_before_mount_attaches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
