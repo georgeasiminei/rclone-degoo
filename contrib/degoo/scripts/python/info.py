@@ -497,11 +497,56 @@ def _remote_names(data: bytes) -> list[str] | None:
     return names
 
 
+def _remote_error_summary(data: bytes) -> str:
+    """Classify bounded stderr without returning provider text or credentials."""
+    text = data[:MAX_REMOTE_ERROR].decode("utf-8", errors="ignore")
+    auth_status = re.search(r"\bauth\s+HTTP\s+(401|403)\b", text, re.IGNORECASE)
+    login_required = re.search(r"\blogin required\b", text, re.IGNORECASE)
+    degoo_login = re.search(r"\bdegoo login required\b", text, re.IGNORECASE)
+    if login_required and auth_status:
+        return f"login required for remote check (auth HTTP {auth_status.group(1)})"
+    if degoo_login:
+        return "login required for remote check"
+    status = re.search(r"\bHTTP(?:/\d(?:\.\d)?)?\s+([45]\d{2})\b", text, re.IGNORECASE)
+    if status:
+        return f"remote check failed (HTTP {status.group(1)})"
+    return "remote check failed"
+
+
+def _prepare_diagnostic_log(path: Path) -> bool:
+    """Create or validate an owner-private log target before rclone opens it."""
+    try:
+        installer.check_directory(path.parent, private=True)
+        descriptor = log_reader._open_log(path)
+    except (installer.InstallError, log_reader.LogsError):
+        return False
+    if descriptor is not None:
+        os.close(descriptor)
+        return True
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        try:
+            descriptor = log_reader._open_log(path)
+        except log_reader.LogsError:
+            return False
+        if descriptor is None:
+            return False
+    except OSError:
+        return False
+    os.close(descriptor)
+    return True
+
+
 def remote_location(root: Path, *, timeout: float = 12.0) -> tuple[str, list[str] | None]:
     """Optionally query remote ancestry while discarding raw provider output."""
     binary = root / "bin" / "rclone"
     vault = root / "config" / "vault.json"
     if not _owned_executable(binary):
+        return "remote check could not start", None
+    diagnostic_log = root / "logs" / "diagnostics.log"
+    if not _prepare_diagnostic_log(diagnostic_log):
         return "remote check could not start", None
     env = dict(os.environ)
     env.setdefault("HOME", str(installer.home_directory()))
@@ -516,9 +561,9 @@ def remote_location(root: Path, *, timeout: float = 12.0) -> tuple[str, list[str
                     "--config",
                     str(root / "config" / "rclone.conf"),
                     "--log-file",
-                    "/dev/null",
+                    str(diagnostic_log),
                     "--log-level",
-                    "ERROR",
+                    "NOTICE",
                     "degoo",
                     "location",
                     str(vault),
@@ -529,6 +574,7 @@ def remote_location(root: Path, *, timeout: float = 12.0) -> tuple[str, list[str
                 env=env,
                 timeout=timeout,
                 check=False,
+                umask=0o077,
             )
             output.seek(0)
             data = output.read(MAX_REMOTE_OUTPUT + 1)
@@ -538,15 +584,12 @@ def remote_location(root: Path, *, timeout: float = 12.0) -> tuple[str, list[str
         return "remote check timed out", None
     except OSError:
         return "remote check could not start", None
+    if result.returncode != 0:
+        return _remote_error_summary(error_data), None
     if len(data) > MAX_REMOTE_OUTPUT or len(error_data) > MAX_REMOTE_ERROR:
         return "remote check failed", None
-    if result.returncode == 0:
-        names = _remote_names(data)
-        return ("checked", names) if names is not None else ("remote response was not recognized", None)
-    safe_error = error_data.decode("utf-8", errors="ignore")
-    if re.search(r"(?:^|\b)degoo login required(?:\b|$)", safe_error, re.IGNORECASE):
-        return "login required for remote check", None
-    return "remote check failed", None
+    names = _remote_names(data)
+    return ("checked", names) if names is not None else ("remote response was not recognized", None)
 
 
 def _cached_remote_path(manifest: dict[str, Any]) -> str:
@@ -562,6 +605,18 @@ def _cached_remote_path(manifest: dict[str, Any]) -> str:
             return f"{_safe_text(name, 255)} (parent ID { _safe_text(parent, 128) })"
         return _safe_text(name, 255)
     return "not recorded in local install metadata"
+
+
+def _has_unmounted_local_entries(mountpoint: Path) -> bool:
+    """Return whether the ordinary directory beneath an unmounted mount has entries."""
+    try:
+        mount_info = os.lstat(mountpoint)
+        if not stat.S_ISDIR(mount_info.st_mode) or stat.S_ISLNK(mount_info.st_mode):
+            return False
+        with os.scandir(mountpoint) as entries:
+            return next(entries, None) is not None
+    except OSError:
+        return False
 
 
 def _settings_summary(root: Path) -> list[str]:
@@ -654,19 +709,27 @@ def _validate_root(value: str) -> tuple[Path, dict[str, Any]]:
 
 def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) -> str:
     """Build a bounded human-readable report without printing private state."""
-    lines = ["Contained Degoo vault status", f"Install: {_display_path(root)}"]
     auth_path = root / "config" / "auth.json"
     auth_error = authentication_error(auth_path, logs_dir=root / "logs")
+    lines: list[str] = []
     if auth_error:
-        lines.insert(2, f"AUTHENTICATION ERROR: {auth_error}")
+        lines.append(f"AUTHENTICATION ERROR: {auth_error}")
+    lines.extend(("Contained Degoo vault status", f"Install: {_display_path(root)}"))
     folder_id = manifest.get("root_folder_id")
     if isinstance(folder_id, str) and folder_id and folder_id != "0":
-        lines.append(f"Vault folder ID: {_safe_text(folder_id, 128)}")
+        lines.append(f"Vault folder ID (opaque Degoo folder ID, not a name): {_safe_text(folder_id, 128)}")
     parent_id = manifest.get("parent_folder_id")
     if isinstance(parent_id, str) and parent_id:
         lines.append(f"Parent folder ID (cached): {_safe_text(parent_id, 128)}")
     lines.append(f"Remote path (cached local metadata): {_cached_remote_path(manifest)}")
-    lines.append(f"Mount point: {_display_path(root / 'mount')} — {mounted_state(root / 'mount')}")
+    mountpoint = installer.configured_mountpoint(root)
+    mount_state = mounted_state(mountpoint)
+    lines.append(f"Mount point: {_display_path(mountpoint)} — {mount_state}")
+    if mount_state == "not mounted" and _has_unmounted_local_entries(mountpoint):
+        lines.append(
+            "WARNING: the mount directory contains local entries while the vault is not mounted; "
+            "these are ordinary local files and are not pending uploads."
+        )
     lines.append(f"User service: {service_status(root, manifest)}")
     lines.append(
         f"User lingering: {linger_status()} "
@@ -709,7 +772,7 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
     lines.append("Pending counts describe local dirty uploads; they do not audit cloud contents or confirm remote integrity.")
 
     filesystem = filesystem_stats(root / "cache")
-    scan = scan_install_tree(root, root / "cache", root / "mount")
+    scan = scan_install_tree(root, root / "cache", installer.configured_mountpoint(root))
     lines.append(f"Cache backing filesystem: {_display_path(root / 'cache')}")
     if filesystem is None:
         lines.append("  Disk usage: unavailable.")
@@ -747,11 +810,11 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
             location = " / ".join(names) if names else "account root"
             lines.append(f"Remote check: succeeded; current folder ancestry: {location}.")
         else:
-            lines.append(f"Remote check: {state}; no provider error details were printed.")
-            if state == "login required for remote check" and not auth_error:
+            lines.append(f"Remote check: {state}; provider response details are hidden.")
+            if state.startswith("login required for remote check") and not auth_error:
                 command = _login_command(auth_path)
                 lines.insert(
-                    2,
+                    0,
                     f"AUTHENTICATION ERROR: Degoo rejected the current account authentication. Run {command} to sign in again.",
                 )
     else:

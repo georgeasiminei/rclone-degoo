@@ -15,8 +15,10 @@ import (
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 var degooFUSETest = flag.Bool("degoo-fuse-test", false, "run the opt-in native Degoo vault mount test")
@@ -126,6 +128,63 @@ func TestVaultNativeMount(t *testing.T) {
 	require.Equal(t, persistedData, got)
 	stopVaultMount(t, secondMount)
 	secondActive = false
+}
+
+func TestVaultUploadStatusNativeMount(t *testing.T) {
+	if !*degooFUSETest {
+		t.Skip("pass -degoo-fuse-test to run the native Linux FUSE smoke test")
+	}
+	ctx := context.Background()
+	cfg := testConfig(t)
+	_, stack := localStack(t, cfg)
+	mountDir := filepath.Join(t.TempDir(), "mount")
+	require.NoError(t, os.Mkdir(mountDir, 0700))
+	oldCache := config.GetCacheDir()
+	require.NoError(t, config.SetCacheDir(cfg.CacheDir))
+	t.Cleanup(func() { require.NoError(t, config.SetCacheDir(oldCache)) })
+	guard, err := protectMountpoint(mountDir)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, guard.Close())
+		require.NoError(t, os.Chmod(mountDir, 0700))
+	})
+	require.NoError(t, guard.prepare())
+	mountOpt := mountlib.Opt
+	vfsOpt := vfscommon.Opt
+	vfsOpt.CacheMode = vfscommon.CacheModeFull
+	vfsOpt.WriteBack = fs.Duration(500 * time.Millisecond)
+	vfsOpt.PollInterval = 0
+	vfsOpt.UploadStatus = true
+	mnt := startVaultMount(ctx, t, mountDir, stack, &mountOpt, &vfsOpt)
+	active := true
+	t.Cleanup(func() {
+		if active {
+			stopVaultMount(t, mnt)
+		}
+	})
+	require.NoError(t, guard.protect())
+	filename := filepath.Join(mountDir, "status.txt")
+	f, err := os.Create(filename)
+	require.NoError(t, err)
+	_, err = f.WriteString("generated upload state data")
+	require.NoError(t, err)
+	readStatus := func() string {
+		value := make([]byte, 32)
+		n, err := unix.Getxattr(filename, vfs.UploadStatusXattr, value)
+		require.NoError(t, err)
+		return string(value[:n])
+	}
+	require.Equal(t, "pending", readStatus())
+	require.ErrorIs(t, unix.Setxattr(filename, vfs.UploadStatusXattr, []byte("uploaded"), 0), unix.EPERM)
+	require.NoError(t, f.Close())
+	require.Eventually(t, func() bool { return readStatus() == "uploaded" }, 10*time.Second, 20*time.Millisecond)
+	stopVaultMount(t, mnt)
+	active = false
+	info, err := os.Stat(mountDir)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0500), info.Mode().Perm())
+	err = os.WriteFile(filepath.Join(mountDir, "unmounted.txt"), []byte("must fail"), 0600)
+	require.ErrorIs(t, err, os.ErrPermission)
 }
 
 func startVaultMount(ctx context.Context, t *testing.T, mountDir string, remote fs.Fs, mountOpt *mountlib.Options, vfsOpt *vfscommon.Options) *mountlib.MountPoint {

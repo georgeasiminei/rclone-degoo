@@ -113,9 +113,9 @@ class InfoTest(unittest.TestCase):
         ):
             report = info.report(self.root, self.manifest)
         lines = report.splitlines()
-        self.assertTrue(lines[2].startswith("AUTHENTICATION ERROR: No saved account token;"))
-        self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", lines[2])
-        self.assertIn("log in before cloud operations", lines[2])
+        self.assertTrue(lines[0].startswith("AUTHENTICATION ERROR: No saved account token;"))
+        self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", lines[0])
+        self.assertIn("log in before cloud operations", lines[0])
 
     def test_legacy_mount_settings_report_effective_defaults_for_missing_fields(self) -> None:
         settings = {
@@ -189,7 +189,7 @@ class InfoTest(unittest.TestCase):
             mock.patch.object(info, "linger_status", return_value="unknown"),
         ):
             report = info.report(self.root, self.manifest)
-        error_line = report.splitlines()[2]
+        error_line = report.splitlines()[0]
         self.assertTrue(error_line.startswith("AUTHENTICATION ERROR: The saved access token has expired"))
         self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", error_line)
 
@@ -205,8 +205,8 @@ class InfoTest(unittest.TestCase):
             mock.patch.object(info, "remote_location", return_value=("login required for remote check", None)),
         ):
             report = info.report(self.root, self.manifest, check_remote=True)
-        self.assertTrue(report.splitlines()[2].startswith("AUTHENTICATION ERROR: Degoo rejected the current account authentication."))
-        self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", report.splitlines()[2])
+        self.assertTrue(report.splitlines()[0].startswith("AUTHENTICATION ERROR: Degoo rejected the current account authentication."))
+        self.assertIn(f"{shlex.quote(str(self.root / 'degoo-rc'))} login", report.splitlines()[0])
 
     def test_auth_status_only_requires_login_for_a_recent_post_auth_sentinel(self) -> None:
         auth_path = self.root / "config/auth.json"
@@ -250,6 +250,54 @@ class InfoTest(unittest.TestCase):
             self.assertNotIn(secret, report)
         self.assertNotIn("owner@example.test", report)
         self.assertIn("does not contact Degoo", report)
+
+    def test_report_labels_folder_id_as_opaque_and_warns_about_local_mount_files(self) -> None:
+        self.manifest.pop("remote_path")
+        self.manifest.pop("remote_folder_name")
+        self.write_private(self.root / "mount/b.txt", "local data is not an upload")
+        with (
+            mock.patch.object(info, "service_status", return_value="not configured for this install"),
+            mock.patch.object(info, "mounted_state", return_value="not mounted"),
+            mock.patch.object(info, "linger_status", return_value="unknown"),
+        ):
+            report = info.report(self.root, self.manifest)
+        self.assertIn("Vault folder ID (opaque Degoo folder ID, not a name): own-folder-id", report)
+        self.assertIn("Remote path (cached local metadata): not recorded in local install metadata", report)
+        self.assertIn("mount directory contains local entries", report)
+        self.assertIn("not pending uploads", report)
+
+    def test_remote_check_classifies_auth_error_before_rejecting_large_cobra_usage(self) -> None:
+        binary = self.root / "bin/rclone"
+        binary.write_text(
+            "#!/usr/bin/python3\nimport sys\n"
+            "sys.stderr.write('GetOverlay4: cannot obtain access token: degoo login required (auth HTTP 401)\\n')\n"
+            "sys.stderr.write('Usage: rclone degoo location\\n' + '  --flag description\\n' * 3000)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+        state, names = info.remote_location(self.root)
+
+        self.assertEqual(state, "login required for remote check (auth HTTP 401)")
+        self.assertIsNone(names)
+        self.assertNotIn("Usage", state)
+
+    def test_remote_check_reports_safe_http_failure_category(self) -> None:
+        binary = self.root / "bin/rclone"
+        binary.write_text(
+            "#!/usr/bin/python3\nimport sys\n"
+            "sys.stderr.write('GetOverlay4 failed (HTTP 503): private provider payload token=secret\\n')\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+        state, names = info.remote_location(self.root)
+
+        self.assertEqual(state, "remote check failed (HTTP 503)")
+        self.assertIsNone(names)
+        self.assertNotIn("secret", state)
 
     def test_scan_skips_mount_tree_symlinks_and_obeys_entry_limit(self) -> None:
         cached = self.root / "cache" / "plain"
@@ -366,6 +414,9 @@ class InfoTest(unittest.TestCase):
         state, names = info.remote_location(self.root)
         self.assertEqual(state, "login required for remote check")
         self.assertIsNone(names)
+        diagnostic_log = self.root / "logs/diagnostics.log"
+        self.assertTrue(diagnostic_log.is_file())
+        self.assertEqual(stat.S_IMODE(diagnostic_log.stat().st_mode), 0o600)
 
     def test_installer_generates_offline_info_wrapper_and_packages_helper(self) -> None:
         binary = self.base / "rclone"
@@ -373,7 +424,7 @@ class InfoTest(unittest.TestCase):
         binary.chmod(0o700)
         shutil.rmtree(self.root)
         with mock.patch.object(install, "validate_binary"):
-            args = install.build_parser().parse_args(["--binary", str(binary), "--folder-id", "folder-id"])
+            args = install.build_parser().parse_args(["--binary", str(binary), "--folder-id", "folder-id", "--mountpoint", "mount"])
             self.assertEqual(install.install(args), 0)
         installed = self.root / "scripts/python/info.py"
         self.assertTrue(installed.is_file())

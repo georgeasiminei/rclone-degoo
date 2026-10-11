@@ -737,6 +737,7 @@ class WizardTest(unittest.TestCase):
             answers = iter([""] * 13)
             with (
                 mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch.object(wizard.installer, "DEFAULT_MOUNTPOINT", "mount"),
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)),
                 mock.patch.object(wizard.connection, "check_connection", return_value=[]),
@@ -858,6 +859,7 @@ class WizardTest(unittest.TestCase):
             account_folders = [{"id": "device-123", "name": "Device", "category": 1}]
             with (
                 mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch.object(wizard.installer, "DEFAULT_MOUNTPOINT", "mount"),
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)) as choose_binary,
                 mock.patch.object(wizard.connection, "check_connection", return_value=account_folders) as check_connection,
@@ -980,6 +982,7 @@ class WizardTest(unittest.TestCase):
             account_folders = [{"id": "device-123", "name": "Device", "category": 1}]
             with (
                 mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch.object(wizard.installer, "DEFAULT_MOUNTPOINT", "mount"),
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)),
                 mock.patch.object(wizard.connection, "check_connection", return_value=account_folders) as check_connection,
@@ -1024,6 +1027,7 @@ class WizardTest(unittest.TestCase):
             args = type("Args", (), {"binary": None, "folder_id": "other-id", "folder_name": None, "vault_config": None, "upgrade": True})()
             with (
                 mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch.object(wizard.installer, "DEFAULT_MOUNTPOINT", "mount"),
                 mock.patch.object(wizard.installer, "load_manifest", return_value={"root_folder_id": "bound-id"}),
                 mock.patch.object(wizard, "_check_runtime") as check_runtime,
                 self.assertRaises(wizard.WizardError),

@@ -1,16 +1,58 @@
 # Degoo private vault implementation plan
 
-**Status (2026-10-10):** Core implementation and offline validation are
-complete; live smoke checks passed against a dedicated disposable Degoo
-folder. A 2 MiB logical file has been fully published and verified after
-remounting with a fresh cache, including a CDN range read and matching full
-SHA-256. Root-level empty-file, overwrite, truncate, and rename readbacks passed
-after a fresh-cache remount. Nested creation, readback, rename, and deletion
-also passed, followed by an empty fresh-cache remount. Live
-limits above 20 GiB, pagination beyond 1,000 entries, and account-token
-lifetime are unverified, so the vault is not yet accepted for normal use.
+**Status (2026-10-11):** Core implementation and offline validation are
+complete; limited live smoke checks passed against a dedicated disposable
+Degoo folder. A 2 MiB logical file was published and verified after remounting
+with a fresh cache, including a CDN range read and matching full SHA-256.
+Root-level empty-file, overwrite, truncate, and rename readbacks passed after a
+fresh-cache remount. Nested creation, readback, rename, and deletion also
+passed, followed by an empty fresh-cache remount. An expired-token refresh
+initially returned HTTP 401. Authentication was later renewed, and read-only
+provider queries confirmed the intended folder. A local vault binding that had
+used a folder name instead of an opaque provider folder ID was corrected after
+confirming its cache contained no identity or cached file data. No actual
+provider ID or private path is recorded here. This does not establish reliable
+automatic renewal; final mounted health verification is still pending. Live
+limits above 20 GiB, pagination beyond 1,000 entries, and upload recovery under
+Degoo's consistency model also remain unverified.
 
 ## Implementation decisions and validation plan
+
+### Health reporting, file upload state, and mountpoint protection
+
+The contained `degoo-rc status` command checks authentication first, then
+mount/service health and local upload state. It returns a nonzero exit code for
+unhealthy state and supports JSON output. With a selected file or directory it
+reports `pending`, `uploading`, `uploaded`, or `unknown` from the mounted VFS
+read-only `user.rclone.upload-status` attribute. `uploaded` describes the
+current VFS version after writeback and does not trigger a fresh remote audit.
+The generic `--vfs-upload-status` option defaults to false; `rclone degoo
+mount` enables it. When the mount is absent, ordinary files below the
+mountpoint are reported as local-only and are never sent to Degoo. The private
+Unix HTTP socket's `GET /status` response exposes aggregate queued, uploading,
+and retrying counts, without per-file names or content.
+
+New contained installs default to `/mnt/degoo`; upgrades retain their recorded
+mount path. Installer helpers allow only `/mnt/degoo` and the legacy contained
+`mount` path. Migration to `/mnt/degoo` requires the previous underlying mount
+directory to be empty, and uninstall leaves the external directory in place.
+The mount creates an owner-private directory when possible, refuses to cover
+local files, and protects the underlying directory after mounting and on
+failure or unmount. If setup cannot create it, diagnostics print privileged
+`mkdir`, `chown`, `chmod`, and `chattr +i` commands. An immutable directory can
+block unprivileged FUSE mounting; the mount reports a `sudo chattr -i` command
+when the current user lacks write access. Clear the flag before retrying; the
+mount guard then protects the underlying directory by removing write
+permissions through its retained directory handle.
+
+Status output places authentication errors first. Private `status.log` and
+`diagnostics.log` capture the relevant helper and Degoo diagnostics; displayed
+command errors omit Cobra usage blocks and redact recognized credentials.
+The final repository-wide test suite, scoped race and lint checks, Python
+helper tests, package self-check, native FUSE upload-status smoke test, and
+changed-document lint passed; details are recorded in [VALIDATION.md](VALIDATION.md).
+The installed mount's current health is still pending verification because an
+immutable mountpoint flag blocks ordinary-user FUSE mounting until cleared.
 
 Upload timing separates the local close delay from transfer, registration,
 verification, and publication. The installer exposes a positive `write_back`

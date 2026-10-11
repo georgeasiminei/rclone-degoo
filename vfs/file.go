@@ -17,8 +17,12 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
+
+// UploadStatusXattr is the extended attribute name for a file's upload status.
+const UploadStatusXattr = "user.rclone.upload-status"
 
 // The File object is tightly coupled to the Dir object. Since they
 // both have locks there is plenty of potential for deadlocks. In
@@ -140,6 +144,43 @@ func (f *File) Name() (name string) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.leaf
+}
+
+// UploadStatus reports whether the current file version is pending, uploading,
+// uploaded, or unknown. It reports uploaded when the VFS knows the version has
+// a remote object; it does not revalidate the object with the remote. When
+// upload status reporting is disabled or the state cannot be proven, it returns
+// unknown.
+func (f *File) UploadStatus() string {
+	if f == nil {
+		return "unknown"
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.d == nil || !f.d.vfs.Opt.UploadStatus {
+		return "unknown"
+	}
+	if len(f.writers) != 0 {
+		return "pending"
+	}
+	// Keep the File lock while sampling the cache so a new writer cannot finish
+	// between the dirty check and the remote-object check.
+	cachePath := f._cachePath()
+	if cache := f.d.vfs.cache; cache != nil {
+		if item := cache.DirtyItem(cachePath); item != nil {
+			queue, _ := cache.Queue()["queue"].([]writeback.QueueInfo)
+			for _, queued := range queue {
+				if queued.Name == cachePath && queued.Uploading {
+					return "uploading"
+				}
+			}
+			return "pending"
+		}
+	}
+	if f.o == nil {
+		return "pending"
+	}
+	return "uploaded"
 }
 
 // _path returns the full path of the file

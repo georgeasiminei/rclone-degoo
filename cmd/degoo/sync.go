@@ -20,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"golang.org/x/sys/unix"
 )
 
@@ -120,7 +121,50 @@ type syncHandler struct {
 	endpoint   *syncEndpoint
 }
 
+type uploadQueueStatus struct {
+	Queued    int `json:"queued"`
+	Uploading int `json:"uploading"`
+	Retrying  int `json:"retrying"`
+}
+
+func queueStatus(ctx context.Context, mountedVFS *vfs.VFS) (uploadQueueStatus, error) {
+	call := rc.Calls.Get("vfs/queue")
+	if call == nil {
+		return uploadQueueStatus{}, errors.New("VFS upload queue call is unavailable")
+	}
+	out, err := call.Fn(ctx, rc.Params{"fs": fs.ConfigString(mountedVFS.Fs())})
+	if err != nil {
+		return uploadQueueStatus{}, err
+	}
+	items, ok := out["queue"].([]writeback.QueueInfo)
+	if !ok {
+		return uploadQueueStatus{}, errors.New("VFS upload queue response is invalid")
+	}
+	var status uploadQueueStatus
+	for _, item := range items {
+		if item.Uploading {
+			status.Uploading++
+		} else {
+			status.Queued++
+		}
+		if item.Tries > 0 && !item.Uploading || item.Tries > 1 {
+			status.Retrying++
+		}
+	}
+	return status, nil
+}
+
 func (handler *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/status" && r.URL.RawQuery == "" && r.Method == http.MethodGet {
+		status, err := queueStatus(r.Context(), handler.mountedVFS)
+		if err != nil {
+			fs.Errorf(nil, "degoo: could not inspect upload queue: %v", err)
+			writeSyncError(w, http.StatusInternalServerError, "upload queue unavailable")
+			return
+		}
+		writeSyncJSON(w, http.StatusOK, status)
+		return
+	}
 	if r.URL.Path != "/sync" || r.URL.RawQuery != "" {
 		writeSyncError(w, http.StatusNotFound, "not found")
 		return
@@ -147,11 +191,15 @@ func (handler *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	handler.endpoint.refreshMu.Lock()
 	defer handler.endpoint.refreshMu.Unlock()
+	started := time.Now()
+	fs.Logf(nil, "degoo: refreshing mounted remote view (path %q, recursive %t)", cleanPath, *request.Recursive)
 	handler.flushRaw()
 	if err := refreshVFSPath(r.Context(), handler.mountedVFS, cleanPath, *request.Recursive); err != nil {
+		fs.Errorf(nil, "degoo: mounted remote refresh failed (path %q, elapsed %s): %v", cleanPath, time.Since(started).Round(time.Millisecond), err)
 		writeSyncError(w, http.StatusBadGateway, "refresh failed")
 		return
 	}
+	fs.Logf(nil, "degoo: mounted remote view refreshed (path %q, elapsed %s); pending local writes retained", cleanPath, time.Since(started).Round(time.Millisecond))
 	writeSyncJSON(w, http.StatusOK, syncResponse{Path: cleanPath, Refreshed: true})
 }
 

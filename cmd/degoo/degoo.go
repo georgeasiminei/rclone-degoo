@@ -80,7 +80,10 @@ type mountSettings struct {
 }
 
 func init() {
-	root := &cobra.Command{Use: "degoo", Short: "Manage an encrypted Degoo vault on Linux."}
+	root := &cobra.Command{Use: "degoo", Short: "Manage an encrypted Degoo vault on Linux.", PersistentPreRun: func(c *cobra.Command, _ []string) {
+		// Runtime failures must remain visible without burying them in flag help.
+		c.SilenceUsage = true
+	}}
 	cmd.Root.AddCommand(root)
 	var email, restURL string
 	var cachedEmail bool
@@ -131,7 +134,7 @@ func init() {
 	initialize.Flags().StringVar(&remote, "remote", "", "Configured raw Degoo remote reserved for this vault (required)")
 	initialize.Flags().StringVar(&cacheDir, "cache-dir", "", "Private persistent cache directory (required)")
 	var settingsFile, syncSocket string
-	var verifyUpload bool
+	var verifyUpload, protectMountDir bool
 	mount := &cobra.Command{Use: "mount vault.json /path/to/mountpoint", Short: "Mount a writable vault with encrypted names, contents, and chunk metadata.", Long: `Mount a private Degoo vault through VFS, chunker, and crypt.
 The configuration must be a private version 1 JSON file. Encryption and full
 VFS caching are enforced. fsync commits to the local cache; uploads finish
@@ -142,13 +145,14 @@ verification is enabled by default. The private --settings file may set cache,
 read, mount, and network controls, plus write_back and verify_upload; explicit
 command-line flags take precedence. --sync-socket optionally exposes a private
 local Unix socket for targeted VFS cache refreshes.`, Args: cobra.ExactArgs(2), RunE: func(c *cobra.Command, args []string) error {
-		return mountVault(c.Context(), args[0], args[1], settingsFile, syncSocket, c.Flags(), verifyUpload)
+		return mountVault(c.Context(), args[0], args[1], settingsFile, syncSocket, c.Flags(), verifyUpload, protectMountDir)
 	}}
 	mountlib.AddFlags(mount.Flags())
 	vfsflags.AddFlags(mount.Flags())
 	mount.Flags().StringVar(&settingsFile, "settings", "", "Private JSON file with optional mount settings")
 	mount.Flags().StringVar(&syncSocket, "sync-socket", "", "Private Unix socket for scoped VFS refresh requests")
 	mount.Flags().BoolVar(&verifyUpload, "verify-upload", true, "Read back and hash each uploaded object before publishing it")
+	mount.Flags().BoolVar(&protectMountDir, "protect-mountpoint", true, "Make the underlying mount directory unwritable when unmounted and refuse to hide local files")
 	status := &cobra.Command{Use: "status vault.json", Short: "Show the number and size of locally pending uploads.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		cfg, err := readConfig(args[0])
 		if err != nil {
@@ -642,12 +646,25 @@ func cacheIdentity(c *VaultConfig, backend string) ([]byte, error) {
 	return []byte(hex.EncodeToString(sum[:]) + "\n"), nil
 }
 
-func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSocket string, flags *pflag.FlagSet, verifyUploadFlag bool) error {
+func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSocket string, flags *pflag.FlagSet, verifyUploadFlag, protectMountDir bool) error {
 	if err := safeLogging(ctx); err != nil {
 		return err
 	}
 	if mountlib.Opt.Daemon {
 		return errors.New("degoo mount runs in the foreground; use a service manager for background operation")
+	}
+	var guard *mountpointGuard
+	if protectMountDir {
+		var err error
+		guard, err = protectMountpoint(mountpoint)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := guard.Close(); err != nil {
+				rfs.Errorf(nil, "degoo: mount directory protection failed: %v", err)
+			}
+		}()
 	}
 	c, err := readConfig(filename)
 	if err != nil {
@@ -677,6 +694,12 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 		return err
 	}
 	defer func() { _ = lock.Close() }()
+	_, _, _, remoteConfig, err := rfs.ConfigFs(c.Remote)
+	if err != nil {
+		return err
+	}
+	folderID, _ := remoteConfig.Get("root_folder_id")
+	rfs.Logf(nil, "degoo: starting vault mount (folder ID %q, mountpoint %q, cache %q, write-back %s, verify-upload %t)", folderID, mountpoint, c.CacheDir, options.WriteBack, verifyUpload)
 	base, err := cache.Get(mountCtx, c.Remote)
 	if err != nil {
 		return err
@@ -717,13 +740,25 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 	}
 	options.CacheMode = vfscommon.CacheModeFull
 	options.PollInterval = 0
+	options.UploadStatus = true
 	mnt := mountlib.NewMountPoint(guardedMount, mountpoint, stack, &mountOptions, &options)
 	mnt.Ctx = mountCtx
 	rfs.Logf(nil, "Vault writes are saved in the local cache; remote uploads complete asynchronously. Keep the cache for recovery.")
+	if guard != nil {
+		if err := guard.prepare(); err != nil {
+			return err
+		}
+	}
 	_, err = mnt.Mount()
 	if err != nil {
 		return err
 	}
+	if guard != nil {
+		if err := guard.protect(); err != nil {
+			return errors.Join(err, mnt.Unmount())
+		}
+	}
+	rfs.Logf(nil, "degoo: vault mounted (folder ID %q, mountpoint %q)", folderID, mountpoint)
 	var syncEndpoint *syncEndpoint
 	if syncSocket != "" {
 		syncEndpoint, err = startSyncEndpoint(syncSocket, mnt.VFS, mountDF.DirCacheFlush)
@@ -736,6 +771,12 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 		}
 	}
 	waitErr := mnt.Wait()
+	files, size, pendingErr := pending(c)
+	if pendingErr != nil {
+		rfs.Errorf(nil, "degoo: mount stopped; pending upload count unavailable: %v", pendingErr)
+	} else {
+		rfs.Logf(nil, "degoo: mount stopped (pending local uploads: %d files, %d bytes)", files, size)
+	}
 	if syncEndpoint != nil {
 		if closeErr := syncEndpoint.Close(); closeErr != nil {
 			if waitErr != nil {

@@ -131,9 +131,18 @@ file contents. There is no restore operation.
 
 At the end of setup, the wizard prints the install directory, mount path,
 actual mount state, helper commands, and log locations. The `degoo-rc`
-command is installed on `PATH`; the default mount path is
-`~/.local/share/rclone-degoo/mount`; open that directory in your file manager
-or use it like any other directory while it is mounted.
+command is installed on `PATH`; the default mount path is `/mnt/degoo`. Open
+that directory in your file manager or use it like any other directory while
+it is mounted. If the installer cannot prepare the owner-private directory, it
+prints the needed privileged `mkdir`, `chown`, `chmod 700`, and `chattr +i`
+commands. The mount refuses to hide local files and protects the underlying
+directory from unmounted writes. An older install keeps its saved mountpoint
+unless `--mountpoint /mnt/degoo` is selected explicitly. That migration is
+refused while the old underlying directory contains files. Uninstall leaves
+the external mount directory in place. If you apply `chattr +i` to protect it
+while idle, clear the immutable flag with `sudo chattr -i -- /mnt/degoo` before
+an ordinary-user FUSE mount. The mount guard uses owner permissions to protect
+the underlying directory after mounting and on failure or unmount.
 
 ```sh
 degoo-rc info
@@ -141,7 +150,9 @@ degoo-rc logs
 degoo-rc logs --follow
 ```
 
-`degoo-rc logs` shows recent mount, login, setup, and status logs. Use
+`degoo-rc logs` shows recent mount, login, setup, status, and Degoo diagnostic
+messages. The private `status.log` and `diagnostics.log` contain status and
+runtime diagnostics. Use
 `--follow` to watch new messages; press Ctrl+C to stop following. The `logs/`
 path is a directory, while `degoo-rc logs` is the viewer. New mounts log
 notices and errors by default; routine cache-cleanup messages require a
@@ -150,6 +161,8 @@ cannot renew, `degoo-rc info` shows a login-required warning with the login
 command. Run `degoo-rc login`
 again; the mount can reload the saved credentials. An expired access token
 alone does not establish a failure when automatic renewal is still possible.
+Earlier renewal attempts returned HTTP 403 and HTTP 401; authentication was
+later renewed, but reliable automatic renewal remains unverified.
 
 The private install root is `~/.local/share/rclone-degoo`. The installer puts
 the entrypoint at `~/.local/share/rclone-degoo/degoo-rc` and links it from
@@ -189,6 +202,16 @@ pending-upload status. Keep the cache until pending uploads reach zero. A
 locally saved file may still await remote upload; pending changes and their
 matching vault configuration are both needed to resume work after recovery.
 
+`degoo-rc status` reports authentication errors first and returns nonzero when
+health checks fail. It accepts an optional file or directory path and supports
+`--json`. Per-file states are `pending`, `uploading`, `uploaded`, and `unknown`.
+The read-only `user.rclone.upload-status` attribute is enabled for Degoo mounts;
+generic VFS mounts default it off. `uploaded` means VFS knows the current
+version has a remote representation after writeback, not that status performed
+a new remote integrity check. Files created under an unmounted mountpoint are
+reported as local-only and are never queued for upload. The private status
+socket returns aggregate queued, uploading, and retrying counts only.
+
 ## Uninstall
 
 Inspect the install without changing it:
@@ -220,7 +243,8 @@ The separate `backup-config` command excludes cached files and pending uploads.
 If you choose not to retain the vault configuration, type `DISCARD` to confirm
 losing the local secret. Type `REMOVE` to confirm local cleanup. Uninstall
 stops the service linked to this install and removes its owned local files and
-systemd links, then reloads the user manager and verifies removal. It never
+systemd links, then reloads the user manager and verifies removal. It preserves
+the external `/mnt/degoo` directory. It never
 deletes remote encrypted files or Degoo account data.
 
 See [installation and cleanup](docs/INSTALLATION.md) for full setup,

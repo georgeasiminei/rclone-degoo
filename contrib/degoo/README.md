@@ -210,6 +210,23 @@ long-term unattended renewal remains unverified.
 vault and its ancestors; it may refresh authentication but does not download
 file data or calculate remote size.
 
+Use `degoo-rc status` for authentication-first health and upload status. An
+unhealthy result exits nonzero; `--json` returns machine-readable output. Pass
+a file path to report its current upload state:
+
+```sh
+degoo-rc status
+degoo-rc status /mnt/degoo/report.pdf --json
+```
+
+The per-file values are `pending`, `uploading`, `uploaded`, and `unknown`.
+`uploaded` means the current VFS version has a known remote representation
+after writeback; it is not a fresh cloud integrity check. Generic VFS mounts
+leave the read-only `user.rclone.upload-status` attribute disabled by default;
+the Degoo mount enables it. A file created below an unmounted mountpoint is
+local-only and is never queued for upload. The mount refuses to cover a
+nonempty directory.
+
 See [installation and cleanup](../../docs/degoo/INSTALLATION.md) for the full
 dependency, mount, cache, upgrade, and recovery guide. See
 [the quick start](../../DEGOO.md) and [usage](../../docs/degoo/USAGE.md) for
@@ -238,8 +255,16 @@ disposable account for destructive validation.
 ## Find your mount and logs
 
 The wizard ends with the install and mount paths, actual mount state, helper
-commands, and log locations. The default mount is
-`~/.local/share/rclone-degoo/mount`. Open that directory while it is mounted.
+commands, and log locations. The default mount is `/mnt/degoo`. Open that
+directory while it is mounted. New installs create it owner-private; if the
+installer cannot prepare it, it prints the privileged setup commands. Upgrades
+preserve their saved mount path. To migrate an older install, choose
+`--mountpoint /mnt/degoo`; migration is refused while the old underlying
+directory contains files. The external mount directory remains after uninstall.
+If you set `chattr +i` to protect it while idle, clear the flag with
+`sudo chattr -i -- /mnt/degoo` before mounting; it can prevent unprivileged
+FUSE setup. The mount protects the underlying directory by removing write
+permissions after mounting and on failure or unmount.
 The installed `degoo-rc` command is available on `PATH`:
 
 ```sh
@@ -249,7 +274,9 @@ degoo-rc logs --follow
 ```
 
 Press Ctrl+C to stop following logs. `degoo-rc logs` is the viewer; `logs/` is a
-directory. New mounts log notices and errors by default. The upgrade wizard
+directory. The private `status.log` and `diagnostics.log` contain status and
+Degoo runtime diagnostics. Displayed command errors omit Cobra usage blocks.
+New mounts log notices and errors by default. The upgrade wizard
 offers to stop the contained mount and waits briefly for it to start again.
 To stop the user service manually:
 
@@ -257,8 +284,10 @@ To stop the user service manually:
 degoo-rc service stop
 ```
 
-If authentication cannot renew, status reports a login-required warning with
-the login command. Run `degoo-rc login` again. Its
+If authentication cannot renew, status reports a login-required error with the
+login command and returns nonzero. Earlier renewal attempts returned HTTP 403
+and HTTP 401; authentication was later renewed, but reliable automatic renewal
+is still unverified. Run `degoo-rc login` again. Its
 password prompt stays visible in the terminal while logs go to a file, and
 password characters remain hidden. Keep the cache and matching vault
 configuration while uploads are pending.
@@ -305,7 +334,8 @@ checkout instead:
 
 Cleanup stops the service linked to this install, removes its owned systemd
 links, reloads the user manager, and deletes the contained local files. Remote
-encrypted files, account-wide sessions, and lingering settings remain
+encrypted files, the external `/mnt/degoo` directory, account-wide sessions,
+and lingering settings remain
 untouched. Empty shared directories under the user systemd config path may remain.
 
 ## Command reference and layout

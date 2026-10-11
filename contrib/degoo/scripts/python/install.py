@@ -25,7 +25,8 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "connection.py", "restore.py", "backup_config.py", "sync.py")
+SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "connection.py", "restore.py", "backup_config.py", "sync.py", "status.py")
+DEFAULT_MOUNTPOINT = "/mnt/degoo"
 SOURCE_SHELL_FILES = ("install.sh", "trash.sh", "uninstall.sh")
 GENERATED_SHELL_FILES = ("info.sh", "logs.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh")
 COMPATIBILITY_SHELL_FILES = (*SOURCE_SHELL_FILES, *GENERATED_SHELL_FILES)
@@ -68,7 +69,7 @@ MOUNT_DURATION_COMPONENT = re.compile(r"((?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(ns|us
 MOUNT_DURATION_NUMBER = re.compile(rf"{SIZE_NUMBER}\Z")
 BW_RATE = re.compile(rf"(?P<tx>off|{SIZE_NUMBER}{SIZE_SUFFIX})(?::(?P<rx>off|{SIZE_NUMBER}{SIZE_SUFFIX}))?\Z", re.IGNORECASE)
 FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount2.9", "fusermount3"}
-LEGACY_LOG_FILES = ("mount.log", "login.log", "setup.log", "status.log", "wizard-folders.log")
+LEGACY_LOG_FILES = ("mount.log", "login.log", "setup.log", "status.log", "wizard-folders.log", "diagnostics.log")
 
 
 class InstallError(Exception):
@@ -593,7 +594,7 @@ def load_manifest(root: Path) -> dict[str, Any]:
     manifest = parse_json_object(raw or b"", "the install manifest is invalid")
     if type(manifest.get("version")) is not int or manifest["version"] != 1 or manifest.get("remote_name") != REMOTE_NAME:
         raise InstallError("the existing install manifest is unsupported")
-    if manifest.get("mountpoint") != "mount" or manifest.get("cache_dir") != "cache":
+    if not isinstance(manifest.get("mountpoint"), str) or manifest["mountpoint"] not in {"mount", DEFAULT_MOUNTPOINT} or manifest.get("cache_dir") != "cache":
         raise InstallError("the existing install manifest contains unexpected paths")
     linked_path = manifest.get("path_link", "")
     if not isinstance(linked_path, str) or (linked_path and linked_path != str(expected_path_link())):
@@ -602,6 +603,41 @@ def load_manifest(root: Path) -> dict[str, Any]:
     if not isinstance(folder_id, str) or folder_id == "0":
         raise InstallError("the existing install manifest has an unsafe folder ID")
     return manifest
+
+
+def configured_mountpoint(root: Path, manifest: dict[str, Any] | None = None) -> Path:
+    """Return the recorded external mountpoint or the legacy contained path."""
+    if manifest is None:
+        raw = read_private_file(root / "install.json", 64 * 1024, missing_ok=True)
+        manifest = parse_json_object(raw, "the install manifest is invalid") if raw else {}
+    value = manifest.get("mountpoint", "mount")
+    if not isinstance(value, str) or value not in {"mount", DEFAULT_MOUNTPOINT}:
+        raise InstallError("the install manifest contains an unexpected mountpoint")
+    return root / value
+
+
+def mountpoint_instructions(path: Path) -> str:
+    """Return commands to create an owner-private immutable mount directory."""
+    quoted = shlex.quote(str(path))
+    return (
+        f"sudo mkdir -p -- {quoted}\n"
+        f"sudo chown -- {os.getuid()}:{os.getgid()} {quoted}\n"
+        f"sudo chmod 700 -- {quoted}\n"
+        f"sudo chattr +i -- {quoted}"
+    )
+
+
+def prepare_mountpoint(path: Path) -> None:
+    """Create a mount directory or report the privileged setup commands."""
+    try:
+        check_components(path, missing_ok=True)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        check_directory(path, private=True)
+    except (InstallError, OSError):
+        raise InstallError(
+            f"mount directory {path} could not be created or is not owner-private. "
+            "Run these commands, then retry installation:\n" + mountpoint_instructions(path)
+        ) from None
 
 
 def read_vault(raw: bytes, root: Path, *, imported: bool) -> tuple[dict[str, Any], bytes]:
@@ -708,8 +744,9 @@ def shell_quote(value: str | Path) -> str:
     return shlex.quote(str(value))
 
 
-def shell_wrapper(name: str, root: Path) -> bytes:
+def shell_wrapper(name: str, root: Path, *, mountpoint: Path | None = None) -> bytes:
     root_text = shell_quote(root)
+    mountpoint = configured_mountpoint(root) if mountpoint is None else mountpoint
     if name == "info.sh":
         content = (
             "#!/bin/sh\nset -eu\n"
@@ -752,7 +789,7 @@ def shell_wrapper(name: str, root: Path) -> bytes:
             "esac\n"
             f"exec \"$ROOT/bin/rclone\" --config \"$ROOT/config/rclone.conf\" "
             f"--log-file \"$ROOT/logs/mount.log\" --log-level NOTICE degoo mount "
-            f"--settings \"$ROOT/config/mount.json\" \"$ROOT/config/vault.json\" \"$ROOT/mount\" \"$@\""
+            f"--settings \"$ROOT/config/mount.json\" \"$ROOT/config/vault.json\" \"$MOUNTPOINT\" \"$@\""
         )
     elif name == "status.sh":
         command = (
@@ -762,31 +799,33 @@ def shell_wrapper(name: str, root: Path) -> bytes:
     elif name == "location.sh":
         command = (
             f"exec \"$ROOT/bin/rclone\" --config \"$ROOT/config/rclone.conf\" "
+            f"--log-file \"$ROOT/logs/diagnostics.log\" --log-level NOTICE "
             f"degoo location \"$ROOT/config/vault.json\" \"$@\""
         )
     elif name == "folders.sh":
         command = (
             f"exec \"$ROOT/bin/rclone\" --config \"$ROOT/config/rclone.conf\" "
+            f"--log-file \"$ROOT/logs/diagnostics.log\" --log-level NOTICE "
             f"degoo folders \"$ROOT/config/auth.json\" \"$@\""
         )
     elif name == "stop.sh":
         command = (
             "if command -v mountpoint >/dev/null 2>&1; then\n"
-            "  if mountpoint -q \"$ROOT/mount\"; then :; else\n"
+            "  if mountpoint -q \"$MOUNTPOINT\"; then :; else\n"
             "    mount_status=$?\n"
             "    if [ \"$mount_status\" -eq 32 ]; then exit 0; fi\n"
             "  fi\n"
             "fi\n"
             "if command -v fusermount3 >/dev/null 2>&1; then\n"
-            "  if fusermount3 -u \"$ROOT/mount\"; then exit 0; fi\n"
+            "  if fusermount3 -u \"$MOUNTPOINT\"; then exit 0; fi\n"
             "elif command -v fusermount >/dev/null 2>&1; then\n"
-            "  if fusermount -u \"$ROOT/mount\"; then exit 0; fi\n"
+            "  if fusermount -u \"$MOUNTPOINT\"; then exit 0; fi\n"
             "else\n"
             "  echo 'FUSE unmount helper was not found (install fuse3 or fuse).' >&2\n"
             "  exit 1\n"
             "fi\n"
             "if command -v mountpoint >/dev/null 2>&1; then\n"
-            "  if mountpoint -q \"$ROOT/mount\"; then :; else\n"
+            "  if mountpoint -q \"$MOUNTPOINT\"; then :; else\n"
             "    mount_status=$?\n"
             "    if [ \"$mount_status\" -eq 32 ]; then exit 0; fi\n"
             "  fi\n"
@@ -796,7 +835,7 @@ def shell_wrapper(name: str, root: Path) -> bytes:
     else:
         raise InstallError("an internal wrapper name was invalid")
     path = '"$ROOT/tools:/usr/bin:/bin"' if name in {"mount.sh", "stop.sh"} else "/usr/bin:/bin"
-    content = f"#!/bin/sh\nset -eu\nROOT={root_text}\numask 077\nexport PYTHONDONTWRITEBYTECODE=1\nexport XDG_CONFIG_HOME=\"$ROOT/config\"\nexport XDG_CACHE_HOME=\"$ROOT/cache\"\nexport TMPDIR=\"$ROOT/tmp\"\nexport PATH={path}\n{command}\n"
+    content = f"#!/bin/sh\nset -eu\nROOT={root_text}\nMOUNTPOINT={shell_quote(mountpoint)}\numask 077\nexport PYTHONDONTWRITEBYTECODE=1\nexport XDG_CONFIG_HOME=\"$ROOT/config\"\nexport XDG_CACHE_HOME=\"$ROOT/cache\"\nexport TMPDIR=\"$ROOT/tmp\"\nexport PATH={path}\n{command}\n"
     return content.encode("utf-8")
 
 
@@ -962,6 +1001,16 @@ def _install(args: argparse.Namespace) -> int:
         manifest = None
         legacy_wrappers = ()
 
+    if manifest is not None and getattr(args, "mountpoint", None):
+        previous_mountpoint = configured_mountpoint(root, manifest)
+        if manifest["mountpoint"] != args.mountpoint:
+            try:
+                with os.scandir(previous_mountpoint) as entries:
+                    if next(entries, None) is not None:
+                        raise InstallError("recover local files from the old mountpoint before changing it")
+            except FileNotFoundError:
+                pass
+            manifest["mountpoint"] = args.mountpoint
     initial_folder_id = manifest.get("root_folder_id", "") if manifest else ""
     supplied_folder_id = validate_folder_id(args.folder_id) if args.folder_id else ""
     if initial_folder_id and supplied_folder_id and supplied_folder_id != initial_folder_id:
@@ -984,9 +1033,10 @@ def _install(args: argparse.Namespace) -> int:
             "version": 1,
             "root_folder_id": "",
             "remote_folder_name": "",
+            "parent_folder_id": "",
             "remote_created_by_setup": False,
             "remote_name": REMOTE_NAME,
-            "mountpoint": "mount",
+            "mountpoint": getattr(args, "mountpoint", None) or DEFAULT_MOUNTPOINT,
             "binary": "bin/rclone",
             "vault_config": "config/vault.json",
             "rclone_config": "config/rclone.conf",
@@ -1082,7 +1132,7 @@ def _install(args: argparse.Namespace) -> int:
 
     for wrapper in GENERATED_SHELL_FILES:
         destination = root / "scripts" / wrapper
-        write_private_file(destination, shell_wrapper(wrapper, root), replace=os.path.lexists(destination), mode=0o700)
+        write_private_file(destination, shell_wrapper(wrapper, root, mountpoint=configured_mountpoint(root, manifest)), replace=os.path.lexists(destination), mode=0o700)
     for wrapper in legacy_wrappers:
         destination = root / wrapper
         write_private_file(destination, compatibility_wrapper(wrapper), replace=os.path.lexists(destination), mode=0o700)
@@ -1098,6 +1148,8 @@ def _install(args: argparse.Namespace) -> int:
         manifest["root_folder_id"] = folder_id
     if folder_name:
         manifest["remote_folder_name"] = folder_name
+    if args.parent_folder_id:
+        manifest["parent_folder_id"] = args.parent_folder_id
     if args.folder_created_by_setup:
         manifest["remote_created_by_setup"] = True
     manifest.setdefault("service_links", [])
@@ -1153,7 +1205,7 @@ def _user_service_active(root: Path) -> bool:
 
 
 def _acquire_upgrade_lock(root: Path) -> int:
-    if os.path.ismount(root) or os.path.ismount(root / "mount"):
+    if os.path.ismount(root) or os.path.ismount(configured_mountpoint(root)):
         if _user_service_active(root):
             stop_command = f"{shlex.quote(str(root / 'scripts/service.sh'))} stop"
         else:
@@ -1185,14 +1237,25 @@ def _acquire_upgrade_lock(root: Path) -> int:
 def install(args: argparse.Namespace) -> int:
     supplied_folder_id = validate_folder_id(args.folder_id) if args.folder_id else ""
     folder_name = validate_folder_name(args.folder_name) if args.folder_name else ""
+    supplied_parent_folder_id = getattr(args, "parent_folder_id", None)
+    parent_folder_id = validate_folder_id(supplied_parent_folder_id) if supplied_parent_folder_id else ""
     if folder_name and not supplied_folder_id and not args.upgrade:
         raise InstallError("--folder-name requires --folder-id")
     if args.folder_created_by_setup and not supplied_folder_id:
         raise InstallError("the setup-created folder marker requires --folder-id")
+    if parent_folder_id and not args.folder_created_by_setup:
+        raise InstallError("the parent folder ID can only be recorded for a setup-created folder")
+    if parent_folder_id and not supplied_folder_id:
+        raise InstallError("--parent-folder-id requires --folder-id")
+    args.parent_folder_id = parent_folder_id
     args.binary = str(_binary_source(args.binary))
     validate_binary(Path(args.binary))
     preflight_install_safety()
+    existing_manifest = load_manifest(expected_root()) if args.upgrade else None
+    selected_mountpoint = getattr(args, "mountpoint", None) or (existing_manifest["mountpoint"] if existing_manifest else DEFAULT_MOUNTPOINT)
     if not args.upgrade:
+        if selected_mountpoint != "mount" and selected_mountpoint == DEFAULT_MOUNTPOINT:
+            prepare_mountpoint(Path(DEFAULT_MOUNTPOINT))
         return _install(args)
     root = expected_root()
     if not os.path.lexists(root):
@@ -1201,6 +1264,8 @@ def install(args: argparse.Namespace) -> int:
     load_manifest(root)
     lock = _acquire_upgrade_lock(root)
     try:
+        if selected_mountpoint != "mount" and selected_mountpoint == DEFAULT_MOUNTPOINT:
+            prepare_mountpoint(Path(DEFAULT_MOUNTPOINT))
         return _install(args)
     finally:
         os.close(lock)
@@ -1212,12 +1277,14 @@ def build_parser() -> argparse.ArgumentParser:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--wizard", action="store_true", help="ask for installation and vault settings step by step")
     mode.add_argument("--no-wizard", action="store_true", help="install without interactive setup (requires --binary)")
+    parser.add_argument("--mountpoint", choices=(DEFAULT_MOUNTPOINT, "mount"), help="mount at /mnt/degoo by default; upgrades keep the saved location; mount selects the legacy contained directory")
     parser.add_argument("--folder-id", help="ID of an existing dedicated Degoo folder (account root 0 is refused)")
     parser.add_argument("--folder-name", help="optional human-readable name for the dedicated folder")
     parser.add_argument("--vault-config", help="private existing vault configuration to import on another machine")
     parser.add_argument("--restore-directory", help="private retained backup directory to restore through the interactive wizard")
     parser.add_argument("--upgrade", action="store_true", help="update the contained client while preserving its vault, login, settings, and cache")
     parser.add_argument("--folder-created-by-setup", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--parent-folder-id", help=argparse.SUPPRESS)
     return parser
 
 

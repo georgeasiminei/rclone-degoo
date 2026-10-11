@@ -70,10 +70,12 @@ func addSetupCommands(root *cobra.Command) {
 		if err != nil {
 			return err
 		}
+		rfs.Logf(nil, "degoo: listing folders (parent ID %q)", parentID)
 		items, err := client.ListDir(c.Context(), parentID)
 		if err != nil {
 			return err
 		}
+		rfs.Logf(nil, "degoo: folder query completed (parent ID %q, %d items)", parentID, len(items))
 		return writeFolders(c.OutOrStdout(), items)
 	}}
 	folders.Flags().StringVar(&parentID, "parent-id", "0", "Parent folder ID; 0 lists account device containers")
@@ -143,10 +145,12 @@ func addSetupCommands(root *cobra.Command) {
 			return err
 		}
 		id, _ := m.Get("root_folder_id")
+		rfs.Logf(nil, "degoo: inspecting vault ancestry (configured folder ID %q)", id)
 		entries, err := ancestorFolders(c.Context(), client.GetItem, id)
 		if err != nil {
 			return err
 		}
+		rfs.Logf(nil, "degoo: vault ancestry resolved (configured folder ID %q, %d folders)", id, len(entries))
 		return json.NewEncoder(c.OutOrStdout()).Encode(entries)
 	}}
 	root.AddCommand(folders, create, location)
@@ -166,7 +170,7 @@ func ancestorFolders(ctx context.Context, get func(context.Context, string) (api
 		seen[id] = true
 		item, err := get(ctx, id)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("inspect ancestor folder ID %q: %w", id, err)
 		}
 		if item.ID != id {
 			return nil, errors.New("degoo returned mismatched folder metadata")

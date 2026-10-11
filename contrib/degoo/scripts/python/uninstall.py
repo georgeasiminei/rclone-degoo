@@ -34,7 +34,6 @@ EXPECTED_MANIFEST_PATHS = {
     "vault_config": "config/vault.json",
     "rclone_config": "config/rclone.conf",
     "cache_dir": "cache",
-    "mountpoint": "mount",
     "pidfile": "mount.pid",
 }
 FUSERMOUNT_NAMES = {"fusermount", "fusermount2", "fusermount2.9", "fusermount3"}
@@ -168,6 +167,10 @@ def _validate_manifest(root: Path) -> dict[str, Any]:
     for field, expected in EXPECTED_MANIFEST_PATHS.items():
         if manifest.get(field) != expected:
             raise CleanupError("the install manifest contains an unexpected local path")
+    try:
+        installer.configured_mountpoint(root, manifest)
+    except installer.InstallError as exc:
+        raise CleanupError(str(exc)) from None
     if created and not folder_name.strip():
         raise CleanupError("the install manifest is incomplete")
     service_config_home = manifest.get("service_config_home", "")
@@ -566,7 +569,7 @@ def read_mountpoints() -> set[str]:
 
 def _mount_state(root: Path, points: set[str]) -> bool:
     root_text = os.path.normpath(str(root))
-    mount_text = os.path.normpath(str(root / "mount"))
+    mount_text = os.path.normpath(str(installer.configured_mountpoint(root)))
     if root_text in points:
         raise CleanupError("refusing to remove an install root that is itself a mountpoint")
     active = mount_text in points
@@ -881,7 +884,7 @@ def _unmount(root: Path) -> None:
     helper = _validate_helper_link(root / "tools/fusermount3", require_executable=True)
     try:
         result = subprocess.run(
-            [str(helper), "-u", str(root / "mount")],
+            [str(helper), "-u", str(installer.configured_mountpoint(root))],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1047,7 +1050,7 @@ def _pending_uploads(root: Path) -> tuple[int, int]:
 
 def _require_empty_mount_directory(root: Path) -> None:
     try:
-        with os.scandir(root / "mount") as iterator:
+        with os.scandir(installer.configured_mountpoint(root)) as iterator:
             if next(iterator, None) is not None:
                 raise CleanupError("the unmounted mount directory contains local files")
     except CleanupError:

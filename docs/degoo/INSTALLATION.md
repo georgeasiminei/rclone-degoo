@@ -218,6 +218,35 @@ its directories to owner-only access (`0700`) and private config files to
 `0600`. The wizard offers to enable the systemd user service by default when a
 user manager responds. It does not enable lingering automatically.
 
+New contained installs mount at `/mnt/degoo`. The installer tries to create
+that directory with mode `0700`. If it cannot create or secure the path, it
+prints privileged commands for the selected mountpoint and current user, such
+as:
+
+```sh
+sudo mkdir -p -- /mnt/degoo
+sudo chown -- "$(id -u):$(id -g)" /mnt/degoo
+sudo chmod 700 -- /mnt/degoo
+sudo chattr +i -- /mnt/degoo
+```
+
+The Linux mount checks that the directory belongs to the user, refuses to hide
+files already in it, and keeps the underlying directory unwritable while
+unmounted. An immutable flag can prevent unprivileged FUSE mounting because the
+mount process needs write access to the mountpoint. If the mount detects that
+condition, it stops and prints a `sudo chattr -i -- /mnt/degoo` command; clear
+the flag and retry. The mount guard then removes write permission through the
+retained directory handle after mounting and again on failure or unmount. You
+may reapply `chattr +i` while the directory is idle, but clear it before the
+next ordinary-user mount.
+
+The installer helpers accept `/mnt/degoo` or the legacy in-install `mount`
+directory. Upgrades preserve the recorded mountpoint by default. To migrate an
+older install to `/mnt/degoo`, pass `--mountpoint /mnt/degoo`; migration is
+refused while the old underlying `mount/` directory contains files. Move those
+files out and retry. The external `/mnt/degoo` directory is preserved during
+uninstall.
+
 For a new vault, the default chunk size is 128 MiB of plaintext and the
 provisional maximum encrypted object size is 19 GiB. The provider's live limit
 above 20 GiB has not been established. The initial `config/mount.json` values
@@ -298,7 +327,7 @@ readback verification does not resolve a provider registration rejection.
   config/rclone.conf  isolated remote and folder ID
   config/mount.json   cache and upload settings
   cache/              persistent plaintext VFS cache and lock
-  mount/              plaintext view while mounted
+  mount/              legacy mountpoint when explicitly selected
   tools/              contained FUSE helper alias
   tmp/                temporary upload files
   logs/               private runtime logs
@@ -328,9 +357,10 @@ current mount state, helper commands, and log paths. A service start request
 does not establish that the mount is ready: the wizard waits briefly for the
 kernel's mount table to show the mount. If startup is still incomplete, it
 reports that state and gives commands to inspect status and logs. The default
-mount path is
-`~/.local/share/rclone-degoo/mount`. Open that directory in a file manager or
-use it like any other directory while mounted. The installed command dispatches
+mount path is `/mnt/degoo`. Open that directory in a file manager or use it like
+any other directory while mounted. Ordinary files created there while the
+mount is absent remain local-only and are never uploaded; a mount refuses to
+cover a nonempty directory. The installed command dispatches
 to helpers in `~/.local/share/rclone-degoo/scripts/`, rather than using files
 from the extracted package folder.
 
@@ -345,8 +375,10 @@ written to a file. Password characters are not echoed or saved.
 Access tokens refresh automatically when nearing expiry. If Degoo rejects a
 refresh, the mount reports that login is needed. Run `degoo-rc login` again;
 the authentication client can load the newly saved credentials. Long-term
-unattended renewal has not been verified: a live one-hour access token expired
-and renewal returned HTTP 403, though fresh login and renewal then succeeded.
+unattended renewal has not been verified. Earlier probes returned HTTP 403 and
+HTTP 401 during token renewal; authentication was later renewed and read-only
+provider queries succeeded. This does not establish reliable automatic
+renewal. See [VALIDATION.md](VALIDATION.md) for the current validation state.
 
 Use the mount launcher for a foreground session:
 
@@ -410,16 +442,39 @@ download file contents or enumerate the cloud to calculate its size. Zero
 pending uploads means there are no local dirty writes, not that remote data
 passed an independent integrity audit.
 
+Use `degoo-rc status` for authentication-first health and upload status. It
+returns a nonzero exit status when authentication, mount/service health, or
+local upload checks are unhealthy. A file path adds per-file status, and
+`--json` returns machine-readable output:
+
+```sh
+degoo-rc status
+degoo-rc status /mnt/degoo/report.pdf --json
+```
+
+For mounted files, status reads the VFS's read-only
+`user.rclone.upload-status` attribute: `pending`, `uploading`, `uploaded`, or
+`unknown`. `uploaded` means VFS knows the current version has a remote
+representation after writeback; it does not freshly audit the remote object.
+When the mount is absent, files under `/mnt/degoo` are reported as
+`local-only`, separate from any persisted cache record, and are never uploaded.
+The private mount socket contributes aggregate queued, uploading, and
+retrying counts only.
+
 ## Logs and authentication errors
 
-Show recent mount, login, setup, and status log messages, or watch new messages:
+Show recent mount, login, setup, status, and Degoo diagnostic messages, or
+watch new messages:
 
 ```sh
 degoo-rc logs
 degoo-rc logs --follow
 ```
 
-Press Ctrl+C to leave follow mode. `degoo-rc logs` is the viewer;
+The contained `status.log` records status-command diagnostics and
+`diagnostics.log` holds Degoo runtime diagnostics. Failures are shown before
+other report details, without Cobra usage blocks. Press Ctrl+C to leave follow
+mode. `degoo-rc logs` is the viewer;
 `~/.local/share/rclone-degoo/logs/` is a directory of files. New mounts log
 notices and errors by default, suppressing routine cache-cleanup messages.
 Existing log contents remain available. For a more detailed foreground session:
@@ -505,7 +560,9 @@ The cleanup stops the owned service before disabling it, removes its systemd
 links, reloads the user manager, and removes the contained configuration,
 cache, logs, binary, and scripts. Only explicitly retained state remains in
 the chosen external backup directory. Remote encrypted files and Degoo
-account data are untouched. Shared dependencies, parent systemd directories,
+account data are untouched. The external `/mnt/degoo` directory is also left
+in place; it remains protected against unmounted writes. Shared dependencies,
+parent systemd directories,
 and historical entries in the shared system journal are not installation
 files and remain. Cleanup does not disable account-wide lingering. If you
 enabled lingering solely for

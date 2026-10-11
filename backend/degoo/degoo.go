@@ -192,7 +192,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	rootItem, err := f.getItem(ctx, opt.RootFolderID)
 	if err != nil {
-		return nil, fmt.Errorf("degoo: inspect configured vault folder: %w", err)
+		return nil, fmt.Errorf("degoo: inspect configured vault folder ID %q: %w", opt.RootFolderID, err)
 	}
 	isDir, err := f.itemIsDirectory(ctx, rootItem)
 	if err != nil {
@@ -201,6 +201,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if !isDir {
 		return nil, errors.New("degoo: root_folder_id does not identify a directory")
 	}
+	fs.Debugf(f, "degoo: vault folder resolved (ID %q, parent ID %q, category %d)", rootItem.ID, rootItem.ParentID, rootItem.Category)
 	if err := f.retireConfiguredRootPlaceholder(ctx, rootItem); err != nil {
 		return nil, fmt.Errorf("degoo: reconcile configured vault folder: %w", err)
 	}
@@ -1646,7 +1647,7 @@ func (f *Fs) uploadAndCommit(ctx context.Context, remote string, old *Object, in
 	created := time.Now()
 	_, registerErr := f.api.Register(ctx, parentID, tempName, providerChecksum, stagedSize, created)
 	if registerErr != nil {
-		fs.Debugf(f, "degoo: reconciling encrypted upload after unacknowledged registration")
+		fs.Logf(f, "degoo: reconciling encrypted upload after unacknowledged registration (parent ID %q, %d bytes): %v", parentID, stagedSize, registerErr)
 	}
 	// An unacknowledged mutation can become visible after a delayed listing.
 	// Reconcile the exact temporary name before returning this attempt.
@@ -1778,6 +1779,7 @@ func (f *Fs) finishUpload(ctx context.Context, remote, leaf, parentID string, st
 			fs.Errorf(f, "could not remove hidden backup after replacement; new object is committed: %v", err)
 		}
 	}
+	fs.Logf(f, "degoo: remote object published (ID %q, parent ID %q, %d bytes, readback verification %t); logical file upload may still be pending", published.id, parentID, size, !f.opt.SkipUploadVerification)
 	return published, nil
 }
 

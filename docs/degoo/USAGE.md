@@ -9,9 +9,12 @@ Linux FUSE -> VFS full cache -> chunker -> crypt -> Degoo
 
 The implementation is experimental. Offline tests exercise the request shapes
 and vault behavior. A disposable live vault passed encrypted publication,
-fresh-cache readback, and CDN range reads. A live access token expired after an
-hour and refresh returned HTTP 403; fresh interactive login is required for
-that session. Long-term renewal, larger live files, and the provider object-size
+fresh-cache readback, and CDN range reads. An expired-token refresh initially
+returned HTTP 401; authentication was later renewed and read-only provider
+queries confirmed the intended folder. The local vault binding was corrected
+after confirming the prior cache held no identity or cached file data. These
+events do not establish reliable automatic renewal, and final mounted health
+verification is still pending. Larger live files and the provider object-size
 limit remain acceptance gates; see
 [VALIDATION.md](VALIDATION.md) for the tested scope.
 
@@ -145,10 +148,10 @@ controls an additional kernel attribute cache.
 Refresh the current mounted directory tree without waiting for the listing TTL:
 
 ```sh
-cd ~/.local/share/rclone-degoo/mount/photos
+cd /mnt/degoo/photos
 degoo-rc sync .
 # An absolute mounted file or directory path also works:
-degoo-rc sync ~/.local/share/rclone-degoo/mount/photos/example.jpg
+degoo-rc sync /mnt/degoo/photos/example.jpg
 ```
 
 The command refreshes remote directory metadata recursively. A file path
@@ -185,18 +188,37 @@ and hashes each encrypted object before publishing it. New installer settings
 use `verify_upload: false` to skip that extra readback while retaining metadata
 and publication checks.
 
+The contained health command reports authentication first, followed by mount
+and service health and local upload counts. It returns a nonzero exit code when
+any health check is unhealthy. Add `--json` for machine-readable output:
+
 ```sh
-./rclone degoo status ~/.config/rclone-degoo/vault.json
+degoo-rc status
+degoo-rc status /mnt/degoo/report.pdf
+degoo-rc status /mnt/degoo/report.pdf --json
 ```
 
-Status counts dirty cached files and their logical byte sizes without reading
-Degoo or displaying file contents. Counts can change during uploads. Upload
-errors are also reported in the normal rclone logs. Zero pending uploads means
-the local cache has no outstanding dirty files; it is not an independent
-provider integrity audit.
-Pending files may be queued, actively uploading, or waiting to retry a failed
-attempt. A registration failure happens after byte transfer; check the logs
-before attributing a long pending interval to the close delay or verification.
+The optional file or directory path reports per-file upload state. `pending`
+means the current local version is waiting for upload, `uploading` means a
+transfer is in progress, `uploaded` means VFS knows the current version has a
+remote representation after writeback, and `unknown` means no state can be
+proven. The VFS exposes the read-only Linux extended attribute
+`user.rclone.upload-status`; generic mounts leave it disabled by default, while
+`rclone degoo mount` enables it. `uploaded` is not a new remote read or an
+independent integrity audit.
+
+When the mount is absent, ordinary files found under the mountpoint are
+reported as `local-only`; they are not pending and will never be uploaded by
+the vault. The mount refuses to cover a nonempty underlying directory. Move
+those files elsewhere before mounting, then copy them into the mounted view if
+they belong in the encrypted vault. If a separate persisted cache record is
+available, status reports it separately from the ordinary local file.
+
+Status also reports aggregate queued, uploading, and retrying counts from the
+mount's private local socket. It does not return filenames or file contents
+from that endpoint. A retrying upload remains pending; inspect `degoo-rc logs`
+for its failure. Zero pending files means the local cache has no outstanding
+dirty writes; it does not confirm current cloud contents or integrity.
 
 A process lock prevents two mounts from sharing a cache. Use one writer for
 each vault; separate machines or cache directories cannot coordinate through
