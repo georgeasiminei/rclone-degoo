@@ -834,3 +834,26 @@ The conditional mounted content check happens after sampling write throughput
 and uses the original total deadline. It confirms generated data through the
 mounted view; it is not an independent cloud integrity audit. No live Degoo
 throughput benchmark or modification of the user's installed mount was made.
+
+## Wizard password recovery and installed benchmark helper (2026-10-13)
+
+Three regression cases reproduced missing saved account credentials after
+normal wizard setup: an early direct vault import, a late existing-folder
+import, and a new vault. Early imports are now installed before account login;
+new vaults and late imports require a final vault-aware login when credentials
+are missing. Tests cover preserving imported encryption settings, ignoring
+inherited account credentials, avoiding an extra login on configured upgrades,
+and preserving vault/cache bytes without startup when final login fails.
+
+- All 329 offline Python helper tests passed, including 73 wizard tests.
+- The package self-check, changed Markdown lint, and `git diff --check` passed.
+- The installed benchmark helper was older than the merged timestamp fix.
+  It was updated to that source, and all 24 benchmark tests passed against the
+  installed copy using disposable local files and simulated upload state.
+- The validated wizard helper was installed locally. Configuration contents
+  and the running mount process were verified unchanged. The original 2 GiB
+  benchmark file was preserved; its VFS upload state reported `uploaded`.
+
+These changes affect Python helpers and documentation only. No live cloud
+benchmark or fresh installation over the user's vault was run. The upload
+state is a local VFS observation, not an independent remote integrity check.

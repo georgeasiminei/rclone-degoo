@@ -85,6 +85,10 @@ list device folders; it cannot be used as the vault folder or as the parent of
 a live create request.
 The wizard suggests enabling the user service by default when the systemd user
 manager is available. Otherwise, mount manually in the foreground.
+It saves the account password encrypted with the selected vault key before
+offering startup. A supplied vault file is installed before login when known
+early. If the vault is created or selected later, the wizard asks you to sign
+in again after setup to enable automatic password recovery.
 
 To stage an install without opening the wizard, pass `--binary` and
 `--no-wizard`:
