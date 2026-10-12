@@ -245,13 +245,17 @@ The wizard generates a cryptographically random vault encryption password for
 a new vault. Use `degoo-rc backup-config` to keep a private configuration backup
 outside the install before saving important data. This removes account
 credentials while retaining the vault key. Degoo account credentials and the
-vault password
-serve separate purposes. Once the vault configuration exists, `degoo-rc login`
+vault password serve separate purposes. Once the vault configuration exists,
+`degoo-rc login`
 saves the account credentials encrypted with the vault data key, enabling
 automatic password login after rejected token renewal. Existing installations
 need one successful login after upgrading to populate this encrypted field.
-If the first wizard login happened before vault creation, run `degoo-rc login`
-after setup to enable the fallback.
+The wizard installs a supplied vault configuration before account login when
+it is already known. If a new vault is created or an existing vault file is
+selected after the first login, the wizard asks you to sign in again after
+setup to save the password encrypted with that vault's key. It verifies that
+the encrypted credential is saved before offering mount startup. A failed
+login preserves the vault and cache and leaves startup for a later retry.
 
 To use an existing compatible encrypted vault on another machine, import its
 private vault configuration and select the same dedicated folder. The password,

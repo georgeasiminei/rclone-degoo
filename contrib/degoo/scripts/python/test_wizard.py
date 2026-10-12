@@ -19,10 +19,40 @@ import wizard
 
 
 class WizardTest(unittest.TestCase):
+    MOCK_ENCRYPTED_CREDENTIALS = "AQIDBA=="
+
     def setUp(self) -> None:
         self.preflight = mock.patch.object(wizard, "_mount_preflight", return_value=[])
         self.preflight.start()
         self.addCleanup(self.preflight.stop)
+
+    @staticmethod
+    def _write_private(path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_bytes(data)
+        path.chmod(0o600)
+
+    def _mock_login_saving_fallback(self, root: Path, *, clear_email: bool = False) -> int:
+        self.assertFalse(clear_email)
+        self._write_private(root / "config/auth.json", b'{"token":"test-login-token"}\n')
+        vault_path = root / "config/vault.json"
+        if vault_path.is_file():
+            vault = json.loads(vault_path.read_bytes())
+            vault["account_credentials"] = self.MOCK_ENCRYPTED_CREDENTIALS
+            self._write_private(vault_path, (json.dumps(vault, sort_keys=True) + "\n").encode())
+        return 0
+
+    def _mock_setup_with_new_vault(self, args: argparse.Namespace, *, result: int = 0) -> int:
+        if result != 0:
+            return result
+        root = Path(args.root)
+        self._write_private(root / "config/vault.json", (json.dumps({
+            "version": 1,
+            "remote": "degoo-live-test:",
+            "password": "test-only-vault-secret",
+            "cache_dir": str(root / "cache"),
+        }, sort_keys=True) + "\n").encode())
+        return 0
 
     def test_preflight_prints_helper_install_and_retry_commands(self) -> None:
         self.preflight.stop()
@@ -414,8 +444,20 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0) as install_call,
                 mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                mock.patch.object(wizard.login, "run", return_value=login_code) as login_call,
-                mock.patch.object(wizard.setup, "run", return_value=setup_code) as setup_call,
+                mock.patch.object(
+                    wizard.login,
+                    "run",
+                    side_effect=lambda login_root, clear_email=False: (
+                        login_code
+                        if login_code != 0
+                        else self._mock_login_saving_fallback(login_root, clear_email=clear_email)
+                    ),
+                ) as login_call,
+                mock.patch.object(
+                    wizard.setup,
+                    "run",
+                    side_effect=lambda setup_args: self._mock_setup_with_new_vault(setup_args, result=setup_code),
+                ) as setup_call,
                 mock.patch.object(wizard, "_save_settings") as save_call,
                 contextlib.redirect_stdout(io.StringIO()) as output,
             ):
@@ -425,7 +467,7 @@ class WizardTest(unittest.TestCase):
     def test_default_answers_complete_staged_install(self) -> None:
         result, login_call, setup_call, _ = self._run_default_flow()
         self.assertEqual(result, 0)
-        login_call.assert_called_once()
+        self.assertEqual(login_call.call_count, 2)
         setup_call.assert_called_once()
         self.assertEqual(setup_call.call_args.args[0].folder_id, "dedicated-id")
 
@@ -484,8 +526,8 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0),
                 mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                mock.patch.object(wizard.login, "run", return_value=0),
-                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard.login, "run", side_effect=self._mock_login_saving_fallback),
+                mock.patch.object(wizard.setup, "run", side_effect=self._mock_setup_with_new_vault),
                 mock.patch.object(wizard, "_save_settings"),
                 mock.patch.object(wizard.service, "run", return_value=0) as service_call,
                 mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
@@ -526,8 +568,8 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0),
                 mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                mock.patch.object(wizard.login, "run", return_value=0),
-                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard.login, "run", side_effect=self._mock_login_saving_fallback),
+                mock.patch.object(wizard.setup, "run", side_effect=self._mock_setup_with_new_vault),
                 mock.patch.object(wizard, "_save_settings"),
                 mock.patch.object(wizard.service, "run", side_effect=failure),
                 mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
@@ -558,8 +600,8 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0),
                 mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                mock.patch.object(wizard.login, "run", return_value=0),
-                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard.login, "run", side_effect=self._mock_login_saving_fallback),
+                mock.patch.object(wizard.setup, "run", side_effect=self._mock_setup_with_new_vault),
                 mock.patch.object(wizard, "_save_settings"),
                 mock.patch.object(wizard.service, "run", return_value=3),
                 mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
@@ -586,8 +628,8 @@ class WizardTest(unittest.TestCase):
                     mock.patch.object(wizard.installer, "expected_root", return_value=root),
                     mock.patch.object(wizard.installer, "install", return_value=0),
                     mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                    mock.patch.object(wizard.login, "run", return_value=0),
-                    mock.patch.object(wizard.setup, "run", return_value=0),
+                    mock.patch.object(wizard.login, "run", side_effect=self._mock_login_saving_fallback),
+                    mock.patch.object(wizard.setup, "run", side_effect=self._mock_setup_with_new_vault),
                     mock.patch.object(wizard, "_save_settings"),
                     mock.patch.object(wizard.service, "run", return_value=0),
                     mock.patch.object(wizard, "_wait_for_mount", return_value=state),
@@ -619,8 +661,8 @@ class WizardTest(unittest.TestCase):
                     mock.patch.object(wizard.installer, "expected_root", return_value=root),
                     mock.patch.object(wizard.installer, "install", return_value=0),
                     mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                    mock.patch.object(wizard.login, "run", return_value=0),
-                    mock.patch.object(wizard.setup, "run", return_value=0),
+                    mock.patch.object(wizard.login, "run", side_effect=self._mock_login_saving_fallback),
+                    mock.patch.object(wizard.setup, "run", side_effect=self._mock_setup_with_new_vault),
                     mock.patch.object(wizard, "_save_settings"),
                     mock.patch.object(wizard.service, "run", return_value=0),
                     mock.patch.object(wizard, "_wait_for_mount", return_value=waited_state),
@@ -651,8 +693,8 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0),
                 mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                mock.patch.object(wizard.login, "run", return_value=0),
-                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard.login, "run", side_effect=self._mock_login_saving_fallback),
+                mock.patch.object(wizard.setup, "run", side_effect=self._mock_setup_with_new_vault),
                 mock.patch.object(wizard, "_save_settings"),
                 mock.patch.object(wizard, "_mount_preflight", return_value=["immutable mount helper is missing"], create=True),
                 mock.patch.object(wizard.service, "run", return_value=0) as service_call,
@@ -687,8 +729,8 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard.installer, "expected_root", return_value=root),
                 mock.patch.object(wizard.installer, "install", return_value=0),
                 mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                mock.patch.object(wizard.login, "run", return_value=0),
-                mock.patch.object(wizard.setup, "run", return_value=0),
+                mock.patch.object(wizard.login, "run", side_effect=self._mock_login_saving_fallback),
+                mock.patch.object(wizard.setup, "run", side_effect=self._mock_setup_with_new_vault),
                 mock.patch.object(wizard, "_save_settings"),
                 mock.patch.object(wizard.service, "run") as service_call,
                 contextlib.redirect_stderr(error_output),
@@ -714,11 +756,14 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_wait_for_mount_state", return_value="not mounted"),
                 mock.patch.object(wizard, "_check_runtime", side_effect=lambda **_: events.append("runtime") or (False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
-                mock.patch.object(wizard, "_current_vault_settings", return_value={"password": "private"}),
+                mock.patch.object(wizard, "_current_vault_settings", return_value={
+                    "password": "private",
+                    "account_credentials": "encrypted-test-credentials",
+                }),
                 mock.patch.object(wizard, "_cache_settings", return_value=wizard.installer.DEFAULT_MOUNT_SETTINGS),
                 mock.patch.object(wizard.installer, "install", side_effect=lambda _: events.append("install") or 0),
                 mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                mock.patch.object(wizard.login, "run", return_value=0),
+                mock.patch.object(wizard.login, "run", return_value=0) as login_call,
                 mock.patch.object(wizard, "_save_settings"),
                 mock.patch.object(wizard.service, "run", side_effect=lambda _root, action: events.append(f"service:{action}") or 0),
                 contextlib.redirect_stdout(io.StringIO()),
@@ -726,8 +771,100 @@ class WizardTest(unittest.TestCase):
                 result = wizard._run(args, input_fn=lambda _: "")
 
         self.assertEqual(result, 0)
+        self.assertEqual(login_call.call_count, 1)
         self.assertLess(events.index("service:stop"), events.index("runtime"))
         self.assertLess(events.index("runtime"), events.index("install"))
+
+    def test_failed_final_fallback_login_preserves_vault_and_pending_cache_without_starting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            config_dir = root / "config"
+            cache_dir = root / "cache"
+            config_dir.mkdir(parents=True, mode=0o700)
+            cache_dir.mkdir(mode=0o700)
+            config_dir.chmod(0o700)
+            cache_dir.chmod(0o700)
+            root.chmod(0o700)
+            vault_path = config_dir / "vault.json"
+            vault_bytes = (json.dumps({
+                "version": 1,
+                "remote": "degoo-live-test:",
+                "password": "test-only-upgrade-vault-secret",
+                "cache_dir": str(cache_dir),
+            }, sort_keys=True) + "\n").encode()
+            self._write_private(vault_path, vault_bytes)
+            self._write_private(config_dir / "auth.json", b'{"token":"still-valid-token"}\n')
+            pending_path = cache_dir / "pending-write.bin"
+            self._write_private(pending_path, b"pending encrypted-vault data")
+            args = type("Args", (), {
+                "binary": None,
+                "folder_id": None,
+                "folder_name": None,
+                "vault_config": None,
+                "upgrade": True,
+            })()
+            output = io.StringIO()
+
+            with (
+                mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                mock.patch.object(wizard.installer, "load_manifest", return_value={
+                    "root_folder_id": "existing-vault-123",
+                    "service_links": [],
+                }),
+                mock.patch.object(wizard, "_prepare_upgrade_mount"),
+                mock.patch.object(wizard, "_check_runtime", return_value=(True, False)),
+                mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                mock.patch.object(wizard, "_cache_settings", return_value=wizard.installer.DEFAULT_MOUNT_SETTINGS),
+                mock.patch.object(wizard.installer, "install", return_value=0),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
+                mock.patch.object(wizard.login, "run", return_value=3) as login_call,
+                mock.patch.object(wizard, "_save_settings"),
+                mock.patch.object(wizard, "_mounted_state", return_value="not mounted"),
+                mock.patch.object(wizard.local_info, "service_status", return_value="not configured for this install"),
+                mock.patch.object(wizard.service, "run") as service_call,
+                contextlib.redirect_stdout(output),
+            ):
+                result = wizard._run(args, input_fn=lambda _: "")
+
+            self.assertEqual(result, 3)
+            login_call.assert_called_once_with(root, clear_email=False)
+            service_call.assert_not_called()
+            self.assertEqual(vault_path.read_bytes(), vault_bytes)
+            self.assertEqual(pending_path.read_bytes(), b"pending encrypted-vault data")
+            self.assertIn("Account password fallback login did not complete", output.getvalue())
+            self.assertIn("degoo-rc login", output.getvalue())
+            self.assertNotIn("Enable and start the user service", output.getvalue())
+            self.assertNotIn("foreground mount command below", output.getvalue())
+            self.assertNotIn("degoo-rc mount", output.getvalue())
+            self.assertNotIn("Step 6 of 6", output.getvalue())
+
+    def test_successful_login_without_saved_credentials_is_not_treated_as_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True, mode=0o700)
+            config_dir.chmod(0o700)
+            root.chmod(0o700)
+            vault_path = config_dir / "vault.json"
+            vault_bytes = (json.dumps({
+                "version": 1,
+                "remote": "degoo-live-test:",
+                "password": "test-only-vault-secret",
+                "cache_dir": str(root / "cache"),
+            }, sort_keys=True) + "\n").encode()
+            self._write_private(vault_path, vault_bytes)
+
+            with (
+                mock.patch.object(wizard.login, "run", return_value=0) as login_call,
+                mock.patch.object(wizard.connection, "check_connection") as connection_check,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaisesRegex(wizard.WizardError, "password was not saved"):
+                    wizard._ensure_account_password_fallback(root)
+
+            login_call.assert_called_once_with(root, clear_email=False)
+            connection_check.assert_not_called()
+            self.assertEqual(vault_path.read_bytes(), vault_bytes)
 
     def test_upgrade_allows_missing_links_when_systemd_confirms_no_loaded_service(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1149,13 +1286,19 @@ class WizardTest(unittest.TestCase):
             binary.chmod(0o700)
             args = type("Args", (), {"binary": None, "folder_id": None, "folder_name": None, "vault_config": None, "upgrade": False})()
             answers = iter([""] * 13)
+            login_vault_presence: list[bool] = []
+
+            def login_after_setup(root: Path, *, clear_email: bool = False) -> int:
+                login_vault_presence.append((root / "config/vault.json").is_file())
+                return self._mock_login_saving_fallback(root, clear_email=clear_email)
+
             with (
                 mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
                 mock.patch.object(wizard.installer, "DEFAULT_MOUNTPOINT", "mount"),
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)),
-                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
-                mock.patch.object(wizard.login, "run", return_value=0) as login_call,
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]) as connection_check,
+                mock.patch.object(wizard.login, "run", side_effect=login_after_setup) as login_call,
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
@@ -1163,17 +1306,154 @@ class WizardTest(unittest.TestCase):
 
             root = home / ".local/share/rclone-degoo"
             self.assertEqual(result, 0)
-            login_call.assert_called_once()
+            self.assertEqual(login_vault_presence, [False, True])
+            self.assertEqual(login_call.call_count, 2)
+            self.assertEqual(connection_check.call_count, 2)
             self.assertEqual(capture.read_text(encoding="utf-8").splitlines(), ["device-123", "rclone-degoo-vault"])
             vault = json.loads((root / "config/vault.json").read_text(encoding="utf-8"))
             self.assertEqual(vault["chunk_size"], "128Mi")
             self.assertEqual(vault["max_object_size"], "19Gi")
             self.assertTrue(vault["password"])
+            self.assertEqual(vault["account_credentials"], self.MOCK_ENCRYPTED_CREDENTIALS)
             settings = json.loads((root / "config/mount.json").read_text(encoding="utf-8"))
             self.assertEqual(settings, wizard.installer.DEFAULT_MOUNT_SETTINGS)
             remote_config = (root / "config/rclone.conf").read_text(encoding="utf-8")
             self.assertIn("root_folder_id = created-folder-123", remote_config)
             self.assertTrue((root / "scripts/python/install.py").is_file())
+
+    def test_early_vault_import_is_installed_before_first_login(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home = base / "home"
+            home.mkdir(mode=0o700)
+            vault_path = base / "imported-vault.json"
+            self._write_private(vault_path, (json.dumps({
+                "version": 1,
+                "remote": "old-machine:",
+                "password": "test-only-imported-vault-secret",
+                "account_credentials": "legacy-encrypted-account-envelope",
+                "cache_dir": str(base / "old-cache"),
+                "chunk_size": "64Mi",
+                "max_object_size": "19Gi",
+            }, sort_keys=True) + "\n").encode())
+            binary = base / "rclone"
+            binary.write_text("#!/bin/sh\necho 'Commands: login mount folders create-vault'\nexit 0\n", encoding="ascii")
+            binary.chmod(0o700)
+            args = type("Args", (), {
+                "binary": None,
+                "folder_id": "existing-vault-123",
+                "folder_name": "Imported vault",
+                "vault_config": str(vault_path),
+                "upgrade": False,
+            })()
+            login_vault_presence: list[bool] = []
+            imported_credentials_at_login: list[str | None] = []
+
+            def login_after_setup(root: Path, *, clear_email: bool = False) -> int:
+                login_vault_presence.append((root / "config/vault.json").is_file())
+                vault_file = root / "config/vault.json"
+                imported_credentials_at_login.append(
+                    json.loads(vault_file.read_bytes()).get("account_credentials") if vault_file.is_file() else None
+                )
+                return self._mock_login_saving_fallback(root, clear_email=clear_email)
+
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch.object(wizard.installer, "DEFAULT_MOUNTPOINT", "mount"),
+                mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
+                mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)),
+                mock.patch.object(wizard.connection, "check_connection", return_value=[]),
+                mock.patch.object(wizard.login, "run", side_effect=login_after_setup) as login_call,
+                mock.patch.object(wizard.setup, "run", wraps=wizard.setup.run) as setup_call,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                result = wizard._run(args, input_fn=lambda _: "")
+
+            root = home / ".local/share/rclone-degoo"
+            self.assertEqual(result, 0)
+            self.assertEqual(login_vault_presence, [True])
+            self.assertEqual(imported_credentials_at_login, [None])
+            login_call.assert_called_once_with(root, clear_email=False)
+            self.assertIsNone(setup_call.call_args.args[0].vault_config)
+            vault = json.loads((root / "config/vault.json").read_bytes())
+            self.assertEqual(vault["password"], "test-only-imported-vault-secret")
+            self.assertEqual(vault["account_credentials"], self.MOCK_ENCRYPTED_CREDENTIALS)
+            self.assertNotEqual(vault["account_credentials"], "legacy-encrypted-account-envelope")
+            self.assertEqual(vault["remote"], "degoo-live-test:")
+            self.assertEqual(vault["cache_dir"], str(root / "cache"))
+
+    def test_late_step_five_vault_import_requires_second_login_to_save_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home = base / "home"
+            home.mkdir(mode=0o700)
+            vault_path = base / "imported-vault.json"
+            self._write_private(vault_path, (json.dumps({
+                "version": 1,
+                "remote": "old-machine:",
+                "password": "test-only-late-imported-vault-secret",
+                "account_credentials": "legacy-encrypted-account-envelope",
+                "cache_dir": str(base / "old-cache"),
+                "chunk_size": "64Mi",
+                "max_object_size": "19Gi",
+            }, sort_keys=True) + "\n").encode())
+            binary = base / "rclone"
+            binary.write_text("#!/bin/sh\necho 'Commands: login mount folders create-vault'\nexit 0\n", encoding="ascii")
+            binary.chmod(0o700)
+            args = type("Args", (), {
+                "binary": None,
+                "folder_id": None,
+                "folder_name": None,
+                "vault_config": None,
+                "upgrade": False,
+            })()
+            login_vault_presence: list[bool] = []
+            imported_credentials_at_login: list[str | None] = []
+
+            def login_after_setup(root: Path, *, clear_email: bool = False) -> int:
+                vault_file = root / "config/vault.json"
+                login_vault_presence.append(vault_file.is_file())
+                imported_credentials_at_login.append(
+                    json.loads(vault_file.read_bytes()).get("account_credentials") if vault_file.is_file() else None
+                )
+                return self._mock_login_saving_fallback(root, clear_email=clear_email)
+
+            def answer(prompt: str) -> str:
+                if prompt.startswith("Private vault.json for this existing folder"):
+                    return str(vault_path)
+                return ""
+
+            output = io.StringIO()
+            device_folders = [{"id": "device-123", "name": "Device", "category": 1}]
+            existing_vault_folders = [{"id": "existing-vault-123", "name": wizard.DEFAULT_FOLDER_NAME, "category": 2}]
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch.object(wizard.installer, "DEFAULT_MOUNTPOINT", "mount"),
+                mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
+                mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)),
+                mock.patch.object(wizard.connection, "check_connection", return_value=device_folders) as connection_check,
+                mock.patch.object(wizard.connection, "list_folders", return_value=existing_vault_folders),
+                mock.patch.object(wizard.login, "run", side_effect=login_after_setup) as login_call,
+                mock.patch.object(wizard.service, "run") as service_call,
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                result = wizard._run(args, input_fn=answer)
+
+            root = home / ".local/share/rclone-degoo"
+            self.assertEqual(result, 0)
+            self.assertEqual(login_vault_presence, [False, True])
+            self.assertEqual(imported_credentials_at_login, [None, None])
+            self.assertEqual(login_call.call_count, 2)
+            self.assertEqual(connection_check.call_count, 2)
+            self.assertIn("Sign in again to save the Degoo account password encrypted by the vault key", output.getvalue())
+            vault = json.loads((root / "config/vault.json").read_bytes())
+            self.assertEqual(vault["password"], "test-only-late-imported-vault-secret")
+            self.assertEqual(vault["account_credentials"], self.MOCK_ENCRYPTED_CREDENTIALS)
+            self.assertNotEqual(vault["account_credentials"], "legacy-encrypted-account-envelope")
+            self.assertEqual(vault["remote"], "degoo-live-test:")
+            service_call.assert_not_called()
 
     def test_backup_restore_wizard_requires_fresh_login_and_drops_saved_auth(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1270,6 +1550,11 @@ class WizardTest(unittest.TestCase):
             def fresh_login(root: Path, *, clear_email: bool = False) -> int:
                 self.assertFalse(clear_email)
                 write_private(root / "config/auth.json", fresh_auth_bytes)
+                vault_path = root / "config/vault.json"
+                if vault_path.is_file():
+                    vault_config = json.loads(vault_path.read_bytes())
+                    vault_config["account_credentials"] = self.MOCK_ENCRYPTED_CREDENTIALS
+                    write_private(vault_path, (json.dumps(vault_config, sort_keys=True) + "\n").encode())
                 return 0
 
             def answer(prompt: str) -> str:
@@ -1317,7 +1602,8 @@ class WizardTest(unittest.TestCase):
             self.assertEqual(installed_vault["cache_dir"], str(root / "cache"))
             self.assertEqual(installed_vault["chunk_size"], "64Mi")
             self.assertEqual(installed_vault["max_object_size"], "19Gi")
-            self.assertNotIn("account_credentials", installed_vault)
+            self.assertEqual(installed_vault["account_credentials"], self.MOCK_ENCRYPTED_CREDENTIALS)
+            self.assertNotEqual(installed_vault["account_credentials"], "legacy-encrypted-account-envelope")
             self.assertEqual(json.loads((root / "config/mount.json").read_bytes()), mount_settings)
             self.assertEqual((root / "config/auth.json").read_bytes(), fresh_auth_bytes)
             self.assertNotEqual((root / "config/auth.json").read_bytes(), auth_bytes)
@@ -1408,6 +1694,11 @@ class WizardTest(unittest.TestCase):
             def fresh_login(login_root: Path, *, clear_email: bool = False) -> int:
                 self.assertFalse(clear_email)
                 write_private(login_root / "config/auth.json", fresh_auth_bytes)
+                vault_path = login_root / "config/vault.json"
+                if vault_path.is_file():
+                    vault_config = json.loads(vault_path.read_bytes())
+                    vault_config["account_credentials"] = self.MOCK_ENCRYPTED_CREDENTIALS
+                    write_private(vault_path, (json.dumps(vault_config, sort_keys=True) + "\n").encode())
                 return 0
 
             account_folders = [{"id": "device-123", "name": "Device", "category": 1}]
@@ -1439,7 +1730,8 @@ class WizardTest(unittest.TestCase):
             self.assertEqual(len(vault_at_setup), 1)
             self.assertEqual(vault_at_setup[0]["password"], secret)
             self.assertEqual(vault_at_setup[0]["cache_dir"], str(root / "cache"))
-            self.assertNotIn("account_credentials", vault_at_setup[0])
+            self.assertEqual(vault_at_setup[0]["account_credentials"], self.MOCK_ENCRYPTED_CREDENTIALS)
+            self.assertNotEqual(vault_at_setup[0]["account_credentials"], "legacy-encrypted-account-envelope")
             self.assertEqual((root / "config/auth.json").read_bytes(), fresh_auth_bytes)
             service_call.assert_not_called()
 

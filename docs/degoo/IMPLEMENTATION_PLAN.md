@@ -213,6 +213,13 @@ Go is required only to build from a checkout, and the wizard can offer that
 build if it finds no binary.
 
 The wizard first offers a retained backup directory for fresh installation.
+An early vault import is installed before account login so the fresh account
+password is encrypted with the imported data key. New vaults and imports
+selected later require a final login after setup when the encrypted account
+credential is missing. Startup is offered only after that credential is saved;
+failure preserves completed configuration and pending cache data. Ordinary
+upgrades reuse existing saved credentials. Imported account credentials and
+tokens remain excluded from restoration.
 Recovered folder and mount settings become defaults; restoration requires a
 fresh account login and ignores credentials present in older backups.
 Original vault settings remain fixed. Retained cache data is copied privately;

@@ -65,6 +65,10 @@ an atomic, permission-protected file. This standalone command saves tokens only.
 After creating the vault configuration, add `--vault-config /private/vault.json`
 to save encrypted account credentials for automatic login after rejected
 renewal. Contained `degoo-rc login` supplies this option when its vault exists.
+The install wizard ensures the encrypted account credential is saved before
+offering to start the mount. An import supplied early is installed before
+login; a vault created or selected later requires another hidden password
+prompt after setup. Ordinary upgrades keep existing saved credentials.
 Accounts that cannot use email/password login need a Degoo-supported password
 login or separately provisioned refresh token; browser-token extraction is
 not provided.

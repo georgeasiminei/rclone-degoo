@@ -122,6 +122,11 @@ This first login happens before vault setup and saves tokens only. After
 account credentials using the same vault password and optional salt as vault
 data. These credentials allow password login after refresh is rejected.
 
+The interactive wizard handles this final login as part of setup. It installs
+an early imported vault before login; for a new vault or a file selected later,
+it asks you to sign in again after setup and confirms that the encrypted
+account credential is saved before offering mount startup.
+
 ## Remote changes
 
 To refresh remote changes from another client, run `degoo-rc sync .` while

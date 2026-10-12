@@ -688,7 +688,7 @@ def _completion_summary(
         print(
             "  Mount prerequisites are incomplete; follow the configuration instructions above before starting."
         )
-    elif not systemd_available:
+    elif not systemd_available and show_commands:
         print("  No systemd user manager is available; run the foreground mount command below when ready.")
 
     if not show_commands:
@@ -1085,6 +1085,35 @@ def _current_vault_settings(root: Path) -> dict[str, Any] | None:
         raise WizardError(str(exc)) from None
 
 
+def _ensure_account_password_fallback(root: Path) -> int:
+    """Ensure the installed vault contains encrypted account credentials."""
+    settings = _current_vault_settings(root)
+    if settings is None:
+        raise WizardError("the installed vault configuration is missing; account password fallback cannot be enabled")
+    credentials = settings.get("account_credentials")
+    if isinstance(credentials, str) and credentials:
+        return 0
+
+    print(
+        "The vault has no encrypted account password saved. Sign in again to save the Degoo account "
+        "password encrypted by the vault key."
+    )
+    result = login.run(root, clear_email=False)
+    if result != 0:
+        return result
+
+    settings = _current_vault_settings(root)
+    credentials = settings.get("account_credentials") if settings is not None else None
+    if not isinstance(credentials, str) or not credentials:
+        raise WizardError("the account password was not saved encrypted by the vault key; retry with degoo-rc login")
+    print("Account password saved encrypted with the vault key for automatic re-login.")
+    try:
+        connection.check_connection(root)
+    except connection.ConnectionCheckError as exc:
+        raise WizardError(f"connection verification after saving the account password did not pass: {exc}") from None
+    return 0
+
+
 def _prompt_cache_settings(settings: dict[str, Any], *, input_fn: Callable[[str], str]) -> dict[str, Any]:
     defaults = installer.DEFAULT_MOUNT_SETTINGS
     write_back = settings.get("write_back")
@@ -1226,6 +1255,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
     if installed_vault is None and not import_path:
         import_path = _prompt("Path to an existing private vault.json to import (optional)", "", input_fn=input_fn) or None
     imported = _imported_settings(import_path, root) if import_path else None
+    vault_imported_before_login = installed_vault is None and bool(import_path)
     if import_path and root_exists and installed_vault is not None:
         raise WizardError("an existing vault secret is already installed; it cannot be replaced during upgrade")
     if configured_folder_id and installed_vault is None and imported is None:
@@ -1244,7 +1274,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
     if backup and configured_folder_id:
         staged_args.folder_id = configured_folder_id
         staged_args.folder_name = requested_folder_name
-    if (configured_folder_id or backup) and installed_vault is None and import_path:
+    if vault_imported_before_login:
         staged_args.vault_config = import_path
     try:
         try:
@@ -1337,7 +1367,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 folder_id=folder_id,
                 parent_id=None,
                 name=folder_name,
-                vault_config=None if backup and backup.vault_config_path else import_path,
+                vault_config=None if vault_imported_before_login else import_path,
             )
         else:
             setup_args = argparse.Namespace(
@@ -1345,7 +1375,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
                 folder_id=None,
                 parent_id=parent_id,
                 name=folder_name,
-                vault_config=None if backup and backup.vault_config_path else import_path,
+                vault_config=None if vault_imported_before_login else import_path,
             )
         try:
             setup_result = setup.run(setup_args)
@@ -1385,6 +1415,30 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             ),
         )
         raise
+
+    try:
+        fallback_result = _ensure_account_password_fallback(root)
+    except (login.LoginError, WizardError) as exc:
+        _completion_summary(
+            root,
+            mount_ready=mount_ready,
+            systemd_available=systemd_available,
+            note=f"Account password fallback setup could not be completed or verified; retry with {_degoo_rc(root, 'login')}. {exc}",
+            show_commands=False,
+        )
+        raise
+    if fallback_result != 0:
+        _completion_summary(
+            root,
+            mount_ready=mount_ready,
+            systemd_available=systemd_available,
+            note=(
+                f"Account password fallback login did not complete (exit code {fallback_result}); "
+                f"retry with {_degoo_rc(root, 'login')}."
+            ),
+            show_commands=False,
+        )
+        return fallback_result
 
     print("Step 6 of 6: Choose how to start the mount.")
     mountpoint = installer.configured_mountpoint(root)
