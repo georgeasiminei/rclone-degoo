@@ -22,6 +22,17 @@ import install
 
 
 class InfoTest(unittest.TestCase):
+    def test_failed_automatic_login_remains_unhealthy_after_cooldown_expires(self) -> None:
+        auth_path = self.root / "config/auth.json"
+        self.write_private(auth_path, {"token": "opaque-access-secret", "refresh_token": "refresh-secret", "retry_after": 1_900_000_060})
+        for now in (1_900_000_000, 1_900_000_120):
+            error = info.authentication_error(auth_path, now=now, logs_dir=self.root / "logs")
+            self.assertIsNotNone(error)
+            self.assertIn("automatic account login", error.lower())
+            self.assertNotIn("refresh-secret", error)
+        self.write_private(auth_path, {"token": "opaque-access-secret", "refresh_token": "refresh-secret"})
+        self.assertIsNone(info.authentication_error(auth_path, now=1_900_000_120, logs_dir=self.root / "logs"))
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

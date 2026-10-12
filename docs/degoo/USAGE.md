@@ -61,10 +61,40 @@ install -d -m 700 ~/.cache/rclone-degoo
 ```
 
 Login prompts for the account password. It saves access and refresh tokens in
-an atomic, permission-protected file, and does not save the account password.
+an atomic, permission-protected file. This standalone command saves tokens only.
+After creating the vault configuration, add `--vault-config /private/vault.json`
+to save encrypted account credentials for automatic login after rejected
+renewal. Contained `degoo-rc login` supplies this option when its vault exists.
 Accounts that cannot use email/password login need a Degoo-supported password
 login or separately provisioned refresh token; browser-token extraction is
 not provided.
+
+The `account_credentials` field in `vault.json` holds a versioned encrypted
+email/password record, encoded as base64. It uses rclone crypt's authenticated
+data format and the same vault password and optional salt as file encryption.
+The account password is never stored as plaintext or merely obscured.
+The vault key is stored locally in the same permission-protected configuration;
+this protects against accidental plaintext disclosure, not someone able to
+read the complete configuration. Configuration backups omit this credential,
+including its encrypted form. After restoring a backup, log in once to enable
+password fallback again. Configuration backups retain the vault decryption
+key and omit account access and refresh tokens as well as the account password.
+
+Automatic recovery first tries token renewal. A rejected renewal or absent
+refresh token can trigger password login. Network errors and temporary server
+errors do not trigger password login. Failed attempts retain tokens and pending
+local writes, with a persistent cooldown to avoid login storms; explicit login
+bypasses that cooldown. `degoo-rc info` reports whether the credential is saved
+and whether automatic login remains incomplete. A successful login writes new
+tokens that the running mount can reload on its next request.
+
+For standalone logout with a saved password, supply the same `--vault-config`
+to remove the encrypted credential as well as tokens. The command also detects
+a sibling `vault.json` by default. Stop the mount before logout because it may
+hold a usable access token in memory.
+
+The proposed next recovery layer, including checks while the mount is idle,
+is described in [Session recovery proposal](SESSION_RECOVERY.md).
 
 Add a raw remote to your usual rclone configuration, replacing the paths and
 folder ID below. `root_folder_id` is mandatory and must identify a dedicated

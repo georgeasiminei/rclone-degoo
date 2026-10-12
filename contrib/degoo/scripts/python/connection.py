@@ -113,6 +113,9 @@ def _run_folder_query(root: Path, parent_id: str) -> bytes:
         "--parent-id",
         parent_id,
     ]
+    vault = root / "config/vault.json"
+    if os.path.lexists(vault):
+        arguments.extend(("--vault-config", str(vault)))
     try:
         with tempfile.TemporaryFile(dir=output_path) as output, tempfile.TemporaryFile(dir=output_path) as error:
             result = subprocess.run(

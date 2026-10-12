@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Create a private portable backup of Degoo vault configuration and credentials."""
+"""Create a private portable Degoo configuration backup without account credentials."""
 
 from __future__ import annotations
 
 import argparse
 import ctypes
 import errno
+import json
 import os
 from pathlib import Path
 import secrets
@@ -19,7 +20,8 @@ import restore
 
 
 MAX_MANIFEST_SIZE = 64 * 1024
-CONFIG_FILES = ("auth.json", "login.json", "mount.json", "rclone.conf", "vault.json")
+CONFIG_FILES = ("login.json", "mount.json", "rclone.conf", "vault.json")
+SOURCE_CONFIG_FILES = ("auth.json", "auth.json.lock", *CONFIG_FILES)
 REQUIRED_CONFIG_FILES = frozenset({"mount.json", "rclone.conf", "vault.json"})
 RENAME_NOREPLACE = 1
 
@@ -77,7 +79,7 @@ def _config_snapshot(config_dir: Path) -> tuple[os.stat_result, tuple[str, ...],
         names = tuple(sorted(os.listdir(config_dir)))
     except (OSError, installer.InstallError):
         raise BackupConfigError("the configuration directory could not be inspected safely") from None
-    if any(name not in CONFIG_FILES for name in names):
+    if any(name not in SOURCE_CONFIG_FILES for name in names):
         raise BackupConfigError("the configuration directory contains unsupported state")
     files = {name: _safe_private_file(config_dir / name) for name in names}
     if not REQUIRED_CONFIG_FILES.issubset(files):
@@ -163,6 +165,9 @@ def _read_source(root: Path) -> dict[str, bytes]:
         raise BackupConfigError("the vault secret is not bound to the configured Degoo remote")
 
     _assert_source_unchanged(root, manifest_info, config_dir_info, config_names, config_files)
+    if "account_credentials" in vault:
+        del vault["account_credentials"]
+        files["vault.json"] = (json.dumps(vault, indent=2, sort_keys=True) + "\n").encode("utf-8")
     return files
 
 
@@ -410,7 +415,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         directory = run(_absolute_path(args.root, "install root"), Path(args.directory) if args.directory else None)
         print(f"Configuration backup created at: {directory}")
-        print("Configuration and credentials only. File data, cache, and pending uploads are excluded.")
+        print("Vault configuration only. Saved account passwords and authentication tokens are excluded; log in after restoring.")
+        print("File data, cache, and pending uploads are excluded.")
         return 0
     except (BackupConfigError, installer.InstallError, restore.RestoreError) as exc:
         print(f"backup-config refused: {exc}", file=sys.stderr)

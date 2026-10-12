@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -58,6 +59,8 @@ type VaultConfig struct {
 	ChunkSize rfs.SizeSuffix `json:"chunk_size"`
 	// MaxObjectSize is the provisional encrypted-object safety cap.
 	MaxObjectSize rfs.SizeSuffix `json:"max_object_size"`
+	// AccountCredentials stores optional encrypted Degoo account credentials.
+	AccountCredentials string `json:"account_credentials,omitempty"`
 }
 
 type mountSettings struct {
@@ -85,9 +88,9 @@ func init() {
 		c.SilenceUsage = true
 	}}
 	cmd.Root.AddCommand(root)
-	var email, restURL string
+	var email, restURL, loginVaultConfig string
 	var cachedEmail bool
-	login := &cobra.Command{Use: "login auth.json", Short: "Log in without saving the account password.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
+	login := &cobra.Command{Use: "login auth.json", Short: "Log in and optionally save credentials encrypted by a vault.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		if err := safeLogging(c.Context()); err != nil {
 			return err
 		}
@@ -99,12 +102,15 @@ func init() {
 		if err != nil {
 			return err
 		}
-		return auth.Login(c.Context(), fshttp.NewClient(c.Context()), restURL, args[0], email, password)
+		return loginAccount(c.Context(), fshttp.NewClient(c.Context()), restURL, args[0], loginVaultConfig, email, password)
 	}}
 	login.Flags().StringVar(&email, "email", "", "Degoo account email")
 	login.Flags().BoolVar(&cachedEmail, "cached-email", false, "Indicate that --email came from the wrapper's saved email")
 	login.Flags().StringVar(&restURL, "rest-url", "https://rest-api.degoo.com", "Degoo login endpoint")
-	logout := &cobra.Command{Use: "logout auth.json", Short: "Remove account tokens while keeping the vault secret and data.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error { return auth.Logout(args[0]) }}
+	login.Flags().StringVar(&loginVaultConfig, "vault-config", "", "Vault configuration in which to store account credentials encrypted by the vault password")
+	var logoutVaultConfig string
+	logout := &cobra.Command{Use: "logout auth.json", Short: "Remove account tokens and saved account credentials while keeping vault data.", Long: "Remove Degoo account tokens and saved encrypted account credentials while keeping the vault secret and data. Stop any running Degoo mount first; it may still hold a valid account token in memory.", Args: cobra.ExactArgs(1), RunE: func(_ *cobra.Command, args []string) error { return logoutAccount(args[0], logoutVaultConfig) }}
+	logout.Flags().StringVar(&logoutVaultConfig, "vault-config", "", "Vault configuration containing saved encrypted account credentials (defaults to sibling vault.json when present)")
 	var remote, cacheDir string
 	initialize := &cobra.Command{Use: "init vault.json", Short: "Create a private vault configuration and prompt for its secret.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		if _, err := os.Lstat(args[0]); !os.IsNotExist(err) {
@@ -183,6 +189,44 @@ func promptPassword(prompt string) (string, error) {
 		return "", errors.New("could not read password")
 	}
 	return string(password), nil
+}
+
+func loginAccount(ctx context.Context, client *http.Client, restURL, authFile, vaultFile, email, password string) error {
+	if vaultFile != "" {
+		if _, err := readConfig(vaultFile); err != nil {
+			return fmt.Errorf("read vault configuration before login: %w", err)
+		}
+		return auth.LoginWithCredentials(ctx, client, restURL, authFile, vaultFile, email, password)
+	}
+	return auth.Login(ctx, client, restURL, authFile, email, password)
+}
+
+func logoutAccount(authFile, vaultFile string) error {
+	var err error
+	vaultFile, err = credentialsFileForAuth(authFile, vaultFile)
+	if err != nil {
+		return err
+	}
+	if vaultFile != "" {
+		if _, err := readConfig(vaultFile); err != nil {
+			return fmt.Errorf("read vault configuration before logout: %w", err)
+		}
+		return auth.LogoutWithCredentials(authFile, vaultFile)
+	}
+	return auth.Logout(authFile)
+}
+
+func credentialsFileForAuth(authFile, explicitVaultFile string) (string, error) {
+	if explicitVaultFile != "" {
+		return explicitVaultFile, nil
+	}
+	candidate := filepath.Join(filepath.Dir(authFile), "vault.json")
+	if _, err := os.Lstat(candidate); err == nil {
+		return candidate, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect sibling vault configuration: %w", err)
+	}
+	return "", nil
 }
 
 func loginPasswordPrompt(email string, cachedEmail bool) string {
@@ -489,7 +533,7 @@ func runMountBandwidthTicker(ctx context.Context, schedule rfs.BwTimetable, curr
 	}
 }
 
-func mountRawConfig(remote string, verify bool) (*rfs.RegInfo, string, string, configmap.Mapper, error) {
+func mountRawConfig(remote string, verify bool, credentialsFile ...string) (*rfs.RegInfo, string, string, configmap.Mapper, error) {
 	fsInfo, configName, fsPath, originalConfig, err := rfs.ConfigFs(remote)
 	if err != nil {
 		return nil, "", "", nil, err
@@ -497,14 +541,18 @@ func mountRawConfig(remote string, verify bool) (*rfs.RegInfo, string, string, c
 	if fsInfo.Name != "degoo" {
 		return nil, "", "", nil, errors.New("mount remote must be a configured Degoo remote")
 	}
+	overrides := configmap.Simple{"skip_upload_verification": strconv.FormatBool(!verify)}
+	if len(credentialsFile) != 0 && credentialsFile[0] != "" {
+		overrides["credentials_file"] = credentialsFile[0]
+	}
 	config := configmap.New().
-		AddGetter(configmap.Simple{"skip_upload_verification": strconv.FormatBool(!verify)}, configmap.PriorityNormal).
+		AddGetter(overrides, configmap.PriorityNormal).
 		AddGetter(originalConfig, configmap.PriorityMax)
 	return fsInfo, configName, fsPath, config, nil
 }
 
-func newMountRawFs(ctx context.Context, remote string, verify bool) (rfs.Fs, error) {
-	fsInfo, configName, fsPath, config, err := mountRawConfig(remote, verify)
+func newMountRawFs(ctx context.Context, remote string, verify bool, credentialsFile ...string) (rfs.Fs, error) {
+	fsInfo, configName, fsPath, config, err := mountRawConfig(remote, verify, credentialsFile...)
 	if err != nil {
 		return nil, err
 	}
@@ -635,10 +683,12 @@ func bindCache(c *VaultConfig, base rfs.Fs) error {
 }
 
 func cacheIdentity(c *VaultConfig, backend string) ([]byte, error) {
+	config := *c
+	config.AccountCredentials = ""
 	identity, err := json.Marshal(struct {
 		Config  *VaultConfig
 		Backend string
-	}{c, backend})
+	}{&config, backend})
 	if err != nil {
 		return nil, err
 	}
@@ -700,7 +750,7 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 	}
 	folderID, _ := remoteConfig.Get("root_folder_id")
 	rfs.Logf(nil, "degoo: starting vault mount (folder ID %q, mountpoint %q, cache %q, write-back %s, verify-upload %t)", folderID, mountpoint, c.CacheDir, options.WriteBack, verifyUpload)
-	base, err := cache.Get(mountCtx, c.Remote)
+	base, err := newMountRawFs(mountCtx, c.Remote, verifyUpload, filename)
 	if err != nil {
 		return err
 	}
@@ -713,7 +763,7 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 	}
 	// Bind the cache to the configured remote above. The verification setting is
 	// scoped to the mounted raw filesystem and must not change the cache identity.
-	mountBase, err := newMountRawFs(mountCtx, c.Remote, verifyUpload)
+	mountBase, err := newMountRawFs(mountCtx, c.Remote, verifyUpload, filename)
 	if err != nil {
 		return err
 	}

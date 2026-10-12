@@ -99,14 +99,20 @@ Then log in and create a dedicated child folder under an actual device ID:
 degoo-rc login
 degoo-rc folders --parent-id 0
 degoo-rc setup --parent-id DEVICE_ID --name rclone-degoo-vault
+degoo-rc login
 degoo-rc service enable
 ```
+
+This first login happens before vault setup and saves tokens only. After `setup`
+creates `vault.json`, run `degoo-rc login` again to save encrypted account
+credentials for automatic login after refresh is rejected.
 
 The default install root is `~/.local/share/rclone-degoo`. Existing vaults can
 be imported using their folder ID and private `vault.json`. The encryption
 secret, optional salt, chunk size, and object cap must match the remote vault;
-local remote/cache paths are rewritten for this installation. Keep the vault
-config backed up privately outside the install directory.
+local remote/cache paths are rewritten for this installation. Use
+`degoo-rc backup-config` to retain the vault key privately outside the install
+directory while omitting account credentials.
 
 Create a configuration backup without uninstalling or stopping the mount:
 
@@ -115,10 +121,11 @@ degoo-rc backup-config --directory ~/private-backups/rclone-degoo
 ```
 
 With no `--directory`, the command chooses a new timestamped private directory.
-This backs up configuration and credentials only: the vault key, saved account
-login, and settings. File data, cache, and pending uploads are excluded. Let
+This backs up configuration only: the vault key, remembered email, and
+settings. It excludes account tokens and the encrypted account password in
+`account_credentials`. File data, cache, and pending uploads are excluded. Let
 uploads finish before expecting those changes on another computer. Transfer
-the backup privately because it contains the encryption key and account tokens.
+the backup privately because it contains the vault encryption key.
 
 To restore this backup or one retained by the uninstall wizard into a fresh
 installation on another computer, pass its directory to the installer:
@@ -131,18 +138,17 @@ installation on another computer, pass its directory to the installer:
 `--restore-directory` requires `--wizard`, and restoration is refused when the
 default install root already exists. The wizard confirms the recovered folder
 ID and name and uses the saved mount settings as defaults. It preserves the
-original vault encryption settings, restores saved account authentication and
-email, and copies an optional retained cache into the new install. Cache
-identity is rebound locally so it can be used from the new path; the backup
-directory remains untouched. Keep the backup until recovery and mount startup
-are complete. If you omit the option, the wizard offers an optional backup
+original vault encryption settings, restores the remembered email, and copies
+an optional retained cache into the new install. Current backups exclude
+account tokens and the saved account password. Cache identity is rebound
+locally so it can be used from the new path; the backup directory remains
+untouched. Older backups may contain account tokens or encrypted credentials;
+restore ignores them and always requires a fresh login, leaving the source
+backup untouched. Keep the backup until recovery and mount startup are
+complete. If you omit the option, the wizard offers an optional backup
 directory prompt; leave it blank for a normal installation.
 
-The wizard checks saved account credentials by listing Degoo folders. If that
-authenticated request succeeds, it skips the account password prompt. If
-Degoo explicitly rejects the saved login, the wizard asks you to log in and
-checks the connection again. A provider or network failure stops setup without
-being reported as a wrong password. This checks Degoo account authentication,
+The wizard's successful folder listing checks Degoo account authentication,
 not whether the vault password can decrypt remote data; the retained
 `vault.json` supplies the original vault encryption settings.
 
@@ -213,13 +219,17 @@ Existing settings are preserved during ordinary upgrades; an omitted
 `write_back` keeps rclone's five-second default. Zero, negative, and `off` values
 are refused. Failed uploads use exponential retry delays based on `write_back`.
 Keep the cache until `degoo-rc status` reports zero pending uploads unless the
-uninstall wizard is making a complete private recovery copy of both config and
-cache.
+uninstall wizard is making a private recovery copy of the vault configuration
+and cache. A restored copy still requires a fresh Degoo login.
 
-`degoo-rc login` remembers the account email in a private file but never saves the
-account password. `degoo-rc login --clear-email` forgets that email without deleting
-tokens or vault settings. Token renewal is automatic when supported, but
-long-term unattended renewal remains unverified.
+`degoo-rc login` remembers the account email in a private file. When a vault
+configuration exists, it also saves encrypted account credentials using the
+same vault password and optional salt as vault data; before vault setup, login
+saves tokens only.
+If refresh is rejected and saved credentials are available, the client tries a
+password login. Network errors and temporary server errors do not trigger this
+fallback. `degoo-rc login --clear-email` forgets the email without deleting
+tokens or vault settings. Long-term unattended renewal remains unverified.
 
 `degoo-rc info` prints a local mount, service, cache, pending-upload, and disk report.
 `degoo-rc info --check-remote` additionally performs a metadata-only lookup of the
@@ -357,13 +367,14 @@ To stop the user service manually:
 degoo-rc service stop
 ```
 
-If authentication cannot renew, status reports a login-required error with the
+If a refresh token is rejected and encrypted account credentials are saved, the
+client attempts password login; network and temporary server errors do not
+trigger it. If authentication still requires attention, status reports the
 login command and returns nonzero. Earlier renewal attempts returned HTTP 403
-and HTTP 401; authentication was later renewed, but reliable automatic renewal
-is still unverified. Run `degoo-rc login` again. Its
-password prompt stays visible in the terminal while logs go to a file, and
-password characters remain hidden. Keep the cache and matching vault
-configuration while uploads are pending.
+and HTTP 401; long-term unattended renewal remains unverified. Run
+`degoo-rc login` again when needed. Its password prompt stays visible in the
+terminal while logs go to a file, and password characters remain hidden. Keep
+the cache and matching vault configuration while uploads are pending.
 
 ## Uninstall
 
@@ -374,9 +385,11 @@ degoo-rc uninstall --inventory
 ```
 
 Running `degoo-rc uninstall` in a terminal, or with `--wizard`,
-starts guided cleanup. It offers to copy vault/account configuration, cache,
-and logs to a private directory outside the install; each choice defaults to
-No. You can enter a backup path or use the suggested timestamped directory.
+starts guided cleanup. It offers to copy the vault configuration, remembered
+email, cache, and logs to a private directory outside the install; each choice
+defaults to No. You can enter a backup path or use the suggested timestamped
+directory. Retained configuration excludes account tokens and the encrypted
+account password, so a fresh login is required after restoration.
 
 A private backup is an owner-only folder outside the install, created only
 when you choose to keep something. At its path prompt, press Enter for the
@@ -396,7 +409,7 @@ passing its directory with `--restore-directory` as shown above. The wizard
 copies retained state into the new install and leaves the selected backup in
 place; it does not require copying the backup contents over an install path.
 When pending uploads were retained, the restored cache keeps them available
-for the mount's upload queue.
+for the mount's upload queue after you log in again.
 
 For an ordinary in-place client upgrade, use this command from a source
 checkout instead:

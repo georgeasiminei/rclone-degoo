@@ -764,3 +764,45 @@ Validation completed:
 These checks use disposable local encrypted data. They do not validate live
 Degoo behavior or install the helper on another server. `golangci-lint` was
 unavailable on the validation host.
+
+## Encrypted account-password fallback and credential-free backups (2026-10-12)
+
+The account-password fallback uses the vault crypt data key, including the
+optional password salt. HTTP fixtures verify rejected renewal followed by
+password login, one-shot password submissions and token exchange, persistent
+cooldowns, provider `Retry-After`, shared account locking, cancellation, and
+login/logout serialization. Credential tests cover ciphertext tampering, a
+wrong key, clearing saved credentials, and preservation of vault fields.
+Command and backend tests exercise the complete fallback path. Cache identity
+tests ensure that changing account credentials does not detach pending writes.
+
+Configuration backups and uninstall-retention backups omit account passwords,
+their encrypted form, tokens, and account lock files. Tests verify that the
+installed credentials are preserved and that retained pending cache data
+remains recoverable after restoring and logging in again.
+Legacy-backup and direct-vault import tests verify that saved account
+credentials are stripped, old tokens are not restored, and the wizard requires
+a fresh login while leaving the source backup intact.
+
+Validation:
+
+- Full Go build passed.
+- The credential-free Go suite passed with only `TestMount`,
+  `TestDockerPluginMountTCP`, and `TestDockerPluginMountUnix` excluded because
+  standard `fusermount3` is unavailable. The initial unfiltered run confirmed
+  those environment failures. An archive test passed after selecting the
+  freshly built binary; a transient S3 cache timing failure passed on rerun.
+- Uncached Degoo backend and command tests passed. Auth and command race tests
+  passed; scoped Degoo backend/auth/API/command lint reported zero issues.
+- All 314 offline Python tests passed, including backup, restore, and
+  uninstall recovery tests. Changed Markdown lint and `git diff --check`
+  passed.
+
+This does not establish live password fallback or multi-day provider renewal.
+An existing installation needs an interactive login to populate its encrypted
+credential. The idle supervisor in [SESSION_RECOVERY.md](SESSION_RECOVERY.md)
+is a proposal and is not implemented by this change.
+
+The local client was upgraded with its existing configuration and cache
+contents verified unchanged. Its service remains stopped pending the first
+interactive login with the updated client.

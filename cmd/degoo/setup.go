@@ -40,11 +40,20 @@ func transportDefaults() configmap.Simple {
 func setupAPI(ctx context.Context, m configmap.Getter) (*api.Client, error) {
 	get := func(name string) string { value, _ := m.Get(name); return value }
 	client := fshttp.NewClient(ctx)
-	tokens, err := auth.New(client, get("auth_file"), get("rest_url"))
+	tokens, err := auth.NewWithCredentials(client, get("auth_file"), get("rest_url"), get("credentials_file"))
 	if err != nil {
 		return nil, err
 	}
 	return api.New(client, tokens, get("api_url"), get("api_key")), nil
+}
+
+func withCredentialsFile(m configmap.Getter, filename string) configmap.Getter {
+	if filename == "" {
+		return m
+	}
+	return configmap.New().
+		AddGetter(configmap.Simple{"credentials_file": filename}, configmap.PriorityNormal).
+		AddGetter(m, configmap.PriorityMax)
 }
 
 func writeFolders(out io.Writer, items []api.Item) error {
@@ -60,12 +69,20 @@ func writeFolders(out io.Writer, items []api.Item) error {
 
 func addSetupCommands(root *cobra.Command) {
 	var parentID string
+	var foldersVaultConfig string
 	folders := &cobra.Command{Use: "folders auth.json", Short: "List Degoo device containers and folders for vault setup.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		if err := safeLogging(c.Context()); err != nil {
 			return err
 		}
 		m := transportDefaults()
 		m["auth_file"] = args[0]
+		credentialsFile, err := credentialsFileForAuth(args[0], foldersVaultConfig)
+		if err != nil {
+			return err
+		}
+		if credentialsFile != "" {
+			m["credentials_file"] = credentialsFile
+		}
 		client, err := setupAPI(c.Context(), m)
 		if err != nil {
 			return err
@@ -79,7 +96,9 @@ func addSetupCommands(root *cobra.Command) {
 		return writeFolders(c.OutOrStdout(), items)
 	}}
 	folders.Flags().StringVar(&parentID, "parent-id", "0", "Parent folder ID; 0 lists account device containers")
+	folders.Flags().StringVar(&foldersVaultConfig, "vault-config", "", "Vault configuration containing encrypted account credentials")
 	var createParent, name string
+	var createVaultConfig string
 	create := &cobra.Command{Use: "create-vault auth.json", Short: "Create a dedicated vault folder and print its ID.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		if err := safeLogging(c.Context()); err != nil {
 			return err
@@ -92,6 +111,13 @@ func addSetupCommands(root *cobra.Command) {
 		}
 		m := transportDefaults()
 		m["auth_file"], m["root_folder_id"] = args[0], createParent
+		credentialsFile, err := credentialsFileForAuth(args[0], createVaultConfig)
+		if err != nil {
+			return err
+		}
+		if credentialsFile != "" {
+			m["credentials_file"] = credentialsFile
+		}
 		base, err := degoobackend.NewFs(c.Context(), "degoo-setup", "", m)
 		if err != nil {
 			return err
@@ -125,6 +151,7 @@ func addSetupCommands(root *cobra.Command) {
 	}}
 	create.Flags().StringVar(&createParent, "parent-id", "", "Parent device container or folder ID (required)")
 	create.Flags().StringVar(&name, "name", "", "New dedicated vault folder name (required)")
+	create.Flags().StringVar(&createVaultConfig, "vault-config", "", "Vault configuration containing encrypted account credentials")
 	location := &cobra.Command{Use: "location vault.json", Short: "Show the configured vault's remote ancestor folders.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		if err := safeLogging(c.Context()); err != nil {
 			return err
@@ -140,7 +167,7 @@ func addSetupCommands(root *cobra.Command) {
 		if info.Name != "degoo" {
 			return errors.New("vault remote must be Degoo")
 		}
-		client, err := setupAPI(c.Context(), m)
+		client, err := setupAPI(c.Context(), withCredentialsFile(m, args[0]))
 		if err != nil {
 			return err
 		}

@@ -66,6 +66,16 @@ class ConnectionTest(unittest.TestCase):
         self.assertEqual(options["timeout"], connection.QUERY_TIMEOUT)
         self.assertEqual(run.side_effect.private_modes, [0o600, 0o600])
 
+    def test_existing_vault_enables_saved_password_for_connection_checks(self) -> None:
+        vault = self.root / "config/vault.json"
+        vault.parent.mkdir(mode=0o700)
+        vault.write_text("{}\n", encoding="utf-8")
+        vault.chmod(0o600)
+        with mock.patch.object(connection.subprocess, "run", side_effect=self._run_result()) as run:
+            connection.check_connection(self.root)
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--vault-config") + 1], str(vault))
+
     def test_list_folders_queries_children_and_preserves_same_name_entries(self) -> None:
         response = json.dumps(
             [

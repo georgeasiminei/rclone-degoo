@@ -168,6 +168,9 @@ def run(root: Path, *, clear_email: bool) -> int:
     ):
         raise LoginError("the contained rclone executable is unsafe")
     auth_path = config_dir / "auth.json"
+    vault_path = config_dir / "vault.json"
+    _check_components(vault_path.parent)
+    credential_args = ["--vault-config", str(vault_path)] if os.path.lexists(vault_path) else []
     for required in (root / "logs", root / "tmp", root / "cache"):
         _check_components(required)
     _write_email(email_path, email)
@@ -195,6 +198,7 @@ def run(root: Path, *, clear_email: bool) -> int:
                 "--email",
                 email,
                 "--cached-email",
+                *credential_args,
             ],
             stdin=None,
             check=False,
@@ -208,6 +212,10 @@ def run(root: Path, *, clear_email: bool) -> int:
             f"Degoo login did not complete. Review {root / 'logs/login.log'} and try {_degoo_rc(root, 'login')} again.",
             file=sys.stderr,
         )
+    elif credential_args:
+        print("Account password saved encrypted with the vault key for automatic re-login.")
+    else:
+        print("Tokens saved. After vault setup, run degoo-rc login once to enable encrypted password fallback.")
     return result.returncode
 
 

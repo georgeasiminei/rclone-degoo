@@ -41,6 +41,7 @@ class RestoreTest(unittest.TestCase):
             "cache_dir": str(self.base / "old install" / "cache"),
             "chunk_size": "128Mi",
             "max_object_size": "19Gi",
+            "account_credentials": "legacy-encrypted-account-envelope",
         }
         self.vault_bytes = (json.dumps(self.vault, sort_keys=True) + "\n").encode()
         self.auth_bytes = b'{"token":"test-only-access","refresh_token":"test-only-refresh"}\n'
@@ -110,7 +111,7 @@ class RestoreTest(unittest.TestCase):
         self.write_private(metadata, b"pending metadata")
         return identity, pending, pending.read_bytes()
 
-    def test_inspection_recovers_settings_vault_and_saved_auth_defaults(self) -> None:
+    def test_inspection_recovers_settings_and_requires_fresh_account_authentication(self) -> None:
         backup = restore.inspect_backup(self.backup, self.target)
 
         self.assertEqual(backup.folder_id, self.folder_id)
@@ -120,26 +121,32 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(backup.vault_config_path, self.backup / "config/vault.json")
         self.assertEqual(backup.vault_settings["cache_dir"], str(self.target / "cache"))
         self.assertEqual(backup.vault_settings["remote"], install.REMOTE_NAME + ":")
-        self.assertEqual(backup.auth_bytes, self.auth_bytes)
+        self.assertFalse(hasattr(backup, "auth_bytes"))
+        self.assertNotIn("account_credentials", backup.vault_settings)
         self.assertEqual(backup.login_bytes, self.login_bytes)
         self.assertFalse(backup.cache_has_data)
 
-    def test_restore_copies_auth_login_and_cache_without_changing_backup(self) -> None:
+    def test_restore_drops_legacy_auth_and_credentials_but_preserves_login_and_cache(self) -> None:
         identity, pending, pending_bytes = self.add_cache_data()
         identity_before = identity.read_bytes()
+        source_vault_before = (self.backup / "config/vault.json").read_bytes()
+        source_auth_before = (self.backup / "config/auth.json").read_bytes()
         backup = restore.inspect_backup(self.backup, self.target)
 
         with mock.patch.object(restore.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
             restore.restore_to_install(backup, self.target)
 
-        self.assertEqual((self.target / "config/auth.json").read_bytes(), self.auth_bytes)
+        self.assertFalse((self.target / "config/auth.json").exists())
+        restored_vault = json.loads((self.target / "config/vault.json").read_bytes())
+        self.assertNotIn("account_credentials", restored_vault)
         self.assertEqual((self.target / "config/login.json").read_bytes(), self.login_bytes)
-        self.assertEqual((self.target / "config/auth.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.target / "config/login.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.target / "cache" / "vfs" / self.cache_name / pending.name).read_bytes(), pending_bytes)
         self.assertEqual((self.target / "cache" / f"{self.cache_name}.identity").read_bytes(), identity_before)
         self.assertEqual(identity.read_bytes(), identity_before)
         self.assertEqual(pending.read_bytes(), pending_bytes)
+        self.assertEqual((self.backup / "config/vault.json").read_bytes(), source_vault_before)
+        self.assertEqual((self.backup / "config/auth.json").read_bytes(), source_auth_before)
         self.assertFalse((self.backup / "cache" / f"{self.cache_name}.lock").exists())
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o700)
         run.assert_called_once()

@@ -161,10 +161,17 @@ These points are the binding product requirements recorded from the user.
 - Logout clears Degoo authentication state only. It must never clear the vault
   secret, vault configuration, or remote vault data.
 
-The recommended initial login flow prompts for the Degoo account password,
-saves a refresh token in a private local file, and avoids saving the account
-password. Future agents may adapt the account-login mechanism while preserving
-the separate vault secret, automatic renewal, and simple local-file setup.
+The updated user requirement (2026-10-12) permits saving the Degoo account
+password for automatic login when token renewal is rejected. Encrypt the saved
+account credentials with the same key used for vault data and store the
+ciphertext in the private vault configuration JSON. Keep token renewal as the
+first choice, use the password as a fallback, and protect against repeated
+login attempts during outages or provider rate limiting. Account login and
+vault encryption remain separate purposes even though saved credentials use
+the vault key for encryption. Logout must clear saved account credentials as
+well as tokens, while preserving vault data, its secret, and pending writes.
+Configuration backups must exclude account passwords, including their encrypted
+form, and access/refresh tokens. Restoring a backup requires a fresh login.
 
 ### Configuration and data safety
 

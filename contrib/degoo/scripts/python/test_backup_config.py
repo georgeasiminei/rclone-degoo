@@ -22,6 +22,29 @@ import restore
 
 
 class BackupConfigTest(unittest.TestCase):
+    def test_backup_excludes_encrypted_account_password_and_preserves_installed_credential(self) -> None:
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        encrypted = "generated-encrypted-account-password"
+        vault["account_credentials"] = encrypted
+        original = (json.dumps(vault) + "\n").encode()
+        self.write_private(vault_path, original)
+        self.write_private(self.root / "config/auth.json.lock", b"")
+        destination = backup_config.run(self.root, self.base / "password-free-backup")
+        backed_up = json.loads((destination / "config/vault.json").read_bytes())
+        self.assertNotIn("account_credentials", backed_up)
+        self.assertEqual(backed_up["password"], self.secret)
+        self.assertEqual(vault_path.read_bytes(), original)
+        for path in destination.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(encrypted.encode(), path.read_bytes())
+                self.assertNotIn(b"test-only-token", path.read_bytes())
+                self.assertNotIn(b"test-only-refresh", path.read_bytes())
+        self.assertFalse((destination / "config/auth.json").exists())
+        self.assertFalse((destination / "config/auth.json.lock").exists())
+        restored = restore.inspect_backup(destination, self.base / "restored-install")
+        self.assertNotIn("account_credentials", restored.vault_settings)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -121,7 +144,7 @@ class BackupConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             {path.name for path in (destination / "config").iterdir()},
-            {"auth.json", "login.json", "mount.json", "rclone.conf", "vault.json"},
+            {"login.json", "mount.json", "rclone.conf", "vault.json"},
         )
         for path in (destination / "config").iterdir():
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -134,7 +157,7 @@ class BackupConfigTest(unittest.TestCase):
         self.assertEqual(restored.folder_id, self.folder_id)
         self.assertEqual(restored.vault_settings["password"], self.secret)
         self.assertEqual(restored.vault_settings["cache_dir"], str(target_root / "cache"))
-        self.assertEqual(restored.auth_bytes, self.auth)
+        self.assertFalse(hasattr(restored, "auth_bytes"))
         self.assertEqual(restored.login_bytes, self.login)
 
         self.assertEqual((self.root / "install.json").read_bytes(), original_manifest)
@@ -151,7 +174,7 @@ class BackupConfigTest(unittest.TestCase):
 
         self.assertEqual(result, 0, stderr.getvalue())
         self.assertIn(str(destination), stdout.getvalue())
-        self.assertIn("Configuration and credentials only", stdout.getvalue())
+        self.assertIn("authentication tokens are excluded", stdout.getvalue())
         self.assertIn("File data, cache, and pending uploads are excluded", stdout.getvalue())
         self.assertNotIn(self.secret, stdout.getvalue())
         self.assertNotIn("test-only-refresh", stdout.getvalue())

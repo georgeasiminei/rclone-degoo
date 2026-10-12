@@ -280,6 +280,14 @@ def authentication_error(
             return f"No saved account token; log in before cloud operations by running {command}."
         return None
     current = time.time() if now is None else now
+    retry_after = auth.get("retry_after")
+    if type(retry_after) is int and retry_after > 0:
+        if retry_after > current:
+            return (
+                "Automatic account login has not completed; password retries are cooling down "
+                f"for approximately {int(retry_after - current)} seconds. Run {command} to sign in explicitly."
+            )
+        return f"Automatic account login has not completed; the next cloud request may retry it. Run {command} to sign in explicitly."
     try:
         auth_info = os.lstat(auth_path)
     except OSError:
@@ -802,6 +810,9 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
 
     lines.append("Saved account authentication (running mount credentials are not inspected):")
     lines.append(f"  {authentication_status(auth_path, logs_dir=root / 'logs')}")
+    vault = _read_json(root / "config" / "vault.json", 64 * 1024)
+    saved_password = bool(vault and isinstance(vault.get("account_credentials"), str) and vault["account_credentials"])
+    lines.append("  Encrypted account-password fallback: " + ("saved; attempted after rejected renewal." if saved_password else "not saved; run degoo-rc login after vault setup to enable it."))
     lines.append("  This summary reads saved auth.json; a running mount may hold different in-memory token state.")
     lines.append("  This local check does not contact Degoo or validate the token with the server.")
     if check_remote:

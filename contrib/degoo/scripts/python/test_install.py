@@ -482,6 +482,9 @@ class InstallTest(unittest.TestCase):
         code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
         self.assertEqual(code, 0, stderr)
         vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        vault["account_credentials"] = "generated-encrypted-credential-envelope"
+        vault_path.write_text(json.dumps(vault) + "\n", encoding="utf-8")
         vault_before = vault_path.read_bytes()
         config_before = (self.root / "config/rclone.conf").read_bytes()
         settings_path = self.root / "config/mount.json"
@@ -744,6 +747,7 @@ class InstallTest(unittest.TestCase):
             "remote": "old-machine:",
             "password": "kept-vault-secret",
             "password_salt": "independent-salt",
+            "account_credentials": "legacy-encrypted-account-envelope",
             "cache_dir": "/old/machine/cache",
             "chunk_size": "512Mi",
             "max_object_size": "18Gi",
@@ -757,7 +761,10 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(imported["remote"], "degoo-live-test:")
         self.assertEqual(imported["cache_dir"], str(self.root / "cache"))
         self.assertEqual(imported["chunk_size"], "512Mi")
-        self.assertEqual(json.loads(backup.read_text(encoding="utf-8"))["cache_dir"], "/old/machine/cache")
+        self.assertNotIn("account_credentials", imported, "importing a vault always requires a fresh account login")
+        saved_source = json.loads(backup.read_text(encoding="utf-8"))
+        self.assertEqual(saved_source["cache_dir"], "/old/machine/cache")
+        self.assertEqual(saved_source["account_credentials"], "legacy-encrypted-account-envelope")
 
 
 class LoginTest(unittest.TestCase):
@@ -777,6 +784,9 @@ class LoginTest(unittest.TestCase):
         self.root.chmod(0o700)
 
     def test_cached_email_skips_python_email_prompt_and_go_gets_cached_flag(self) -> None:
+        vault_path = self.root / "config/vault.json"
+        vault_path.write_text("{}\n", encoding="ascii")
+        vault_path.chmod(0o600)
         email_path = self.root / "config/login.json"
         email_path.write_text('{"email":"owner@example.test"}\n', encoding="ascii")
         email_path.chmod(0o600)
@@ -787,6 +797,7 @@ class LoginTest(unittest.TestCase):
         self.assertIn("--email", command)
         self.assertIn("owner@example.test", command)
         self.assertIn("--cached-email", command)
+        self.assertEqual(command[command.index("--vault-config") + 1], str(vault_path))
         self.assertNotIn("test-password", command)
         self.assertEqual(run.call_args.kwargs["umask"], 0o077)
 
