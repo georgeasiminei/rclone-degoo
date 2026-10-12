@@ -204,8 +204,8 @@ Go is required only to build from a checkout, and the wizard can offer that
 build if it finds no binary.
 
 The wizard first offers a retained backup directory for fresh installation.
-Recovered folder and mount settings become defaults; saved account credentials
-are checked with an authenticated folder query before prompting for a password.
+Recovered folder and mount settings become defaults; restoration requires a
+fresh account login and ignores credentials present in older backups.
 Original vault settings remain fixed. Retained cache data is copied privately;
 an offline `degoo restore-cache` command verifies the original identity and
 changes only its cache-path binding. Existing installs use the upgrade flow
@@ -271,9 +271,10 @@ helper.
 1. Implement the provider request contracts from the pinned Python reference
    in Go, with HTTP mocks for pagination, authentication, ranges, uploads, and
    partial registration failures. See [API_EVIDENCE.md](API_EVIDENCE.md).
-2. Keep account tokens in an atomic private file. Prompt for the account
-   password and never persist it; the independent vault secret lives in a
-   separate versioned private configuration.
+2. Keep account tokens in an atomic private file. When a vault configuration
+   is available, encrypt the account credentials with its data-encryption key
+   for automatic password login after rejected renewal. Persist a login
+   cooldown separately from credentials and retain the independent vault secret.
 3. Construct `VFS -> chunker -> crypt -> Degoo` inside `rclone degoo mount`.
    Require the raw remote to identify a dedicated folder; fix crypt data and
    name encryption settings rather than trusting an arbitrary remote chain.
@@ -403,8 +404,9 @@ Store vault and auth configuration in private files and directories on Linux.
 Owner-only permissions (for example, mode 0600 for files and 0700 for their
 directory) are a recommended default. The config may contain the vault
 password in plaintext; no separate key file is required. Rclone's config
-obscuring is not encryption. Prefer an interactive Degoo password prompt and
-private refresh-token storage without persisting the account password. Logout
+obscuring is not encryption. Prompt interactively for the Degoo password and
+encrypt saved account credentials with the vault cipher as authorized on
+2026-10-12. Keep refresh tokens separately in private storage. Logout
 must remove any stored account credentials while preserving the vault secret.
 
 ## Existing rclone capability and new work

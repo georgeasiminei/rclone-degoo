@@ -18,6 +18,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import install
+import restore
 import uninstall  # noqa: E402
 
 
@@ -60,12 +61,20 @@ class UninstallTest(unittest.TestCase):
             "version": 1,
             "remote": "degoo-live-test:",
             "password": "test-only-vault-secret",
+            "password_salt": "test-only-vault-salt",
             "cache_dir": str(self.root / "cache"),
+            "chunk_size": "128Mi",
+            "max_object_size": "19Gi",
+            "account_credentials": "generated-encrypted-account-password-blob",
         }
         self.vault_bytes = (json.dumps(self.vault, sort_keys=True) + "\n").encode()
+        self.retained_vault = {key: value for key, value in self.vault.items() if key != "account_credentials"}
+        self.retained_vault_bytes = (json.dumps(self.retained_vault, sort_keys=True) + "\n").encode()
         self.write_private(self.root / "config/vault.json", self.vault_bytes)
         self.write_private(self.root / "config/auth.json", b'{"access_token":"test-only-token"}\n')
-        self.write_private(self.root / "config/rclone.conf", b"[degoo-live-test]\ntype = degoo\n")
+        self.write_private(self.root / "config/auth.json.lock", b"private lock state\n")
+        self.write_private(self.root / "config/login.json", b'{"email":"owner@example.test"}\n')
+        self.write_private(self.root / "config/rclone.conf", install.rclone_config(self.root, "generated-test-folder-id"))
         self.write_private(self.root / "install.json", json.dumps({
             "version": 1,
             "root_folder_id": "generated-test-folder-id",
@@ -299,14 +308,18 @@ class UninstallTest(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn(str(destination), stdout)
         self.assertIn("vault encryption key", stdout)
-        self.assertIn("account tokens", stdout)
+        self.assertIn("remembered email", stdout)
+        self.assertIn("authentication tokens are excluded", stdout)
+        self.assertIn("fresh Degoo login is required", stdout)
         self.assertIn("mount settings", stdout)
         self.assertIn("local cache", stdout)
         self.assertIn("local logs", stdout)
         self.assertIn("Remote encrypted files were left untouched", stdout)
         self.assertFalse(self.root.exists())
-        self.assertEqual((destination / "config/vault.json").read_bytes(), self.vault_bytes)
-        self.assertEqual((destination / "config/auth.json").read_bytes(), b'{"access_token":"test-only-token"}\n')
+        self.assertEqual((destination / "config/vault.json").read_bytes(), self.retained_vault_bytes)
+        self.assertFalse((destination / "config/auth.json").exists())
+        self.assertFalse((destination / "config/auth.json.lock").exists())
+        self.assertEqual((destination / "config/login.json").read_bytes(), b'{"email":"owner@example.test"}\n')
         self.assertEqual((destination / "cache/pending.bin").read_bytes(), b"pending bytes")
         self.assertFalse((destination / "logs").exists())
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
@@ -334,7 +347,7 @@ class UninstallTest(unittest.TestCase):
         self.assertIn("selected retention still needs a valid private backup path", stdout)
         self.assertIn("press Ctrl+C to cancel and restart", stdout)
         self.assertFalse(self.root.exists())
-        self.assertEqual((destination / "config/vault.json").read_bytes(), self.vault_bytes)
+        self.assertEqual((destination / "config/vault.json").read_bytes(), self.retained_vault_bytes)
         self.assertFalse((destination / "cache").exists())
         self.assertFalse((destination / "logs").exists())
 
@@ -347,7 +360,8 @@ class UninstallTest(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertNotIn("Backup directory path", stdout)
         self.assertIn("vault encryption key", stdout)
-        self.assertIn("account tokens", stdout)
+        self.assertIn("remembered email", stdout)
+        self.assertIn("authentication tokens are excluded", stdout)
         self.assertIn("mount settings", stdout)
         self.assertIn("local cache", stdout)
         self.assertIn("local logs", stdout)
@@ -383,11 +397,91 @@ class UninstallTest(unittest.TestCase):
             )
         self.assertEqual(code, 0, stderr)
         self.assertIn("were preserved in", stdout)
+        self.assertIn("fresh Degoo login is required after restoration", stdout)
         self.assertFalse(self.root.exists())
         self.assertEqual((destination / "cache/pending.bin").read_bytes(), b"pending bytes")
-        self.assertEqual((destination / "config/vault.json").read_bytes(), self.vault_bytes)
+        self.assertEqual((destination / "config/vault.json").read_bytes(), self.retained_vault_bytes)
+        self.assertFalse((destination / "config/auth.json").exists())
         self.assertTrue((destination / "bin/rclone").stat().st_mode & 0o100)
         self.assertTrue((destination / "install.json").exists())
+
+    def test_retention_filters_account_auth_and_restores_pending_cache(self) -> None:
+        cache_name = restore._cache_name()
+        for parent_name in ("vfs", "vfsMeta"):
+            parent = self.root / "cache" / parent_name
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o700)
+            remote_cache = parent / cache_name
+            remote_cache.mkdir(mode=0o700)
+            remote_cache.chmod(0o700)
+        identity_bytes = b"a" * 64 + b"\n"
+        pending_bytes = b"encrypted pending upload data"
+        metadata_bytes = b"pending upload metadata"
+        self.write_private(self.root / "cache" / f"{cache_name}.identity", identity_bytes)
+        self.write_private(self.root / "cache" / "vfs" / cache_name / "pending.bin", pending_bytes)
+        self.write_private(self.root / "cache" / "vfsMeta" / cache_name / "pending.bin", metadata_bytes)
+
+        source_vault = (self.root / "config/vault.json").read_bytes()
+        source_auth = (self.root / "config/auth.json").read_bytes()
+        source_auth_lock = (self.root / "config/auth.json.lock").read_bytes()
+        source_login = (self.root / "config/login.json").read_bytes()
+        destination = self.base / "recoverable-retention"
+        uninstall._retain_state(
+            self.root,
+            destination,
+            keep_config=True,
+            keep_cache=True,
+            keep_logs=False,
+            pending=True,
+        )
+
+        self.assertEqual((self.root / "config/vault.json").read_bytes(), source_vault)
+        self.assertEqual((self.root / "config/auth.json").read_bytes(), source_auth)
+        self.assertEqual((self.root / "config/auth.json.lock").read_bytes(), source_auth_lock)
+        self.assertEqual((self.root / "config/login.json").read_bytes(), source_login)
+        self.assertEqual((self.root / "cache" / f"{cache_name}.identity").read_bytes(), identity_bytes)
+        self.assertEqual((self.root / "cache" / "vfs" / cache_name / "pending.bin").read_bytes(), pending_bytes)
+        retained_vault = json.loads((destination / "config/vault.json").read_bytes())
+        self.assertNotIn("account_credentials", retained_vault)
+        self.assertEqual(retained_vault["password"], self.vault["password"])
+        self.assertFalse((destination / "config/auth.json").exists())
+        self.assertFalse((destination / "config/auth.json.lock").exists())
+        self.assertEqual((destination / "config/login.json").read_bytes(), source_login)
+        retained_contents = b"".join(
+            path.read_bytes()
+            for path in destination.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn(self.vault["account_credentials"].encode(), retained_contents)
+        self.assertNotIn(b"test-only-token", retained_contents)
+        self.assertEqual((destination / "cache" / f"{cache_name}.identity").read_bytes(), identity_bytes)
+        self.assertEqual((destination / "cache" / "vfs" / cache_name / "pending.bin").read_bytes(), pending_bytes)
+
+        target = self.base / "fresh-install"
+        for name in ("bin", "cache", "config", "tmp"):
+            path = target / name
+            path.mkdir(parents=True, mode=0o700)
+            path.chmod(0o700)
+        target.chmod(0o700)
+        target_vault = self.retained_vault | {"cache_dir": str(target / "cache")}
+        self.write_private(target / "config/vault.json", (json.dumps(target_vault, sort_keys=True) + "\n").encode())
+        self.write_private(target / "config/rclone.conf", install.rclone_config(target, "generated-test-folder-id"))
+        binary = target / "bin/rclone"
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        binary.chmod(0o700)
+
+        backup = restore.inspect_backup(destination, target)
+        self.assertTrue(backup.cache_has_data)
+        self.assertFalse(hasattr(backup, "auth_bytes"))
+        self.assertEqual(backup.login_bytes, source_login)
+        with mock.patch.object(restore.subprocess, "run", return_value=mock.Mock(returncode=0)):
+            restore.restore_to_install(backup, target)
+
+        self.assertEqual((target / "cache" / f"{cache_name}.identity").read_bytes(), identity_bytes)
+        self.assertEqual((target / "cache" / "vfs" / cache_name / "pending.bin").read_bytes(), pending_bytes)
+        self.assertEqual((target / "cache" / "vfsMeta" / cache_name / "pending.bin").read_bytes(), metadata_bytes)
+        self.assertFalse((target / "config/auth.json").exists())
+        self.assertEqual((target / "config/login.json").read_bytes(), source_login)
 
     def test_pending_uploads_still_refuse_removal_without_both_retained_groups(self) -> None:
         destination = self.base / "config-only"
@@ -444,7 +538,8 @@ class UninstallTest(unittest.TestCase):
         directory.mkdir(mode=0o700)
         directory.chmod(0o700)
         mismatch = directory / "vault.json"
-        self.write_private(mismatch, b'{"password":"different"}\n')
+        mismatch_vault = self.retained_vault | {"password": "different"}
+        self.write_private(mismatch, (json.dumps(mismatch_vault, sort_keys=True) + "\n").encode())
         code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(mismatch))
         self.assertEqual(code, 2)
         self.assertIn("does not match", stderr)
@@ -457,6 +552,27 @@ class UninstallTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("unsafe ownership or permissions", stderr)
         self.assertTrue(self.root.exists())
+
+    def test_sanitized_vault_backup_matches_without_changing_installed_credentials(self) -> None:
+        directory = self.base / "sanitized-vault-backup"
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+        backup = directory / "vault.json"
+        self.write_private(backup, self.retained_vault_bytes)
+        original_vault_bytes = (self.root / "config/vault.json").read_bytes()
+        self.write_rclone("Pending local uploads: 2 files, 123 bytes")
+
+        code, _, stderr = self.invoke("--delete-local", "--vault-backup", str(backup))
+
+        self.assertEqual(code, 2)
+        self.assertIn("pending local uploads remain", stderr)
+        self.assertNotIn("vault backup does not match", stderr)
+        self.assertTrue(self.root.exists())
+        self.assertEqual((self.root / "config/vault.json").read_bytes(), original_vault_bytes)
+        self.assertEqual(
+            json.loads((self.root / "config/vault.json").read_bytes())["account_credentials"],
+            self.vault["account_credentials"],
+        )
 
     def test_pending_uploads_preserve_local_install_and_cache(self) -> None:
         self.write_rclone("Pending local uploads: 2 files, 123 bytes")

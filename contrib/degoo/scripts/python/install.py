@@ -643,7 +643,7 @@ def prepare_mountpoint(path: Path) -> None:
 
 def read_vault(raw: bytes, root: Path, *, imported: bool) -> tuple[dict[str, Any], bytes]:
     config = parse_json_object(raw, "the vault configuration is invalid")
-    allowed = {"version", "remote", "password", "password_salt", "cache_dir", "chunk_size", "max_object_size"}
+    allowed = {"version", "remote", "password", "password_salt", "cache_dir", "chunk_size", "max_object_size", "account_credentials"}
     if set(config) - allowed:
         raise InstallError("the vault configuration has unsupported fields")
     if type(config.get("version")) is not int or config["version"] != 1:
@@ -652,6 +652,8 @@ def read_vault(raw: bytes, root: Path, *, imported: bool) -> tuple[dict[str, Any
         raise InstallError("the vault configuration does not contain a password")
     if "password_salt" in config and not isinstance(config["password_salt"], str):
         raise InstallError("the vault configuration password salt is invalid")
+    if "account_credentials" in config and not isinstance(config["account_credentials"], str):
+        raise InstallError("the encrypted account credentials are invalid")
     if not imported:
         if config.get("remote") != f"{REMOTE_NAME}:":
             raise InstallError("the installed vault configuration points to another remote")
@@ -661,6 +663,7 @@ def read_vault(raw: bytes, root: Path, *, imported: bool) -> tuple[dict[str, Any
         remote = config.get("remote")
         if not isinstance(remote, str) or not remote.endswith(":") or not remote[:-1]:
             raise InstallError("the imported vault configuration has an invalid remote")
+        config.pop("account_credentials", None)
         config["remote"] = f"{REMOTE_NAME}:"
         config["cache_dir"] = str(root / "cache")
     return config, (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -730,6 +733,8 @@ def validate_rclone_config(raw: bytes, root: Path, folder_id: str) -> None:
     section = parser[REMOTE_NAME]
     if section.get("type") != "degoo" or section.get("root_folder_id") != folder_id or section.get("auth_file") != str(root / "config/auth.json"):
         raise InstallError("config/rclone.conf points to another remote or account-token path")
+    if "credentials_file" in section and section["credentials_file"] != str(root / "config/vault.json"):
+        raise InstallError("config/rclone.conf points to another vault-credential path")
 
 
 def rclone_config(root: Path, folder_id: str) -> bytes:
@@ -738,6 +743,7 @@ def rclone_config(root: Path, folder_id: str) -> bytes:
         "type = degoo\n"
         f"root_folder_id = {folder_id}\n"
         f"auth_file = {root / 'config/auth.json'}\n"
+        f"credentials_file = {root / 'config/vault.json'}\n"
     ).encode("utf-8")
 
 
@@ -805,6 +811,9 @@ def shell_wrapper(name: str, root: Path, *, mountpoint: Path | None = None) -> b
         )
     elif name == "folders.sh":
         command = (
+            "if [ -f \"$ROOT/config/vault.json\" ]; then\n"
+            "  set -- --vault-config \"$ROOT/config/vault.json\" \"$@\"\n"
+            "fi\n"
             f"exec \"$ROOT/bin/rclone\" --config \"$ROOT/config/rclone.conf\" "
             f"--log-file \"$ROOT/logs/diagnostics.log\" --log-level NOTICE "
             f"degoo folders \"$ROOT/config/auth.json\" \"$@\""

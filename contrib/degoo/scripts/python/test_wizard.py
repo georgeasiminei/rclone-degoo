@@ -1175,7 +1175,7 @@ class WizardTest(unittest.TestCase):
             self.assertIn("root_folder_id = created-folder-123", remote_config)
             self.assertTrue((root / "scripts/python/install.py").is_file())
 
-    def test_backup_restore_wizard_restores_vault_settings_and_saved_login(self) -> None:
+    def test_backup_restore_wizard_requires_fresh_login_and_drops_saved_auth(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             home = base / "home"
@@ -1199,6 +1199,7 @@ class WizardTest(unittest.TestCase):
                 "cache_dir": old_cache,
                 "chunk_size": "64Mi",
                 "max_object_size": "19Gi",
+                "account_credentials": "legacy-encrypted-account-envelope",
             }
             mount_settings = wizard.installer.DEFAULT_MOUNT_SETTINGS | {
                 "read_chunk_streams": 6,
@@ -1206,6 +1207,7 @@ class WizardTest(unittest.TestCase):
                 "cache_max_age": "10h",
             }
             auth_bytes = b'{"token":"test-only-access-token","refresh_token":"test-only-refresh-token"}\n'
+            fresh_auth_bytes = b'{"token":"new-login-access-token","refresh_token":"new-login-refresh-token"}\n'
             login_bytes = b'{"email":"owner@example.test"}\n'
 
             def write_private(path: Path, data: bytes) -> None:
@@ -1265,6 +1267,11 @@ class WizardTest(unittest.TestCase):
             })()
             prompts: list[str] = []
 
+            def fresh_login(root: Path, *, clear_email: bool = False) -> int:
+                self.assertFalse(clear_email)
+                write_private(root / "config/auth.json", fresh_auth_bytes)
+                return 0
+
             def answer(prompt: str) -> str:
                 prompts.append(prompt)
                 return str(backup) if len(prompts) == 1 else ""
@@ -1277,7 +1284,7 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)) as choose_binary,
                 mock.patch.object(wizard.connection, "check_connection", return_value=account_folders) as check_connection,
-                mock.patch.object(wizard.login, "run") as login_call,
+                mock.patch.object(wizard.login, "run", side_effect=fresh_login) as login_call,
                 mock.patch.object(wizard.setup, "run") as setup_call,
                 mock.patch.object(wizard.service, "run") as service_call,
                 contextlib.redirect_stdout(output),
@@ -1287,6 +1294,7 @@ class WizardTest(unittest.TestCase):
 
             root = home / ".local/share/rclone-degoo"
             self.assertEqual(result, 0)
+            self.assertIn("Account authentication tokens and saved account credentials are not restored.", output.getvalue())
             self.assertIn("Backup directory to restore", prompts[0])
             self.assertTrue(any("Recovered dedicated vault folder ID" in prompt and folder_id in prompt for prompt in prompts))
             self.assertTrue(any("Recovered vault folder name" in prompt and folder_name in prompt for prompt in prompts))
@@ -1295,7 +1303,7 @@ class WizardTest(unittest.TestCase):
             self.assertFalse(any("password" in prompt.casefold() for prompt in prompts))
             choose_binary.assert_called_once()
             check_connection.assert_called_once_with(root)
-            login_call.assert_not_called()
+            login_call.assert_called_once_with(root, clear_email=False)
             setup_call.assert_not_called()
             service_call.assert_not_called()
 
@@ -1309,8 +1317,10 @@ class WizardTest(unittest.TestCase):
             self.assertEqual(installed_vault["cache_dir"], str(root / "cache"))
             self.assertEqual(installed_vault["chunk_size"], "64Mi")
             self.assertEqual(installed_vault["max_object_size"], "19Gi")
+            self.assertNotIn("account_credentials", installed_vault)
             self.assertEqual(json.loads((root / "config/mount.json").read_bytes()), mount_settings)
-            self.assertEqual((root / "config/auth.json").read_bytes(), auth_bytes)
+            self.assertEqual((root / "config/auth.json").read_bytes(), fresh_auth_bytes)
+            self.assertNotEqual((root / "config/auth.json").read_bytes(), auth_bytes)
             self.assertEqual((root / "config/login.json").read_bytes(), login_bytes)
             self.assertEqual((root / "config/auth.json").stat().st_mode & 0o777, 0o600)
             self.assertEqual((root / "config/login.json").stat().st_mode & 0o777, 0o600)
@@ -1337,7 +1347,9 @@ class WizardTest(unittest.TestCase):
                 "cache_dir": str(old_root / "cache"),
                 "chunk_size": "64Mi",
                 "max_object_size": "19Gi",
+                "account_credentials": "legacy-encrypted-account-envelope",
             }
+            fresh_auth_bytes = b'{"token":"new-login-access-token","refresh_token":"new-login-refresh-token"}\n'
 
             def write_private(path: Path, data: bytes) -> None:
                 path.write_bytes(data)
@@ -1393,6 +1405,11 @@ class WizardTest(unittest.TestCase):
                 vault_at_setup.append(json.loads((root / "config/vault.json").read_bytes()))
                 return 0
 
+            def fresh_login(login_root: Path, *, clear_email: bool = False) -> int:
+                self.assertFalse(clear_email)
+                write_private(login_root / "config/auth.json", fresh_auth_bytes)
+                return 0
+
             account_folders = [{"id": "device-123", "name": "Device", "category": 1}]
             with (
                 mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
@@ -1401,7 +1418,7 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_choose_binary", return_value=(str(binary), None)),
                 mock.patch.object(wizard.connection, "check_connection", return_value=account_folders) as check_connection,
                 mock.patch.object(wizard.connection, "list_folders", return_value=[]),
-                mock.patch.object(wizard.login, "run") as login_call,
+                mock.patch.object(wizard.login, "run", side_effect=fresh_login) as login_call,
                 mock.patch.object(wizard.setup, "run", side_effect=setup_with_existing_vault) as setup_call,
                 mock.patch.object(wizard.service, "run") as service_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -1413,7 +1430,7 @@ class WizardTest(unittest.TestCase):
             self.assertIn("Backup directory to restore", prompts[0])
             self.assertFalse(any("vault.json to import" in prompt for prompt in prompts))
             check_connection.assert_called_once_with(root)
-            login_call.assert_not_called()
+            login_call.assert_called_once_with(root, clear_email=False)
             setup_call.assert_called_once()
             setup_args = setup_call.call_args.args[0]
             self.assertIsNone(setup_args.vault_config)
@@ -1422,6 +1439,8 @@ class WizardTest(unittest.TestCase):
             self.assertEqual(len(vault_at_setup), 1)
             self.assertEqual(vault_at_setup[0]["password"], secret)
             self.assertEqual(vault_at_setup[0]["cache_dir"], str(root / "cache"))
+            self.assertNotIn("account_credentials", vault_at_setup[0])
+            self.assertEqual((root / "config/auth.json").read_bytes(), fresh_auth_bytes)
             service_call.assert_not_called()
 
     def test_requested_folder_id_is_validated_before_dependency_work(self) -> None:

@@ -301,7 +301,13 @@ def _validate_backup(path_arg: str, root: Path, vault_bytes: bytes | None) -> No
     if parent_info.st_uid != os.getuid() or parent_info.st_mode & 0o022:
         raise CleanupError("the vault backup directory must be private to the current user")
     backup_bytes = _read_private_file(path, MAX_VAULT_SIZE)
-    if backup_bytes != vault_bytes:
+    backup_vault = _decode_json(backup_bytes)
+    installed_vault = _decode_json(vault_bytes)
+    backup_vault.pop("account_credentials", None)
+    installed_vault.pop("account_credentials", None)
+    backup_settings = json.dumps(backup_vault, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    installed_settings = json.dumps(installed_vault, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if backup_settings != installed_settings:
         raise CleanupError("the vault backup does not match the installed vault configuration")
 
 
@@ -411,7 +417,80 @@ def _copy_file_at(source_fd: int, destination_fd: int, name: str, *, executable:
         os.close(source_file)
 
 
-def _copy_directory_contents(source_fd: int, destination_fd: int) -> None:
+def _read_retained_file_at(source_fd: int, name: str, maximum: int) -> bytes:
+    """Read one checked private file through an already-open directory."""
+    try:
+        before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+    except OSError:
+        raise CleanupError("a retained file changed while it was being inspected") from None
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o077 or before.st_mode & 0o6000:
+        raise CleanupError("a retained file has unsafe ownership or permissions")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        source_file = os.open(name, flags, dir_fd=source_fd)
+    except OSError:
+        raise CleanupError("a retained file could not be opened safely") from None
+    try:
+        opened = os.fstat(source_file)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise CleanupError("a retained file changed while being opened")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining > 0:
+            chunk = os.read(source_file, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(source_file)
+        if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise CleanupError("a retained file changed while it was being read")
+    finally:
+        os.close(source_file)
+    data = b"".join(chunks)
+    if len(data) > maximum:
+        raise CleanupError("a retained file is larger than the supported limit")
+    return data
+
+
+def _write_retained_file_at(destination_fd: int, name: str, data: bytes) -> None:
+    """Write one new owner-private file and flush its contents."""
+    output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        destination_file = os.open(name, output_flags, 0o600, dir_fd=destination_fd)
+    except OSError:
+        raise CleanupError("a retained file could not be created safely") from None
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(destination_file, view)
+            if written <= 0:
+                raise CleanupError("a retained file could not be written completely")
+            view = view[written:]
+        os.fchmod(destination_file, 0o600)
+        os.fsync(destination_file)
+    finally:
+        os.close(destination_file)
+
+
+def _copy_sanitized_vault_at(source_fd: int, destination_fd: int, name: str) -> None:
+    """Copy a vault configuration without remembered account credentials."""
+    raw = _read_retained_file_at(source_fd, name, MAX_VAULT_SIZE)
+    vault = _decode_json(raw)
+    if "account_credentials" not in vault:
+        _write_retained_file_at(destination_fd, name, raw)
+        return
+    del vault["account_credentials"]
+    sanitized = (json.dumps(vault, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
+    _write_retained_file_at(destination_fd, name, sanitized)
+
+
+def _copy_directory_contents(source_fd: int, destination_fd: int, *, exclude_account_auth: bool = False) -> None:
     """Copy a checked directory tree without retaining symbolic links."""
     try:
         with os.scandir(source_fd) as iterator:
@@ -419,6 +498,8 @@ def _copy_directory_contents(source_fd: int, destination_fd: int) -> None:
     except OSError:
         raise CleanupError("a retained directory could not be inspected safely") from None
     for child in children:
+        if exclude_account_auth and child.name in {"auth.json", "auth.json.lock"}:
+            continue
         try:
             info = child.stat(follow_symlinks=False)
         except OSError:
@@ -450,14 +531,17 @@ def _copy_directory_contents(source_fd: int, destination_fd: int) -> None:
                 opened = os.fstat(source_child)
                 if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
                     raise CleanupError("a retained directory changed while being opened")
-                _copy_directory_contents(source_child, destination_child)
+                _copy_directory_contents(source_child, destination_child, exclude_account_auth=exclude_account_auth)
             finally:
                 if source_child >= 0:
                     os.close(source_child)
                 if destination_child >= 0:
                     os.close(destination_child)
         elif stat.S_ISREG(info.st_mode):
-            _copy_file_at(source_fd, destination_fd, child.name)
+            if exclude_account_auth and child.name == "vault.json":
+                _copy_sanitized_vault_at(source_fd, destination_fd, child.name)
+            else:
+                _copy_file_at(source_fd, destination_fd, child.name)
         else:
             raise CleanupError("symbolic links and special files cannot be retained")
     _fsync_directory(destination_fd)
@@ -474,6 +558,27 @@ def _copy_retained_directory(source: Path, destination: Path) -> None:
     destination_fd = _open_checked_directory(destination)
     try:
         _copy_directory_contents(source_fd, destination_fd)
+        parent_fd = _open_checked_directory(destination.parent)
+        try:
+            _fsync_directory(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
+
+
+def _copy_retained_config_directory(source: Path, destination: Path) -> None:
+    """Copy config while omitting account tokens and saved account passwords."""
+    try:
+        os.mkdir(destination, 0o700)
+    except OSError:
+        raise CleanupError("a retained directory could not be created safely") from None
+    os.chmod(destination, 0o700)
+    source_fd = _open_checked_directory(source)
+    destination_fd = _open_checked_directory(destination)
+    try:
+        _copy_directory_contents(source_fd, destination_fd, exclude_account_auth=True)
         parent_fd = _open_checked_directory(destination.parent)
         try:
             _fsync_directory(parent_fd)
@@ -531,7 +636,7 @@ def _retain_state(
     _validate_retention_directory(destination, root)
     _create_retention_directory(destination)
     if keep_config:
-        _copy_retained_directory(root / "config", destination / "config")
+        _copy_retained_config_directory(root / "config", destination / "config")
     if keep_cache:
         _copy_retained_directory(root / "cache", destination / "cache")
     if keep_logs:
@@ -1352,9 +1457,12 @@ def _wizard(args: argparse.Namespace) -> int:
     root, layout, _, _ = _inspect_install(args.root)
     print("This removes local Degoo mount files only. Degoo remote data will be left untouched.")
     print("A new owner-only backup outside the install is created only if at least one keep option is answered Yes.")
-    print("Configuration includes the vault encryption key, Degoo account tokens, and mount settings.")
+    print(
+        "Configuration includes the vault encryption key, remembered email, and mount settings. "
+        "Account passwords and authentication tokens are excluded; a fresh Degoo login is required."
+    )
     print("The local cache may contain pending uploads; keep both configuration and cache to recover them.")
-    keep_config = _prompt_yes_no("Keep vault, account login, and mount configuration?")
+    keep_config = _prompt_yes_no("Keep vault, remembered email, and mount configuration?")
     keep_cache = _prompt_yes_no("Keep the local cache?")
     keep_logs = _prompt_yes_no("Keep local logs?")
 
@@ -1531,6 +1639,7 @@ def uninstall(args: argparse.Namespace) -> int:
             "To resume them, run `./contrib/degoo/degoo-rc install --wizard "
             f"--restore-directory {shlex.quote(str(retention_directory))}` from the project checkout "
             "or use the extracted package's degoo-rc installer. "
+            "A fresh Degoo login is required after restoration; only the remembered email is retained. "
             "Degoo remote data was left untouched."
         )
     else:
@@ -1538,7 +1647,7 @@ def uninstall(args: argparse.Namespace) -> int:
     if retention_directory is not None:
         retained: list[str] = []
         if keep_config:
-            retained.append("configuration (vault key, account tokens, and mount settings)")
+            retained.append("configuration (vault key, remembered email, and mount settings; log in again)")
         if keep_cache:
             retained.append("local cache")
         if keep_logs:
@@ -1549,8 +1658,7 @@ def uninstall(args: argparse.Namespace) -> int:
             print(f"Unselected local state removed: {', '.join(removed)}.")
     else:
         print(
-            "No retention directory was created. The local configuration (including any vault key, account tokens, "
-            "and mount settings), cache, and logs were removed."
+            "No retention directory was created. The local configuration, cache, and logs were removed."
         )
     if service_cleanup:
         print("The owned user service is confirmed inactive; its links were removed and systemd was reloaded.")

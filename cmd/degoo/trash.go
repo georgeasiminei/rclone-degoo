@@ -39,6 +39,7 @@ type trashJSON struct {
 func addTrashCommands(root *cobra.Command) {
 	var limit int
 	var jsonOutput bool
+	var trashVaultConfig string
 	trash := &cobra.Command{
 		Use:   "trash auth.json",
 		Short: "List items in the Degoo account recycle bin.",
@@ -52,7 +53,7 @@ which lists every trash item. No restore operation is currently known.`,
 			if err := safeLogging(c.Context()); err != nil {
 				return err
 			}
-			client, err := trashAPI(c.Context(), args[0])
+			client, err := trashAPI(c.Context(), args[0], trashVaultConfig)
 			if err != nil {
 				return err
 			}
@@ -65,9 +66,11 @@ which lists every trash item. No restore operation is currently known.`,
 	}
 	trash.Flags().IntVar(&limit, "limit", 0, "Maximum number of trash items to return (0 means all)")
 	trash.Flags().BoolVar(&jsonOutput, "json", false, "Output trash items as JSON")
+	trash.Flags().StringVar(&trashVaultConfig, "vault-config", "", "Vault configuration containing encrypted account credentials")
 
 	var yes bool
 	var dryRun bool
+	var emptyVaultConfig string
 	empty := &cobra.Command{
 		Use:   "empty-trash auth.json",
 		Short: "Permanently delete every item in the Degoo account recycle bin.",
@@ -81,7 +84,7 @@ only when you are certain. Restore from trash is not currently supported.`,
 			if err := safeLogging(c.Context()); err != nil {
 				return err
 			}
-			client, err := trashAPI(c.Context(), args[0])
+			client, err := trashAPI(c.Context(), args[0], emptyVaultConfig)
 			if err != nil {
 				return err
 			}
@@ -110,13 +113,25 @@ only when you are certain. Restore from trash is not currently supported.`,
 	}
 	empty.Flags().BoolVar(&yes, "yes", false, "Skip the two interactive confirmations")
 	empty.Flags().BoolVar(&dryRun, "dry-run", false, "List the items that would be deleted without changing them")
+	empty.Flags().StringVar(&emptyVaultConfig, "vault-config", "", "Vault configuration containing encrypted account credentials")
 
 	root.AddCommand(trash, empty)
 }
 
-func trashAPI(ctx context.Context, authFile string) (*api.Client, error) {
+func trashAPI(ctx context.Context, authFile string, vaultConfig ...string) (*api.Client, error) {
 	m := transportDefaults()
 	m["auth_file"] = authFile
+	explicitVaultFile := ""
+	if len(vaultConfig) != 0 {
+		explicitVaultFile = vaultConfig[0]
+	}
+	credentialsFile, err := credentialsFileForAuth(authFile, explicitVaultFile)
+	if err != nil {
+		return nil, err
+	}
+	if credentialsFile != "" {
+		m["credentials_file"] = credentialsFile
+	}
 	return setupAPI(ctx, m)
 }
 

@@ -64,6 +64,10 @@ func init() {
 			Required:  true,
 			Sensitive: true,
 		}, {
+			Name:      "credentials_file",
+			Help:      "Path to the private encrypted vault configuration holding optional Degoo account credentials.",
+			Sensitive: true,
+		}, {
 			Name:      "root_folder_id",
 			Help:      "Degoo folder ID reserved for the encrypted vault; root ID 0 is not allowed.",
 			Required:  true,
@@ -97,6 +101,7 @@ var errMutationAmbiguous = errors.New("degoo mutation state is ambiguous")
 // Options defines the configuration for the Degoo backend.
 type Options struct {
 	AuthFile               string `config:"auth_file"`                // AuthFile is the path to private Degoo token state.
+	CredentialsFile        string `config:"credentials_file"`         // CredentialsFile is the path to encrypted account credentials.
 	RootFolderID           string `config:"root_folder_id"`           // RootFolderID is the dedicated encrypted vault folder ID.
 	APIKey                 string `config:"api_key"`                  // APIKey is the AppSync routing key.
 	APIURL                 string `config:"api_url"`                  // APIURL is the GraphQL endpoint.
@@ -165,7 +170,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	clientCtx, ci := fs.AddConfig(ctx)
 	ci.Dump = 0
 	httpClient := fshttp.NewClient(clientCtx)
-	authClient, err := auth.New(httpClient, opt.AuthFile, opt.RESTURL)
+	authClient, err := auth.NewWithCredentials(httpClient, opt.AuthFile, opt.RESTURL, opt.CredentialsFile)
 	if err != nil {
 		return nil, err
 	}

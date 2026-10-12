@@ -1034,8 +1034,7 @@ def _choose_backup(args: argparse.Namespace, root: Path, *, root_exists: bool, i
     if backup.folder_id:
         print(f"Recovered vault folder: {backup.folder_name or '(name not recorded)'} (ID {backup.folder_id}).")
     print("Recovered mount settings will be offered as defaults; vault encryption settings will be preserved.")
-    if backup.auth_bytes:
-        print("Saved account credentials will be tested before asking for a password.")
+    print("Account authentication tokens and saved account credentials are not restored. Sign in again to use this backup.")
     if backup.cache_has_data:
         print("Recovered cached files and pending writes will be preserved.")
     if not _yes_no("Use this backup as the installation defaults?", default=True, input_fn=input_fn):

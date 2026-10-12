@@ -112,6 +112,39 @@ func TestVaultConfigurationAndCacheProtection(t *testing.T) {
 	require.Error(t, bindCache(&bad, base), "missing identity must not allow pending plaintext to be rebound")
 }
 
+func TestLegacyVaultConfigAndAccountCredentialsCacheIdentity(t *testing.T) {
+	cfg := testConfig(t)
+	identity, err := cacheIdentity(cfg, "TestDegoo:")
+	require.NoError(t, err)
+
+	legacy := map[string]any{
+		"version":         1,
+		"remote":          cfg.Remote,
+		"password":        cfg.Password,
+		"cache_dir":       cfg.CacheDir,
+		"chunk_size":      cfg.ChunkSize,
+		"max_object_size": cfg.MaxObjectSize,
+	}
+	data, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	filename := filepath.Join(t.TempDir(), "private", "vault.json")
+	require.NoError(t, auth.WritePrivateFile(filename, data))
+	loaded, err := readConfig(filename)
+	require.NoError(t, err)
+	require.Empty(t, loaded.AccountCredentials, "older vault files omit the optional account credential")
+
+	cfg.AccountCredentials = "AQIDBA=="
+	withCredentials, err := cacheIdentity(cfg, "TestDegoo:")
+	require.NoError(t, err)
+	require.Equal(t, identity, withCredentials, "account login data must not invalidate pending local cache state")
+
+	changedCipher := *cfg
+	changedCipher.PasswordSalt = "different salt"
+	withChangedCipher, err := cacheIdentity(&changedCipher, "TestDegoo:")
+	require.NoError(t, err)
+	require.NotEqual(t, identity, withChangedCipher, "vault cipher settings remain part of cache identity")
+}
+
 func TestMountSettingsValidationAndFlagPrecedence(t *testing.T) {
 	writeSettings := func(t *testing.T, content string) string {
 		t.Helper()

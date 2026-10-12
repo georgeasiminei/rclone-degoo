@@ -57,7 +57,6 @@ class Backup:
     mount_settings: dict[str, Any]
     vault_config_path: Path | None
     vault_settings: dict[str, Any] | None = field(repr=False)
-    auth_bytes: bytes | None = field(repr=False)
     login_bytes: bytes | None = field(repr=False)
     cache_path: Path | None
     cache_has_data: bool
@@ -207,10 +206,15 @@ def _validate_rclone_config(raw: bytes, folder_id: str) -> None:
     if parser.sections() != [installer.REMOTE_NAME]:
         raise RestoreError("the retained Degoo remote config is incomplete")
     section = parser[installer.REMOTE_NAME]
-    if set(section) != {"type", "root_folder_id", "auth_file"}:
+    if (
+        not {"type", "root_folder_id", "auth_file"} <= set(section)
+        or set(section) - {"type", "root_folder_id", "auth_file", "credentials_file"}
+    ):
         raise RestoreError("the retained Degoo remote config contains unsupported settings")
     auth_path_text = section.get("auth_file", "")
     auth_path = Path(auth_path_text)
+    if "credentials_file" in section and section["credentials_file"] != str(auth_path.parent / "vault.json"):
+        raise RestoreError("the retained Degoo remote config contains an unsafe credential path")
     if (
         section.get("type") != "degoo"
         or section.get("root_folder_id") != folder_id
@@ -223,15 +227,16 @@ def _validate_rclone_config(raw: bytes, folder_id: str) -> None:
         raise RestoreError("the retained Degoo remote config points to another folder or unsafe token path")
 
 
-def _validate_auth(data: bytes) -> bytes:
+def _validate_auth(data: bytes) -> None:
     auth = _parse_object(data, "the retained account authentication state is invalid")
-    if set(auth) - {"token", "refresh_token"}:
+    if set(auth) - {"token", "refresh_token", "retry_after"}:
         raise RestoreError("the retained account authentication state has unsupported fields")
     if any(not isinstance(auth.get(key, ""), str) for key in ("token", "refresh_token")):
         raise RestoreError("the retained account authentication state is invalid")
+    if "retry_after" in auth and (type(auth["retry_after"]) is not int or auth["retry_after"] < 0):
+        raise RestoreError("the retained account authentication cooldown is invalid")
     if not any(auth.get(key, "") for key in ("token", "refresh_token")):
         raise RestoreError("the retained account authentication state is empty")
-    return data
 
 
 def _validate_login(data: bytes) -> bytes:
@@ -380,7 +385,6 @@ def inspect_backup(path: str | os.PathLike[str], target_root: str | os.PathLike[
 
     vault_config_path: Path | None = None
     vault_settings: dict[str, Any] | None = None
-    auth_bytes: bytes | None = None
     login_bytes: bytes | None = None
     mount_settings = dict(installer.DEFAULT_MOUNT_SETTINGS)
     rclone_bytes: bytes | None = None
@@ -400,6 +404,7 @@ def inspect_backup(path: str | os.PathLike[str], target_root: str | os.PathLike[
                     raise RestoreError("the retained vault config has an unsafe cache path")
                 normalized = installer.import_vault_config(str(vault_config_path), target)
                 vault_settings = installer.parse_json_object(normalized, "invalid")
+                vault_settings.pop("account_credentials", None)
             except installer.InstallError:
                 raise RestoreError("the retained vault configuration is invalid or unsafe") from None
             except RestoreError:
@@ -408,7 +413,7 @@ def inspect_backup(path: str | os.PathLike[str], target_root: str | os.PathLike[
                 raise RestoreError("the retained vault config does not use the contained Degoo remote")
         auth_raw = _read_private_file(config_dir / "auth.json", installer.MAX_CONFIG_SIZE, missing_ok=True)
         if auth_raw is not None:
-            auth_bytes = _validate_auth(auth_raw)
+            _validate_auth(auth_raw)
         login_raw = _read_private_file(config_dir / "login.json", installer.MAX_CONFIG_SIZE, missing_ok=True)
         if login_raw is not None:
             login_bytes = _validate_login(login_raw)
@@ -447,7 +452,6 @@ def inspect_backup(path: str | os.PathLike[str], target_root: str | os.PathLike[
         mount_settings=mount_settings,
         vault_config_path=vault_config_path,
         vault_settings=vault_settings,
-        auth_bytes=auth_bytes,
         login_bytes=login_bytes,
         cache_path=cache_path if cache_exists else None,
         cache_has_data=cache_has_data,
@@ -465,7 +469,6 @@ def _same_inspection(left: Backup, right: Backup) -> bool:
         and left.mount_settings == right.mount_settings
         and left.vault_config_path == right.vault_config_path
         and left.vault_settings == right.vault_settings
-        and left.auth_bytes == right.auth_bytes
         and left.login_bytes == right.login_bytes
         and left.cache_path == right.cache_path
         and left.cache_has_data == right.cache_has_data
@@ -811,7 +814,7 @@ def _restore_cache_binding(backup: Backup, root: Path) -> None:
 
 
 def restore_to_install(backup: Backup, root: str | os.PathLike[str]) -> None:
-    """Restore saved login state and, when present, rebind a cache into a fresh install."""
+    """Restore vault settings and cache data without account authentication tokens."""
     target = _absolute_path(root, "install root")
     try:
         common = os.path.commonpath((str(backup.directory), str(target)))
@@ -845,15 +848,29 @@ def _restore_to_install_locked(backup: Backup, target: Path) -> None:
     _check_directory(config_dir, private=True)
     _check_directory(cache_dir, private=True)
 
-    if backup.vault_settings is not None:
-        target_vault_bytes = _read_private_file(config_dir / "vault.json", installer.MAX_CONFIG_SIZE)
-        assert target_vault_bytes is not None
+    target_vault_bytes = _read_private_file(config_dir / "vault.json", installer.MAX_CONFIG_SIZE, missing_ok=True)
+    if target_vault_bytes is not None:
         try:
             target_vault, _ = installer.read_vault(target_vault_bytes, target, imported=False)
         except installer.InstallError:
             raise RestoreError("the staged vault configuration is invalid") from None
-        if target_vault != backup.vault_settings:
+        if target_vault.pop("account_credentials", None) is not None:
+            try:
+                installer.write_private_file(
+                    config_dir / "vault.json",
+                    (json.dumps(target_vault, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                    replace=True,
+                )
+            except installer.InstallError:
+                raise RestoreError("saved account credentials could not be removed from the staged vault") from None
+        if backup.vault_settings is not None and target_vault != backup.vault_settings:
             raise RestoreError("the staged vault configuration does not match the selected backup")
+    elif backup.vault_settings is not None:
+        raise RestoreError("the staged vault configuration is missing")
+
+    target_auth = _read_private_file(config_dir / "auth.json", installer.MAX_CONFIG_SIZE, missing_ok=True)
+    if target_auth is not None:
+        raise RestoreError("account authentication is present in the new install; clear it and sign in again after restoring")
     if backup.folder_id:
         target_rclone_bytes = _read_private_file(config_dir / "rclone.conf", installer.MAX_CONFIG_SIZE)
         assert target_rclone_bytes is not None
@@ -863,14 +880,12 @@ def _restore_to_install_locked(backup: Backup, target: Path) -> None:
             raise RestoreError("the staged Degoo remote config does not match this install") from None
 
     destinations: list[tuple[Path, bytes]] = []
-    if backup.auth_bytes is not None:
-        destinations.append((config_dir / "auth.json", backup.auth_bytes))
     if backup.login_bytes is not None:
         destinations.append((config_dir / "login.json", backup.login_bytes))
-    missing_account_files: list[tuple[Path, bytes]] = []
+    missing_login_files: list[tuple[Path, bytes]] = []
     for path, data in destinations:
         if not os.path.lexists(path):
-            missing_account_files.append((path, data))
+            missing_login_files.append((path, data))
             continue
         existing = _read_private_file(path, installer.MAX_CONFIG_SIZE)
         if existing != data:
@@ -884,10 +899,10 @@ def _restore_to_install_locked(backup: Backup, target: Path) -> None:
             raise RestoreError("refusing to merge retained data into a nonempty install cache")
 
     try:
-        for path, data in missing_account_files:
+        for path, data in missing_login_files:
             installer.write_private_file(path, data)
     except installer.InstallError:
-        raise RestoreError("saved account state could not be restored safely") from None
+        raise RestoreError("saved account email could not be restored safely") from None
 
     if not backup.cache_has_data:
         return

@@ -15,10 +15,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rclone/rclone/backend/degoo/api"
+	"github.com/rclone/rclone/backend/degoo/auth"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/object"
@@ -395,6 +397,82 @@ func newTestFsAtRootID(t *testing.T, mock *mockDegoo, root, rootID string, extra
 	}
 	f, err := NewFs(context.Background(), "test", root, options)
 	return f, server, err
+}
+
+func TestNewFsUsesEncryptedAccountCredentialsAfterRefreshRejection(t *testing.T) {
+	const (
+		email    = "vault-user@example.test"
+		password = "account-password"
+	)
+	mock := newMockDegoo()
+	var loginCalls, refreshCalls atomic.Int32
+	newTokenClaims := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix())))
+	newToken := "header." + newTokenClaims + ".signature"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/login":
+			loginCalls.Add(1)
+			var input map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Errorf("decode login request: %v", err)
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if input["Username"] != email || input["Password"] != password {
+				t.Errorf("login received unexpected account credentials")
+				writer.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			writeTestJSON(writer, map[string]string{"RefreshToken": "new-refresh-token"})
+		case "/access-token/v2":
+			refreshCalls.Add(1)
+			var input map[string]string
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Errorf("decode token request: %v", err)
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if input["RefreshToken"] != "new-refresh-token" {
+				writer.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			writeTestJSON(writer, map[string]string{"Token": newToken, "RefreshToken": "new-refresh-token"})
+		default:
+			mock.ServeHTTP(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	authDir := t.TempDir()
+	if err := os.Chmod(authDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authPath := path.Join(authDir, "auth.json")
+	vaultPath := path.Join(authDir, "vault.json")
+	expiredClaims := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(-time.Hour).Unix())))
+	if err := auth.WritePrivateFile(authPath, []byte(fmt.Sprintf(`{"token":%q,"refresh_token":"expired-refresh-token"}`, "header."+expiredClaims+".signature"))); err != nil {
+		t.Fatal(err)
+	}
+	vaultJSON := []byte(`{"version":1,"remote":"test:","password":"separate-vault-password","cache_dir":"/tmp/degoo-test-cache"}`)
+	if err := auth.WritePrivateFile(vaultPath, vaultJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.SaveCredentials(vaultPath, email, password); err != nil {
+		t.Fatal(err)
+	}
+	options := configmap.Simple{
+		"auth_file": authPath, "credentials_file": vaultPath, "root_folder_id": "vault", "api_key": "test-key",
+		"api_url": server.URL, "rest_url": server.URL,
+	}
+	if _, err := NewFs(context.Background(), "test", "", options); err != nil {
+		t.Fatalf("NewFs: %v", err)
+	}
+	if loginCalls.Load() != 1 {
+		t.Fatalf("account login calls = %d, want 1", loginCalls.Load())
+	}
+	if refreshCalls.Load() < 2 {
+		t.Fatalf("token refresh calls = %d, want rejected refresh and login exchange", refreshCalls.Load())
+	}
 }
 
 func TestUploadAndReplacementKeepPreviousDataUntilCommit(t *testing.T) {
