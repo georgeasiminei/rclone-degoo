@@ -331,6 +331,14 @@ mounted write path through VFS completion; that state is not an independent
 cloud integrity check. A timeout or other failure leaves the benchmark file
 available for inspection with `degoo-rc status` and `degoo-rc logs`.
 
+A writeback can change the modification time shown by the mount without changing
+the file contents. If only that timestamp changed, the write benchmark checks
+that the file still contains the generated zero data before reporting success
+or deleting it. This local content check is excluded from the reported throughput
+time but uses the same total timeout. Replaced files, changed sizes, nonzero data,
+and changes during the check cause refusal and preserve the file. Reads continue
+to refuse cleanup when their source timestamp changes.
+
 ## Account trash
 
 The trash commands are account-wide and take the private account-auth file

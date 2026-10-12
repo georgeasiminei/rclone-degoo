@@ -88,6 +88,35 @@ def wait_for_upload(path: Path, timeout: float, poll_interval: float, started: f
         time.sleep(min(poll_interval, remaining))
 
 
+def verify_written_data(path: Path, identity: os.stat_result, started: float, timeout: float) -> None:
+    """Confirm generated zero data when writeback changes the reported timestamp."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino, current.st_size)
+            != (identity.st_dev, identity.st_ino, identity.st_size)
+        ):
+            raise BenchmarkError("the benchmark file changed during the test; cleanup refused")
+        zeros = bytes(1024 * 1024)
+        remaining = identity.st_size
+        while remaining:
+            if time.monotonic() - started >= timeout:
+                raise BenchmarkError("content check timed out; file preserved")
+            data = os.read(descriptor, min(remaining, len(zeros)))
+            if not data or data != zeros[:len(data)]:
+                raise BenchmarkError("the benchmark file changed during the test; cleanup refused")
+            remaining -= len(data)
+        if time.monotonic() - started >= timeout:
+            raise BenchmarkError("content check timed out; file preserved")
+        after = os.fstat(descriptor)
+        if (after.st_size, after.st_mtime_ns) != (current.st_size, current.st_mtime_ns):
+            raise BenchmarkError("the benchmark file changed during the content check; cleanup refused")
+    finally:
+        os.close(descriptor)
+
+
 def run(args: argparse.Namespace) -> int:
     """Benchmark a regular mounted file, preserving it on failure."""
     mountpoint = local_sync._validate_install(Path(args.root)).resolve(strict=True)
@@ -141,11 +170,24 @@ def run(args: argparse.Namespace) -> int:
         raise BenchmarkError("could not measure elapsed time; file preserved")
     current = path.lstat()
     if (
-        (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
-        != (identity.st_dev, identity.st_ino, identity.st_size, identity.st_mtime_ns)
+        (current.st_dev, current.st_ino, current.st_size)
+        != (identity.st_dev, identity.st_ino, identity.st_size)
         or not stat.S_ISREG(current.st_mode)
     ):
         raise BenchmarkError("the benchmark file changed during the test; cleanup refused")
+    if current.st_mtime_ns != identity.st_mtime_ns:
+        if args.mode != "write":
+            raise BenchmarkError("the benchmark file changed during the test; cleanup refused")
+        # FUSE/cache close and upload can change mtime without changing the data.
+        print("Writeback timestamp changed; checking generated zero data (excluded from throughput timing)...", flush=True)
+        verify_written_data(path, identity, started, args.timeout)
+        after = path.lstat()
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+            or not stat.S_ISREG(after.st_mode)
+        ):
+            raise BenchmarkError("the benchmark file changed during the content check; cleanup refused")
     print(f"Elapsed: {elapsed:.3f} seconds\nAverage speed: {size / elapsed / 1_000_000:.2f} MB/s", flush=True)
     if args.mode == "write":
         print("Includes local write, fsync, close, writeback delay, and VFS upload completion; no independent cloud integrity check.")

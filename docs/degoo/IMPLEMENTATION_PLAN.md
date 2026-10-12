@@ -160,6 +160,15 @@ while `--no-delete` retains it and failures preserve it. A read may still come
 from rclone's disk cache, and VFS `uploaded` state is not an independent cloud
 integrity proof. Detailed options and examples are in [USAGE.md](USAGE.md).
 
+Write cleanup checks the original device, inode, type, and logical size. The
+pre-close timestamp may differ from the post-upload timestamp because FUSE,
+the VFS cache, and Degoo do not provide a stable modification-time version
+identifier. When only this timestamp differs, the benchmark validates the
+generated zero data locally before accepting success. This preserves detection
+of same-size content edits without rejecting normal writeback. Validation is
+outside throughput timing, within the total timeout, and does not establish
+independent remote integrity. Read cleanup retains its timestamp comparison.
+
 Registration recovery performs bounded metadata reads against the same
 temporary object without replaying the mutation. Missing, null, or lost
 acknowledgements receive a twenty-second visibility window; negative boolean

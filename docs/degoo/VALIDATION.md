@@ -806,3 +806,31 @@ is a proposal and is not implemented by this change.
 The local client was upgraded with its existing configuration and cache
 contents verified unchanged. Its service remains stopped pending the first
 interactive login with the updated client.
+
+## Benchmark cleanup after writeback timestamp changes
+
+Offline checks on 2026-10-12 passed:
+
+- A generated 8 MiB write through a native Linux FUSE mount reproduced the
+  cleanup refusal with the benchmark from `staging`. The backing stack was
+  chunker over crypt over a temporary local directory, with 1 MiB chunks,
+  `norename` transactions, full VFS caching, a two-second writeback delay,
+  upload-status attributes, and a 100 ms attribute timeout. Device, inode,
+  and logical size stayed unchanged; the post-upload modification time differed
+  from the pre-close stat. The fixed benchmark completed, verified zero data,
+  and deleted the file. This check contacted no Degoo endpoint.
+- All 325 Python helper tests passed, including 24 benchmark tests. Regression
+  cases cover timestamp-only drift with deletion and retention, same-size
+  edits, replacements, read timestamp changes, partial verification blocks,
+  nonzero tail data, premature EOF, changes during verification, symlinks,
+  and timeout preservation, including expiry during the final read.
+- `go build` and the full offline `make quicktest BRANCH=degoo-benchmark`
+  passed. The newly built executable was available on a temporary PATH; the
+  host's FUSE 2 helper was exposed there as `fusermount3` for existing tests.
+- The package self-check, changed-document Markdown lint, and
+  `git diff --check` passed.
+
+The conditional mounted content check happens after sampling write throughput
+and uses the original total deadline. It confirms generated data through the
+mounted view; it is not an independent cloud integrity audit. No live Degoo
+throughput benchmark or modification of the user's installed mount was made.
