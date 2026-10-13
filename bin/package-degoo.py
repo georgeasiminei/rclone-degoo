@@ -53,7 +53,7 @@ SHELL_LAUNCHERS = (
 )
 CLI_COMMANDS = (
     "install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "mount", "stop", "status", "update",
-    "location", "folders", "service", "info", "logs", "trash", "empty-trash",
+    "location", "folders", "service", "info", "logs", "trash", "empty-trash", "completion",
 )
 PACKAGE_ENTRIES = (
     ("contrib/degoo/degoo-rc", "degoo-rc"),

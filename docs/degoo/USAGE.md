@@ -31,17 +31,42 @@ only when it still points to this install. A fresh installed root has
 checkout and the extracted archive use `degoo-rc` as their sole installer and
 maintenance entrypoint. Examples here use `degoo-rc`.
 
-The command set is `install`, `uninstall`, `backup-config`, `login`, `setup`,
+The command set is `install`, `update`, `uninstall`, `backup-config`, `login`, `setup`,
 `mount`, `stop`, `status`, `benchmark`, `sync`, `location`, `folders`,
-`service`, `info`, `logs`, `trash`, and `empty-trash`. Service actions are
-`enable`, `disable`, `start`, `stop`, `restart`, and `status`. Existing command
-options remain available. `trash` lists account trash; `empty-trash`
+`service`, `info`, `logs`, `trash`, `empty-trash`, and `completion`.
+Service actions are `enable`, `disable`, `start`, `stop`, `restart`, and `status`.
+Existing command options remain available. `trash` lists account trash; `empty-trash`
 separately performs account-wide deletion.
 
 For the recommended contained installer, persistent user service, cached-email
 login, mount settings, and complete local cleanup, see
 [INSTALLATION.md](INSTALLATION.md). The manual steps below are an alternative
 for users who manage their own paths and services.
+
+## Tab completion in Bash
+
+Enable completion in the current terminal:
+
+```sh
+source <(degoo-rc completion bash)
+```
+
+Type `degoo-rc up` and press Tab to complete `update`. Type `degoo-rc u`
+and press Tab twice to list `update` and `uninstall`. Completion also suggests
+service actions, benchmark modes, and command names after `degoo-rc help`.
+Other arguments keep Bash's normal completion, including local file paths.
+
+For new terminals, add this line to `~/.bashrc`:
+
+```sh
+if command -v degoo-rc >/dev/null 2>&1; then source <(degoo-rc completion bash); fi
+```
+
+The installer does not edit your shell profile. The guard makes the line harmless
+after uninstall; you can remove it yourself. This command supports Bash only.
+Completion lists come from the client when sourced; open a new terminal or run
+the `source` command again after updating. From a source checkout, use
+`source <(./contrib/degoo/degoo-rc completion bash)` instead.
 
 ## Setup
 

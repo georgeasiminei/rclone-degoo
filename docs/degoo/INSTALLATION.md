@@ -477,6 +477,10 @@ entrypoint.
 Runtime Python bytecode and temporary upload files stay contained or are
 disabled.
 
+For Bash Tab completion, run `source <(degoo-rc completion bash)` in your
+terminal. See [Tab completion](USAGE.md#tab-completion-in-bash) for examples
+and the optional `~/.bashrc` line to enable it in new terminals.
+
 ## Login, mount, and recovery
 
 The wizard finishes with a summary of the install directory, mount location,
