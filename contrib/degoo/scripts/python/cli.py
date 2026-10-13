@@ -34,6 +34,7 @@ COMMANDS = {
     "logs": "View recent command logs and account-authentication status or follow new messages with credentials redacted.",
     "trash": "List account-wide trash without deleting anything.",
     "empty-trash": "Permanently delete all account trash after confirmation; supports dry-run.",
+    "completion": "Print a shell completion script for command names and subcommands.",
 }
 PYTHON_COMMANDS = {"install", "update", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "service", "info", "logs", "status", "mount-setup"}
 DETAILS = {
@@ -81,7 +82,15 @@ def show_help(command: str | None = None) -> int:
         print("\nUse degoo-rc help COMMAND or degoo-rc COMMAND help for parameters and details.")
         return 0
     print(f"{COMMANDS[command]}\n", flush=True)
-    if command in PYTHON_COMMANDS:
+    if command == "completion":
+        print("Usage: degoo-rc completion bash\n\n"
+              "Enable Tab completion in the current Bash session:\n"
+              "  source <(degoo-rc completion bash)\n\n"
+              "To enable it in new terminals, add this line to ~/.bashrc:\n"
+              "  if command -v degoo-rc >/dev/null 2>&1; then source <(degoo-rc completion bash); fi\n\n"
+              "Completes command names, service actions, benchmark modes, and help topics.\n"
+              "Other arguments use the shell's normal completion, including local paths.")
+    elif command in PYTHON_COMMANDS:
         module = importlib.import_module(command.replace("-", "_"))
         parser = module.build_parser()
         parser.prog = f"degoo-rc {command}"
@@ -131,6 +140,40 @@ def show_help(command: str | None = None) -> int:
     return 0
 
 
+def show_completion(parameters: list[str]) -> int:
+    """Print Bash completion without reading installation or account state."""
+    if parameters != ["bash"]:
+        print("Usage: degoo-rc completion bash (supported shell: bash)", file=sys.stderr)
+        return 2
+    commands = " ".join((*COMMANDS, "help"))
+    script = r'''# Bash completion for degoo-rc. Source this script in an interactive shell.
+_degoo_rc()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}" choices='' match
+    COMPREPLY=()
+    if (( COMP_CWORD == 1 )); then
+        choices='@COMMANDS@'
+    elif (( COMP_CWORD == 2 )); then
+        case "${COMP_WORDS[1]}" in
+            help) choices='@HELP_TOPICS@' ;;
+            service) choices='enable disable start stop restart status' ;;
+            benchmark) choices='read write' ;;
+            completion) choices='bash' ;;
+        esac
+    fi
+    if [[ -n "$choices" ]]; then
+        while IFS= read -r match; do
+            COMPREPLY+=("$match")
+        done < <(compgen -W "$choices" -- "$current")
+    fi
+    return 0
+}
+complete -o bashdefault -o default -F _degoo_rc degoo-rc
+'''
+    print(script.replace("@COMMANDS@", commands).replace("@HELP_TOPICS@", " ".join(COMMANDS)), end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args == ["help"] or args in (["--help"], ["-h"]):
@@ -151,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
         return module.main([parameters[0], "--help"])
     if parameters == ["help"] or "--help" in parameters or "-h" in parameters:
         return show_help(command)
+    if command == "completion":
+        return show_completion(parameters)
     if command == "mount-setup":
         module = importlib.import_module("mount_setup")
         return module.main(["--root", str(BASE), *parameters])

@@ -8,6 +8,31 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Bash command completion — 2026-10-13
+
+`degoo-rc completion bash` generates completion for command names, help topics,
+service actions, and benchmark modes. It leaves normal filename completion
+available for other arguments. Activation is an explicit `source` command;
+shell profiles and customer installations were not changed during validation.
+
+Validation passed:
+
+- Seven completion regressions, including the installed PATH launcher,
+  help and invalid-shell handling, command candidates, and filename fallback.
+- Interactive Bash in an isolated home: `up` plus Tab completed `update`,
+  `u` plus two Tabs listed `update` and `uninstall`, and a local filename
+  containing spaces completed correctly.
+- The full Python helper suite, a fresh Go build, and the full offline Go
+  suite with `RCLONE_CONFIG=/notfound`. The first Go run picked up an older
+  system rclone lacking `test makefiles`; the archive test and full suite
+  passed with the freshly built binary on `PATH`.
+- Package self-check and a real archive build, including completion help
+  verification, changed Python and generated Bash syntax checks, scoped
+  Markdown lint, and `git diff --check`.
+
+Other shells are unsupported by this completion command. No Degoo network
+access or vault operation was needed for these checks.
+
 ## Unattended client updates — 2026-10-13
 
 `degoo-rc update` now resolves the latest successful staging package, verifies

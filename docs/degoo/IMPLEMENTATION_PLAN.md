@@ -22,6 +22,18 @@ encrypted data. This does not establish live Degoo provider behavior.
 
 ## Implementation decisions and validation plan
 
+### Bash command completion
+
+`degoo-rc completion bash` prints a script sourced with
+`source <(degoo-rc completion bash)`. It derives command names from the CLI's
+registry and completes service actions, benchmark modes, and help topics.
+Further arguments retain Bash's normal completion, including local paths.
+Completion generation reads no account or vault state and requires neither
+an installed binary nor the `bash-completion` package. Users can add a guarded
+source line to `~/.bashrc`; the installer continues to leave shell profiles
+untouched. Opening a new terminal or sourcing again refreshes suggestions
+after an update. Other shells are outside this change's scope.
+
 ### Verified unattended package updates
 
 The contained Linux amd64 client provides `degoo-rc update`. Its current
