@@ -565,11 +565,14 @@ mount settings, and cache; it refuses a change to the folder ID.
 
 ### Update the installed client
 
-On Linux amd64, `degoo-rc update` downloads the latest successful
-`degoo-package.yml` artifact from the fork's `staging` branch. The updater uses
-the authenticated GitHub CLI (`gh`); install it and run `gh auth login` if the
-command is unavailable or unauthenticated. A local package can be used instead
-with `--archive PATH`; `PATH` must name the `.tar.gz` file with its matching
+On Linux amd64, `degoo-rc update` checks the latest successful
+`degoo-package.yml` run on the fork's `staging` branch. The workflow publishes
+two artifacts: the small `rclone-degoo-linux-amd64-update` artifact, containing
+the archive's SHA-256 sidecar and `.tar.gz.update.json` manifest, and the full
+`rclone-degoo-linux-amd64` archive artifact. The updater uses the authenticated
+GitHub CLI (`gh`); install it and run `gh auth login` if the command is
+unavailable or unauthenticated. A local package can be used instead with
+`--archive PATH`; `PATH` must name the `.tar.gz` file with its matching
 `.tar.gz.sha256` sidecar next to it. This local path does not use GitHub or
 `gh`. A systemd user manager is needed only when the updater inspects or
 controls a service owned by this installation; manual mounts and installs with
@@ -582,6 +585,44 @@ degoo-rc update --delete-cache
 degoo-rc update --writer-timeout 2m
 degoo-rc update --wait-for-uploads 1h
 ```
+
+The updater first downloads the small metadata artifact and hashes the
+currently installed binary and managed helper files directly. It does not
+depend on the saved `install.json` build identity for this comparison. When
+the payload hash matches, it reports that the client is current without
+downloading the large archive or changing the service, configuration, or
+cache. If the payload differs, it checks that the manifest names the expected
+archive and that its checksum sidecar agrees, then downloads the full archive.
+It verifies the archive's checksum and size, its binary and payload hashes,
+and its clean source commit against both the manifest and workflow run before
+installing. Invalid metadata stops the update without falling back to the full
+download. If an older or expired workflow run has no metadata artifact, the
+updater says so and downloads the full archive for the legacy comparison and
+verification path.
+
+The command prints a message as it enters each update phase, including build
+lookup, metadata download and comparison, archive download when needed,
+package verification, mount preparation, and installation. If a phase runs for
+more than ten seconds, it prints an elapsed-time update every ten seconds; it
+does not show estimated percentages.
+
+When an update would change an active mount, run it from outside the configured
+mount directory. The updater checks the working directory of itself and its
+calling shell before preparing the mount; with the small metadata artifact,
+this check also happens before downloading the full archive. An already-current
+client remains a no-op even when invoked from inside the mount. A child command
+cannot change the working directory of the shell that launched it, so if the
+command reports that the shell is inside the mount, use the parent path it
+prints in that same shell, then retry. For the default `/mnt/degoo` mount:
+
+```sh
+cd /mnt
+degoo-rc update
+```
+
+The updater does not prompt to change directories or force an unmount. It uses
+a normal FUSE unmount and leaves a busy mount running for you to retry after
+closing files and changing to a directory outside the mount.
 
 Before stopping a mounted vault, the updater asks the running client to prepare
 for maintenance. New opens and file or directory changes are briefly refused

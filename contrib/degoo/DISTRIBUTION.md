@@ -302,6 +302,39 @@ degoo-rc update --wait-for-uploads 1h
 The local archive option does not use GitHub or `gh`. A systemd user manager
 is needed only to inspect or control a service owned by this installation;
 manual mounts and installs with no owned service links do not require systemd.
+
+For Actions updates, the workflow publishes a small
+`rclone-degoo-linux-amd64-update` artifact containing the archive's checksum
+sidecar and `.tar.gz.update.json` manifest. The updater downloads this first
+and hashes the installed binary and managed helper files directly, without
+using the saved install manifest as its comparison source. When they match,
+the full archive is not downloaded and the update leaves the service and cache
+alone. When they differ, the updater downloads the existing full archive and
+checks its name, size, checksum, binary hash, payload hash, and clean commit
+against the small manifest and workflow run. Invalid metadata stops the update.
+If an older or expired run has no metadata artifact, the updater reports that
+it is using the full-archive fallback; missing metadata is supported, while
+malformed metadata is not.
+
+During a long phase, the command prints elapsed time every ten seconds. It
+reports phase names instead of estimated percentages. If an update would
+change an active mount, run it outside the mount. With lightweight metadata,
+the updater checks its own and its calling shell's working directories before
+downloading the full archive; it also checks before preparing the mount. An
+already-current update remains a no-op from inside the mount. Since a child
+command cannot change the parent shell's working directory, use the parent
+directory named in the error in that same shell, then retry. For the default
+`/mnt/degoo` mount:
+
+```sh
+cd /mnt
+degoo-rc update
+```
+
+The update command does not prompt to change directories or force a busy
+unmount. It uses a normal unmount and asks you to retry after closing open files
+and moving outside the mount.
+
 Before stopping an owned mount, the updater verifies the archive checksum and
 binary hash in `docs/BUILD.json`. For an Actions download, it also matches the
 source commit against the workflow run. It compares the installed binary and
