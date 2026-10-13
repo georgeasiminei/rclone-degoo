@@ -33,6 +33,51 @@ Validation passed:
 Other shells are unsupported by this completion command. No Degoo network
 access or vault operation was needed for these checks.
 
+## Lightweight update checks and directory preflight — 2026-10-13
+
+The packaging workflow publishes a separate small update artifact containing
+the archive checksum and a manifest with archive size, binary and managed
+payload hashes, and source provenance. The updater checks those fields and
+hashes installed program files directly before downloading the archive. A
+matching payload skips the large download and all runtime changes; different
+payloads are bound to the manifest again after full archive verification.
+Missing metadata uses the visible legacy comparison path, while invalid
+metadata refuses the update. Slow phases report elapsed time every ten seconds.
+
+For actual changes to an active mount, the updater detects a working directory
+inside the mount before preparation; metadata preflight also checks it before
+the full download. It checks the current process, inherited shell directory,
+and accessible same-owner ancestors. It prints a shell-quoted `cd` command for
+the invoking shell, whose directory a child process cannot change. Permission
+restrictions can limit ancestor inspection; normal unmount still refuses busy
+mounts. No-op updates remain valid from within the mount.
+
+Validation passed:
+
+- All 386 Python helper tests, including metadata-only downloads, legacy
+  fallback, malformed metadata rejection, manifest/archive binding, progress
+  reporting, directory preflight before preparation, and no-op behavior.
+- Eight directory-helper tests cover aliases, subdirectories, sibling paths,
+  deleted cwd links, bounded ancestry, and a real subprocess whose parent keeps
+  its directory while the child moves outside it. All paths are disposable.
+- Packager self-checks verify the generated manifest against finalized archive
+  bytes and an independent payload hash, rejected-build output preservation,
+  staged installation, and repeatable archive/checksum/manifest outputs.
+- A real-binary archive install/update roundtrip in a disposable home preserved
+  configuration and pending-cache fixture bytes. Changing an installed helper
+  was detected despite an unchanged saved build identity. A mocked GitHub
+  metadata download using the generated hashes then skipped the archive and
+  preserved the complete installation snapshot, including with `--delete-cache`.
+  Clean commit provenance for that mock was a generated fixture, not a claim
+  that the uncommitted build came from staging.
+- A fresh Go build, `make quicktest`, changed-document Markdown lint, and
+  `git diff --check`. The Go suite used an isolated VFS cache with the fresh
+  executable and a temporary alias to the installed FUSE 2 helper on `PATH`.
+
+The new separate artifact cannot be tested against a staging workflow run until
+this change is merged and packaged. Workflow artifact paths were inspected;
+`actionlint` was unavailable. No customer mount or Degoo account was used.
+
 ## Unattended client updates — 2026-10-13
 
 `degoo-rc update` now resolves the latest successful staging package, verifies

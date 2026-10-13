@@ -258,6 +258,48 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(pending.read_bytes(), b"generated")
         self.assertFalse((self.root / "tmp/update.lock").exists())
 
+    def test_mounted_cwd_conflict_returns_cd_advice_before_preparation(self):
+        import os
+        from unittest import mock
+        self.write_binary("new")
+        self.package()
+        mountpoint = self.root / "mount"
+        original = os.getcwd()
+        state = {"service_active": False, "service_owned": False, "manual_arguments": ["owned"],
+                 "manual_directory": str(self.home), "mounted": True}
+        try:
+            os.chdir(mountpoint)
+            with mock.patch.object(update, "runtime_state", return_value=state), \
+                    mock.patch.object(update.wizard, "_mounted_state", return_value="mounted"), \
+                    mock.patch.object(update, "prepare_mount_for_update") as prepare, \
+                    mock.patch.object(update, "stop_runtime") as stop:
+                code, output, error = self.invoke()
+        finally:
+            os.chdir(original)
+        self.assertEqual(code, 2)
+        self.assertIn("caller shell or updater is inside", error)
+        self.assertIn("cd '", error, "spaces in the safe parent directory must be shell quoted")
+        self.assertIn("degoo-rc update", error)
+        prepare.assert_not_called()
+        stop.assert_not_called()
+        self.assertNotIn("Unmounting", output)
+        self.assertFalse((self.root / "tmp/update-backup").exists())
+
+    def test_identical_package_is_allowed_from_mount_cwd(self):
+        import os
+        from unittest import mock
+        self.package()
+        original = os.getcwd()
+        try:
+            os.chdir(self.root / "mount")
+            with mock.patch.object(update, "preflight_mount_directory") as guard:
+                code, output, error = self.invoke("--delete-cache")
+        finally:
+            os.chdir(original)
+        self.assertEqual(code, 0, error)
+        self.assertIn("Already up to date", output)
+        guard.assert_not_called()
+
     def test_installer_failure_restores_program_and_restart_is_attempted(self):
         from unittest import mock
         self.write_binary("new")
@@ -395,6 +437,7 @@ class UpdateTest(unittest.TestCase):
         token = "c" * 64
         with mock.patch.object(update, "runtime_state", return_value=state), \
                 mock.patch.object(update.wizard, "_mount_preflight", return_value=[]), \
+                mock.patch.object(update, "preflight_mount_directory"), \
                 mock.patch.object(update, "prepare_mount_for_update", return_value=(Path("/private/sock"), token)), \
                 mock.patch.object(update, "renew_mount_preparation") as renew, \
                 mock.patch.object(update, "stop_runtime", side_effect=update.UpdateError("busy unmount")), \
@@ -518,18 +561,98 @@ class UpdateTest(unittest.TestCase):
 
 
 class ActionsSourceTest(unittest.TestCase):
+    def setUp(self):
+        self.run = {"id": 42, "head_branch": "staging", "head_sha": "a" * 40,
+                    "status": "completed", "conclusion": "success"}
+        self.manifest = {"version": 1, "archive": update.ARCHIVE_NAME, "archive_sha256": "b" * 64,
+                         "archive_size": 123, "binary_sha256": "c" * 64, "payload_sha256": "d" * 64,
+                         "commit": "a" * 40, "source_dirty": False}
+
+    def gh_response(self, arguments, **kwargs):
+        if arguments[0] == "api":
+            if "/workflows/" in arguments[1]:
+                return json.dumps({"workflow_runs": [self.run]}).encode()
+            return json.dumps({"artifacts": [{"name": update.UPDATE_ARTIFACT_NAME, "expired": False}]}).encode()
+        target = Path(arguments[-1])
+        if update.UPDATE_ARTIFACT_NAME in arguments:
+            (target / update.UPDATE_MANIFEST_NAME).write_text(json.dumps(self.manifest))
+            (target / (update.ARCHIVE_NAME + ".sha256")).write_text(f"{'b' * 64}  {update.ARCHIVE_NAME}\n")
+        else:
+            (target / update.ARCHIVE_NAME).write_bytes(b"generated")
+        return b""
+
+    def test_matching_manifest_skips_large_archive_and_runtime_preflight(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(update.ActionsSource, "_run", side_effect=self.gh_response) as gh, \
+                mock.patch.object(update, "installed_matches", return_value=True) as compare, \
+                mock.patch.object(update, "preflight_mount_directory") as preflight:
+            archive, source = update.ActionsSource().download(Path(temporary), installed_root=Path("/installed"))
+        self.assertIsNone(archive)
+        self.assertEqual(source["run_id"], 42)
+        compare.assert_called_once_with(Path("/installed"), self.manifest)
+        self.assertEqual(gh.call_count, 3)
+        self.assertIn(update.UPDATE_ARTIFACT_NAME, gh.call_args_list[-1].args[0])
+        preflight.assert_not_called()
+
+    def test_changed_manifest_checks_cwd_before_downloading_archive(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(update.ActionsSource, "_run", side_effect=self.gh_response) as gh, \
+                mock.patch.object(update, "installed_matches", return_value=False), \
+                mock.patch.object(update.installer, "load_manifest", return_value={}), \
+                mock.patch.object(update, "preflight_mount_directory", side_effect=update.UpdateError("cd /mnt")):
+            with self.assertRaisesRegex(update.UpdateError, "cd /mnt"):
+                update.ActionsSource().download(Path(temporary), installed_root=Path("/installed"))
+        self.assertEqual(gh.call_count, 3, "archive download must not happen before cwd conflict is resolved")
+
+    def test_invalid_manifest_never_falls_back_to_large_archive(self):
+        from unittest import mock
+        for key, value in [("commit", "f" * 40), ("source_dirty", True), ("archive", "other.tar.gz"),
+                           ("payload_sha256", "invalid"), ("archive_size", True), ("version", True),
+                           ("archive_sha256", "e" * 64), ("extra", "field")]:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                saved = dict(self.manifest)
+                self.manifest[key] = value
+                with mock.patch.object(update.ActionsSource, "_run", side_effect=self.gh_response) as gh:
+                    with self.assertRaisesRegex(update.UpdateError, "manifest or checksum is invalid"):
+                        update.ActionsSource().download(Path(temporary))
+                self.assertEqual(gh.call_count, 3)
+                self.manifest = saved
+
+    def test_changed_manifest_downloads_full_artifact_and_binds_payload(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(update.ActionsSource, "_run", side_effect=self.gh_response) as gh, \
+                mock.patch.object(update, "installed_matches", return_value=False), \
+                mock.patch.object(update.installer, "load_manifest", return_value={}), \
+                mock.patch.object(update, "preflight_mount_directory"):
+            source = update.ActionsSource()
+            archive, provenance = source.download(Path(temporary), installed_root=Path("/installed"))
+            self.assertEqual(gh.call_count, 4)
+            self.assertIn(update.ARTIFACT_NAME, gh.call_args.args[0])
+            self.assertEqual(provenance["commit"], self.run["head_sha"])
+            source.manifest["archive_size"] = archive.stat().st_size
+            source.verify_package(self.manifest, self.manifest["archive_sha256"], archive)
+            for key in ("binary_sha256", "payload_sha256", "commit"):
+                changed = dict(self.manifest, **{key: "f" * 64})
+                with self.subTest(key=key), self.assertRaisesRegex(update.UpdateError, "does not match"):
+                    source.verify_package(changed, self.manifest["archive_sha256"], archive)
+            with self.assertRaisesRegex(update.UpdateError, "does not match"):
+                source.verify_package(self.manifest, "f" * 64, archive)
+
     def test_filtered_workflow_lookup_and_pinned_download(self):
         from unittest import mock
         run = {"id": 42, "head_branch": "staging", "head_sha": "a" * 40, "status": "completed", "conclusion": "success"}
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary)
             (target / update.ARCHIVE_NAME).write_bytes(b"generated")
-            with mock.patch.object(update.ActionsSource, "_run", side_effect=[json.dumps({"workflow_runs": [run]}).encode(), b""]) as gh:
+            with mock.patch.object(update.ActionsSource, "_run", side_effect=[json.dumps({"workflow_runs": [run]}).encode(), b'{"artifacts":[]}', b""]) as gh:
                 archive, source = update.ActionsSource().download(target)
             self.assertEqual(archive, target / update.ARCHIVE_NAME)
             self.assertEqual(source["run_id"], 42)
             self.assertIn("branch=staging&status=success&per_page=1", gh.call_args_list[0].args[0][1])
-            self.assertEqual(gh.call_args_list[1].args[0][:3], ["run", "download", "42"])
+            self.assertEqual(gh.call_args_list[2].args[0][:3], ["run", "download", "42"])
 
     def test_absent_or_invalid_run_fails_before_download(self):
         from unittest import mock
@@ -538,6 +661,26 @@ class ActionsSourceTest(unittest.TestCase):
                 with self.assertRaises(update.UpdateError):
                     update.ActionsSource().download(Path("/unused"))
                 gh.assert_called_once()
+
+
+class ProgressTest(unittest.TestCase):
+    def test_slow_phase_reports_elapsed_time_and_stops_reporting_after_exit(self):
+        import threading
+        from unittest import mock
+        emitted = threading.Event()
+        lines = []
+
+        def record(message, **kwargs):
+            lines.append(message)
+            emitted.set()
+
+        with mock.patch("builtins.print", side_effect=record):
+            with update.progress("Downloading archive", interval=0.005):
+                self.assertTrue(emitted.wait(1))
+            count = len(lines)
+            self.assertTrue(all("Downloading archive: still working" in line for line in lines))
+            self.assertTrue(all("elapsed" in line for line in lines))
+            self.assertEqual(len(lines), count)
 
 
 if __name__ == "__main__":

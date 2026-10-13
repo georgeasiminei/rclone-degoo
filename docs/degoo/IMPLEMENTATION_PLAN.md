@@ -56,6 +56,27 @@ Documentation-only changes do not alter the managed payload; an identical
 payload causes a no-op that leaves the service, configuration, manifest, and
 cache untouched, including when `--delete-cache` or wait options were supplied.
 
+For Actions runs, the workflow also publishes a small
+`rclone-degoo-linux-amd64-update` artifact containing the archive SHA-256
+sidecar and a `.tar.gz.update.json` manifest. The updater downloads this first
+and computes the hash of the installed binary and managed files on disk; it
+does not trust the saved install manifest to decide whether a change is needed.
+If the payload matches, it skips the full archive download and all runtime or
+cache changes. Otherwise it verifies the downloaded archive's checksum, size,
+binary and payload hashes, and clean commit against the lightweight manifest
+and workflow run. Invalid metadata is an error. Runs without the separate
+artifact, including older runs, use a visible full-archive fallback for
+comparison and verification.
+
+The updater reports phase changes and repeats elapsed time every ten seconds
+while a phase remains active. It does not invent percentage estimates. Before
+downloading a changed full archive, it refuses an active-mount update when the
+updater or its calling shell is working inside the mount. The same check runs
+before mount preparation for local archives. A no-op remains allowed from the
+mount. The child process cannot change its parent shell's current directory, so
+the user must `cd` to the path named in the error, then retry. No prompt or
+forced/lazy unmount is used.
+
 For a mounted vault, the updater first calls the running client through its
 owner-private control socket to enter generic VFS maintenance. The barrier
 refuses new opens and file or directory mutations with `EBUSY`, while allowing

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -38,6 +40,7 @@ PYTHON_HELPERS = (
     "status.py",
     "benchmark.py",
     "update.py",
+    "update_preflight.py",
 )
 DOC_FILES = (
     "API_EVIDENCE.md",
@@ -67,6 +70,8 @@ PACKAGE_ENTRIES = (
     ("backend/degoo/NOTICE", "licenses/degoo-NOTICE"),
 )
 HELP_TIMEOUT_SECONDS = 30
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class PackageError(Exception):
@@ -169,12 +174,16 @@ def sha256_file(path: Path) -> str:
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)
     except OSError:
-        raise PackageError("could not read the supplied binary") from None
+        raise PackageError("could not read a package file") from None
     return digest.hexdigest()
 
 
 def checksum_sidecar_path(archive: Path) -> Path:
     return archive.with_name(f"{archive.name}.sha256")
+
+
+def update_manifest_path(archive: Path) -> Path:
+    return archive.with_name(f"{archive.name}.update.json")
 
 
 def checksum_sidecar_data(archive: Path, archive_name: str | None = None) -> bytes:
@@ -222,6 +231,8 @@ def build_metadata(root: Path, binary: Path) -> bytes:
         return result.stdout.decode("utf-8", errors="replace").strip()
 
     commit = git_output("rev-parse", "--verify", "HEAD")
+    if commit is not None and not COMMIT_PATTERN.fullmatch(commit):
+        commit = None
     branch = git_output("rev-parse", "--abbrev-ref", "HEAD")
     status = git_output("status", "--porcelain", "--untracked-files=normal")
     metadata = {
@@ -269,6 +280,82 @@ def extracted_archive(archive_path: Path, expected_paths: set[str], destination:
     except (OSError, tarfile.TarError):
         raise PackageError("the package archive could not be read safely") from None
     return root
+
+
+def package_identity_from_archive(
+    archive_path: Path, expected_paths: set[str]
+) -> tuple[dict[str, str], dict[str, object]]:
+    """Compute the install identity and build provenance from finalized archive bytes."""
+    with tempfile.TemporaryDirectory(prefix="rclone-degoo-identity-") as temporary:
+        package = extracted_archive(archive_path, expected_paths, Path(temporary))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_rclone_degoo_package_installer", package / "scripts/python/install.py"
+            )
+            if spec is None or spec.loader is None:
+                raise PackageError("the package installer identity helper could not be loaded")
+            installer = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(installer)
+            identity = installer.package_identity(package / "bin/rclone", package)
+            build_info = json.loads((package / "docs/BUILD.json").read_bytes())
+        except PackageError:
+            raise
+        except Exception:
+            raise PackageError("the finalized package identity could not be verified") from None
+        if not isinstance(identity, dict) or not isinstance(build_info, dict):
+            raise PackageError("the finalized package identity has an invalid shape")
+        return identity, build_info
+
+
+def update_manifest_data(archive_path: Path, archive_name: str, expected_paths: set[str]) -> bytes:
+    """Describe a finalized archive for fast update preflight checks."""
+    identity, build_info = package_identity_from_archive(archive_path, expected_paths)
+    archive_sha256 = sha256_file(archive_path)
+    archive_size = archive_path.stat().st_size
+    binary_sha256 = identity.get("binary_sha256")
+    payload_sha256 = identity.get("payload_sha256")
+    source_dirty = build_info.get("source_dirty")
+    commit = build_info.get("commit")
+    if (
+        not isinstance(binary_sha256, str)
+        or not SHA256_PATTERN.fullmatch(binary_sha256)
+        or build_info.get("binary_sha256") != binary_sha256
+        or not isinstance(payload_sha256, str)
+        or not SHA256_PATTERN.fullmatch(payload_sha256)
+        or not SHA256_PATTERN.fullmatch(archive_sha256)
+        or archive_size <= 0
+        or type(source_dirty) is not bool
+        or (commit is not None and (not isinstance(commit, str) or not COMMIT_PATTERN.fullmatch(commit)))
+    ):
+        raise PackageError("the finalized package metadata failed validation")
+    metadata = {
+        "version": 1,
+        "archive": archive_name,
+        "archive_sha256": archive_sha256,
+        "archive_size": archive_size,
+        "binary_sha256": binary_sha256,
+        "payload_sha256": payload_sha256,
+        "commit": commit,
+        "source_dirty": source_dirty,
+    }
+    return (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def self_check_payload_sha256(package: Path) -> str:
+    """Independently reproduce the installer's payload identity in the fixture."""
+    relative_paths = (
+        Path("bin/rclone"),
+        Path("degoo-rc"),
+        *(Path("scripts") / name for name in ("install.sh", "trash.sh", "uninstall.sh")),
+        *(Path("scripts/python") / name for name in PYTHON_HELPERS),
+        *(Path("immutable-mount") / name for name in ("helper.c", "README.md")),
+    )
+    payload = hashlib.sha256()
+    for relative in sorted(relative_paths, key=lambda path: path.as_posix()):
+        payload.update(relative.as_posix().encode("utf-8"))
+        payload.update(b"\0")
+        payload.update(hashlib.sha256((package / relative).read_bytes()).digest())
+    return payload.hexdigest()
 
 
 def run_launcher_help(launcher: Path, env: dict[str, str], *arguments: str) -> None:
@@ -340,24 +427,34 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
 
     output = Path(output_arg).expanduser()
     checksum = checksum_sidecar_path(output)
+    update_manifest = update_manifest_path(output)
     try:
         protected_paths = {source.resolve(strict=True) for source, _ in sources}
         protected_paths.add(Path(__file__).resolve(strict=True))
-        for candidate, label in ((output, "--output"), (checksum, "the checksum sidecar")):
+        for candidate, label in (
+            (output, "--output"),
+            (checksum, "the checksum sidecar"),
+            (update_manifest, "the update manifest"),
+        ):
             if candidate.resolve(strict=False) in protected_paths:
                 raise PackageError(f"{label} cannot replace a package source file")
             validate_output_target(candidate, label)
         output.parent.mkdir(parents=True, exist_ok=True)
-        if output.exists() and os.path.samefile(output, binary):
-            raise PackageError("--output cannot replace the supplied binary")
-        if checksum.exists() and os.path.samefile(checksum, binary):
-            raise PackageError("the checksum sidecar cannot replace the supplied binary")
+        for candidate, label in (
+            (output, "--output"),
+            (checksum, "the checksum sidecar"),
+            (update_manifest, "the update manifest"),
+        ):
+            if candidate.exists() and os.path.samefile(candidate, binary):
+                raise PackageError(f"{label} cannot replace the supplied binary")
         previous_checksum: tuple[bytes, int] | None = None
         if checksum.exists():
             info = os.lstat(checksum)
             if info.st_size > 4096:
                 raise PackageError("the existing checksum sidecar is not a regular checksum file")
             previous_checksum = (checksum.read_bytes(), stat.S_IMODE(info.st_mode))
+        if update_manifest.exists() and os.lstat(update_manifest).st_size > 16384:
+            raise PackageError("the existing update manifest is too large")
     except PackageError:
         raise
     except OSError:
@@ -365,10 +462,12 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
 
     output = output.absolute()
     checksum = checksum.absolute()
+    update_manifest = update_manifest.absolute()
     binary_size = binary.stat().st_size
     temp_name: str | None = None
     checksum_temp_name: str | None = None
     checksum_backup_name: str | None = None
+    manifest_temp_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
             prefix=f".{output.name}.", suffix=".tmp", dir=output.parent, delete=False
@@ -391,7 +490,8 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
                             archive.addfile(tar_info(arcname, source.stat().st_size, mode), stream)
             raw.flush()
             os.fsync(raw.fileno())
-        validate_archive_launchers(Path(temp_name), expected_archive_paths(sources))
+        expected_paths = expected_archive_paths(sources)
+        validate_archive_launchers(Path(temp_name), expected_paths)
         os.chmod(temp_name, 0o644)
         checksum_data = checksum_sidecar_data(Path(temp_name), output.name)
         with tempfile.NamedTemporaryFile(
@@ -404,6 +504,15 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
         os.chmod(checksum_temp_name, 0o644)
         if not verify_checksum_sidecar(Path(temp_name), Path(checksum_temp_name), output.name):
             raise PackageError("the package checksum sidecar failed verification")
+        manifest_data = update_manifest_data(Path(temp_name), output.name, expected_paths)
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{update_manifest.name}.", suffix=".tmp", dir=update_manifest.parent, delete=False
+        ) as manifest_file:
+            manifest_temp_name = manifest_file.name
+            manifest_file.write(manifest_data)
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        os.chmod(manifest_temp_name, 0o644)
         if previous_checksum is not None:
             with tempfile.NamedTemporaryFile(
                 prefix=f".{checksum.name}.backup.", suffix=".tmp", dir=checksum.parent, delete=False
@@ -443,6 +552,10 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
             except OSError:
                 pass
             raise PackageError("the published package checksum sidecar failed verification")
+        os.replace(manifest_temp_name, update_manifest)
+        manifest_temp_name = None
+        if update_manifest.read_bytes() != manifest_data:
+            raise PackageError("the published update manifest failed verification")
         try:
             directory_fd = os.open(output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         except OSError:
@@ -457,7 +570,7 @@ def create_archive(root: Path, binary_arg: str, output_arg: str) -> Path:
     except OSError:
         raise PackageError("could not write the package archive") from None
     finally:
-        for temporary_path in (temp_name, checksum_temp_name, checksum_backup_name):
+        for temporary_path in (temp_name, checksum_temp_name, checksum_backup_name, manifest_temp_name):
             if temporary_path is not None:
                 try:
                     os.unlink(temporary_path)
@@ -553,10 +666,13 @@ def self_check(root: Path) -> None:
 
         archive_path = workspace / "test-package.tar.gz"
         checksum_path = checksum_sidecar_path(archive_path)
+        manifest_path = update_manifest_path(archive_path)
         existing_archive = b"existing archive sentinel\n"
         existing_checksum = b"existing checksum sentinel\n"
+        existing_manifest = b"existing update manifest sentinel\n"
         archive_path.write_bytes(existing_archive)
         checksum_path.write_bytes(existing_checksum)
+        manifest_path.write_bytes(existing_manifest)
         launcher_source.rename(hidden_launcher)
         try:
             create_archive(fixture_root, str(good_binary), str(archive_path))
@@ -566,8 +682,12 @@ def self_check(root: Path) -> None:
             raise PackageError("self-check allowed packaging when the install launcher was missing")
         finally:
             hidden_launcher.rename(launcher_source)
-        if archive_path.read_bytes() != existing_archive or checksum_path.read_bytes() != existing_checksum:
-            raise PackageError("self-check changed an existing archive after rejecting a missing launcher")
+        if (
+            archive_path.read_bytes() != existing_archive
+            or checksum_path.read_bytes() != existing_checksum
+            or manifest_path.read_bytes() != existing_manifest
+        ):
+            raise PackageError("self-check changed existing outputs after rejecting a missing launcher")
 
         try:
             create_archive(fixture_root, str(bad_binary), str(archive_path))
@@ -575,18 +695,52 @@ def self_check(root: Path) -> None:
             pass
         else:
             raise PackageError("self-check allowed packaging with a binary without Degoo support")
-        if archive_path.read_bytes() != existing_archive or checksum_path.read_bytes() != existing_checksum:
-            raise PackageError("self-check changed an existing archive after rejecting an invalid binary")
+        if (
+            archive_path.read_bytes() != existing_archive
+            or checksum_path.read_bytes() != existing_checksum
+            or manifest_path.read_bytes() != existing_manifest
+        ):
+            raise PackageError("self-check changed existing outputs after rejecting an invalid binary")
 
         create_archive(fixture_root, str(good_binary), str(archive_path))
         sources = package_sources(fixture_root)
         expected = expected_archive_paths(sources)
         if not verify_checksum_sidecar(archive_path, checksum_path):
             raise PackageError("self-check found an invalid package checksum sidecar")
+        try:
+            manifest = json.loads(manifest_path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise PackageError("self-check could not read the update manifest") from None
+        if set(manifest) != {
+            "version", "archive", "archive_sha256", "archive_size", "binary_sha256",
+            "payload_sha256", "commit", "source_dirty",
+        }:
+            raise PackageError("self-check found an unexpected update manifest schema")
+        if (
+            type(manifest["version"]) is not int
+            or manifest["version"] != 1
+            or manifest["archive"] != archive_path.name
+            or manifest["archive_sha256"] != sha256_file(archive_path)
+            or type(manifest["archive_size"]) is not int
+            or manifest["archive_size"] != archive_path.stat().st_size
+            or manifest["binary_sha256"] != sha256_file(good_binary)
+            or manifest["commit"] is not None
+            or manifest["source_dirty"] is not True
+        ):
+            raise PackageError("self-check found inaccurate archive or build data in the update manifest")
+        with tempfile.TemporaryDirectory(prefix="rclone-degoo-manifest-check-") as extracted_dir:
+            package = extracted_archive(archive_path, expected, Path(extracted_dir))
+            if manifest["payload_sha256"] != self_check_payload_sha256(package):
+                raise PackageError("self-check found an inaccurate payload hash in the update manifest")
         first_archive = archive_path.read_bytes()
         first_checksum = checksum_path.read_bytes()
+        first_manifest = manifest_path.read_bytes()
         create_archive(fixture_root, str(good_binary), str(archive_path))
-        if archive_path.read_bytes() != first_archive or checksum_path.read_bytes() != first_checksum:
+        if (
+            archive_path.read_bytes() != first_archive
+            or checksum_path.read_bytes() != first_checksum
+            or manifest_path.read_bytes() != first_manifest
+        ):
             raise PackageError("self-check found that repeated packaging is not deterministic")
         required_paths = {
             *(f"{ROOT_NAME}/{name}" for name in SHELL_LAUNCHERS),
@@ -722,6 +876,7 @@ def main(argv: list[str] | None = None) -> int:
         output = create_archive(repository_root(), args.binary, args.output)
         print(f"created {output}")
         print(f"sha256 {checksum_sidecar_path(output)}")
+        print(f"update manifest {update_manifest_path(output)}")
         return 0
     except PackageError as exc:
         print(f"package-degoo: {exc}", file=sys.stderr)

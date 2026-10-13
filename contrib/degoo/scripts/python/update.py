@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import http.client
@@ -16,6 +17,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
+import time
 import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -25,13 +28,16 @@ import install as installer
 import service
 import sync as mount_sync
 import uninstall
+import update_preflight
 import wizard
 
 
 REPOSITORY = "georgeasiminei/rclone-degoo"
 WORKFLOW = "degoo-package.yml"
 ARTIFACT_NAME = "rclone-degoo-linux-amd64"
+UPDATE_ARTIFACT_NAME = f"{ARTIFACT_NAME}-update"
 ARCHIVE_NAME = f"{ARTIFACT_NAME}.tar.gz"
+UPDATE_MANIFEST_NAME = f"{ARCHIVE_NAME}.update.json"
 MAX_PACKAGE_BYTES = 1024 * 1024 * 1024
 MAX_PACKAGE_FILES = 4096
 ACTIVE_STATES = {"active", "activating", "deactivating", "reloading"}
@@ -46,6 +52,25 @@ MANAGED_FILES = ("degoo-rc", "install.json", "rclone-degoo.service",
 
 class UpdateError(Exception):
     """A safe, actionable update failure."""
+
+
+@contextlib.contextmanager
+def progress(label: str, *, interval: float = 10.0):
+    """Report elapsed time while a slow update phase is still running."""
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def report():
+        while not stop.wait(interval):
+            print(f"{label}: still working ({int(time.monotonic() - started)}s elapsed).", flush=True)
+
+    thread = threading.Thread(target=report, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 def sha256_file(path: Path) -> str:
@@ -64,6 +89,9 @@ def sha256_file(path: Path) -> str:
 class ActionsSource:
     """Resolve and download the latest successful staging package using gh."""
 
+    def __init__(self):
+        self.manifest: dict[str, Any] | None = None
+
     @staticmethod
     def _run(arguments: list[str], *, timeout: int = 60) -> bytes:
         if not shutil.which("gh"):
@@ -78,8 +106,10 @@ class ActionsSource:
             raise UpdateError("GitHub package lookup/download failed; check gh auth status and connectivity, then retry degoo-rc update")
         return result.stdout
 
-    def download(self, destination: Path) -> tuple[Path, dict[str, Any]]:
-        response = self._run(["api", f"repos/{REPOSITORY}/actions/workflows/{WORKFLOW}/runs?branch=staging&status=success&per_page=1"])
+    def download(self, destination: Path, *, installed_root: Path | None = None) -> tuple[Path | None, dict[str, Any]]:
+        print("Checking the latest successful staging build on GitHub.", flush=True)
+        with progress("Checking the latest staging build"):
+            response = self._run(["api", f"repos/{REPOSITORY}/actions/workflows/{WORKFLOW}/runs?branch=staging&status=success&per_page=1"])
         try:
             runs = json.loads(response)["workflow_runs"]
             if not runs:
@@ -91,14 +121,96 @@ class ActionsSource:
                 raise ValueError
         except (KeyError, TypeError, ValueError, IndexError, RecursionError):
             raise UpdateError("GitHub returned an invalid package run response") from None
-        print(f"Downloading staging package from workflow run {run['id']} ({run['head_sha'][:12]}).", flush=True)
-        self._run(["run", "download", str(run["id"]), "--name", ARTIFACT_NAME,
-                   "--repo", REPOSITORY, "--dir", str(destination)], timeout=600)
+        source = {"source": "actions", "repository": REPOSITORY,
+                  "run_id": run["id"], "commit": run["head_sha"]}
+        print(f"Latest staging build: run {run['id']} ({run['head_sha'][:12]}).", flush=True)
+        self.manifest = self._download_manifest(run, destination / "metadata")
+        if self.manifest is not None and installed_root is not None:
+            print("Comparing the installed program with the update manifest.", flush=True)
+            with progress("Comparing installed files"):
+                matches = installed_matches(installed_root, self.manifest)
+            if matches:
+                print("Installed program matches; the package archive was not downloaded.", flush=True)
+                return None, source
+            preflight_mount_directory(installed_root, installer.load_manifest(installed_root))
+        size = f" ({self.manifest['archive_size'] / (1024 * 1024):.1f} MiB)" if self.manifest else ""
+        print(f"Downloading the staging package archive{size}.", flush=True)
+        with progress("Downloading package archive"):
+            self._run(["run", "download", str(run["id"]), "--name", ARTIFACT_NAME,
+                       "--repo", REPOSITORY, "--dir", str(destination)], timeout=600)
         archive = destination / ARCHIVE_NAME
         if not archive.is_file():
             raise UpdateError("the latest workflow artifact is missing or expired; no installation files were changed")
-        return archive, {"source": "actions", "repository": REPOSITORY,
-                         "run_id": run["id"], "commit": run["head_sha"]}
+        print("Package archive download complete.", flush=True)
+        return archive, source
+
+    def _download_manifest(self, run: dict[str, Any], destination: Path) -> dict[str, Any] | None:
+        with progress("Checking update artifacts"):
+            response = self._run(["api", f"repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts?per_page=100"])
+        try:
+            artifacts = json.loads(response)["artifacts"]
+            if not isinstance(artifacts, list) or any(not isinstance(item, dict) for item in artifacts):
+                raise ValueError
+            matching = [item for item in artifacts if item.get("name") == UPDATE_ARTIFACT_NAME]
+            if len(matching) > 1:
+                raise ValueError
+            if matching and type(matching[0].get("expired")) is not bool:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, RecursionError):
+            raise UpdateError("GitHub returned an invalid update artifact listing") from None
+        if not matching or matching[0]["expired"]:
+            print("This build has no separate update manifest; downloading its archive for comparison.", flush=True)
+            return None
+        print("Downloading the small update manifest and checksum.", flush=True)
+        destination.mkdir(mode=0o700)
+        with progress("Downloading update manifest"):
+            self._run(["run", "download", str(run["id"]), "--name", UPDATE_ARTIFACT_NAME,
+                       "--repo", REPOSITORY, "--dir", str(destination)], timeout=60)
+        manifest_path = destination / UPDATE_MANIFEST_NAME
+        checksum_path = destination / (ARCHIVE_NAME + ".sha256")
+        try:
+            for path in (manifest_path, checksum_path):
+                installer.check_components(path)
+                if not path.is_file() or path.stat().st_size > 4096:
+                    raise ValueError
+            manifest = json.loads(manifest_path.read_bytes())
+            checksum = re.fullmatch(r"([0-9a-f]{64})  ([^\r\n]+)\n?", checksum_path.read_text(encoding="ascii"))
+            fields = {"version", "archive", "archive_sha256", "archive_size", "binary_sha256",
+                      "payload_sha256", "commit", "source_dirty"}
+            if (not isinstance(manifest, dict) or set(manifest) != fields
+                    or type(manifest["version"]) is not int or manifest["version"] != 1
+                    or manifest["archive"] != ARCHIVE_NAME
+                    or type(manifest["archive_size"]) is not int
+                    or not 0 < manifest["archive_size"] <= MAX_PACKAGE_BYTES
+                    or manifest["commit"] != run["head_sha"] or manifest["source_dirty"] is not False
+                    or checksum is None or checksum[2] != ARCHIVE_NAME
+                    or checksum[1] != manifest["archive_sha256"]):
+                raise ValueError
+            for key in ("archive_sha256", "binary_sha256", "payload_sha256"):
+                if not isinstance(manifest[key], str) or re.fullmatch(r"[0-9a-f]{64}", manifest[key]) is None:
+                    raise ValueError
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError, installer.InstallError):
+            raise UpdateError("the update manifest or checksum is invalid; no installation files were changed") from None
+        print("Update manifest and checksum verified.", flush=True)
+        return manifest
+
+    def verify_package(self, identity: dict[str, Any], archive_hash: str, archive: Path) -> None:
+        """Bind downloaded archive bytes and payload to the lightweight manifest."""
+        if self.manifest is not None and (
+                archive_hash != self.manifest["archive_sha256"]
+                or archive.stat().st_size != self.manifest["archive_size"]
+                or any(identity.get(key) != self.manifest[key] for key in ("binary_sha256", "payload_sha256", "commit"))):
+            raise UpdateError("the downloaded package does not match its update manifest; installation was preserved")
+
+
+def preflight_mount_directory(root: Path, manifest: dict[str, Any]) -> None:
+    """Require the updater and its invoking shell to be outside an active mount."""
+    mountpoint = installer.configured_mountpoint(root, manifest)
+    if wizard._mounted_state(mountpoint) == "mounted":
+        try:
+            update_preflight.require_outside_mount(mountpoint)
+        except update_preflight.PreflightError as exc:
+            raise UpdateError(str(exc)) from None
 
 
 def extract_package(archive_path: Path, destination: Path) -> tuple[Path, str]:
@@ -378,6 +490,7 @@ def stop_runtime(root: Path, manifest: dict[str, Any], state: dict[str, Any]) ->
     elif mounted != "not mounted":
         raise UpdateError("a mount appeared after update inspection; no runtime process was stopped")
     if state["service_owned"]:
+        print("Mount is absent; stopping the owned service before replacement.", flush=True)
         uninstall._stop_owned_service(root, manifest, disable=False)
     if wizard._mounted_state(mountpoint) != "not mounted":
         raise UpdateError("the mount returned during shutdown; inspect the service and retry")
@@ -430,12 +543,14 @@ def start_runtime(root: Path, state: dict[str, Any]) -> None:
         if result.returncode != 0:
             raise UpdateError("systemd could not reload the updated unit; run degoo-rc service restart")
     if state["service_active"]:
+        print("Restarting the previously active user service.", flush=True)
         manifest = installer.load_manifest(root)
         service._require_loaded_unit(root, manifest)
         result = service._systemctl(root, "start", service.UNIT_NAME)
         if result.returncode != 0:
             raise UpdateError("the updated service could not start; inspect degoo-rc logs and retry degoo-rc service start")
     elif state["manual_arguments"]:
+        print("Restarting the previous manual mount in the background.", flush=True)
         env = dict(os.environ, PATH=f"{root / 'tools'}:/usr/bin:/bin",
                    XDG_CONFIG_HOME=str(root / "config"), XDG_CACHE_HOME=str(root / "cache"),
                    TMPDIR=str(root / "tmp"), PYTHONDONTWRITEBYTECODE="1")
@@ -454,6 +569,8 @@ def start_runtime(root: Path, state: dict[str, Any]) -> None:
                              start_new_session=True, umask=0o077)
     if (state["service_active"] or state["manual_arguments"]) and wizard._wait_for_mount(root) != "mounted":
         raise UpdateError("the restarted mount was not confirmed; inspect degoo-rc logs and degoo-rc info, then retry the mount")
+    if state["service_active"] or state["manual_arguments"]:
+        print("Restart complete; the vault mount is connected.", flush=True)
 
 
 def check_managed_tree(path: Path, root: Path) -> None:
@@ -611,28 +728,40 @@ def apply_update(root: Path, package: Path, identity: dict[str, Any], source: di
         state = runtime_state(root, manifest)
         state = _wait_for_service_mount(root, manifest, state)
         mount_unmounted = not state["mounted"]
+        if state["mounted"]:
+            preflight_mount_directory(root, manifest)
         if state["service_active"] or state["manual_arguments"]:
             if wizard._mount_preflight(root, installer.configured_mountpoint(root, manifest),
                                        systemd_available=state["service_active"]):
                 raise UpdateError("mount prerequisites need repair before updating; follow the setup commands above")
         if state["mounted"]:
             wait_for = "open handles and requested uploads" if upload_timeout > 0 else "open handles"
-            print(f"Preparing the mounted vault for update; waiting for {wait_for}.", flush=True)
-            preparation = prepare_mount_for_update(
-                root, writer_timeout=writer_timeout, upload_timeout=upload_timeout
-            )
+            print(f"Preparing the mounted vault; waiting for {wait_for} (handle/flush deadline: {writer_timeout:g}s).", flush=True)
+            if upload_timeout > 0:
+                print(f"Upload completion is required within a separate {upload_timeout:g}s deadline.", flush=True)
+            with progress("Preparing the mounted vault"):
+                preparation = prepare_mount_for_update(
+                    root, writer_timeout=writer_timeout, upload_timeout=upload_timeout
+                )
+            print("Mount prepared; local cached data and recovery metadata have been flushed.", flush=True)
+            if upload_timeout == 0:
+                print("Pending uploads will remain in the cache and resume after restart.", flush=True)
         if preparation is not None:
             renew_mount_preparation(*preparation)
-        print("Installing the verified package, preserving configuration and local writes.", flush=True)
+        if state["mounted"]:
+            print("Unmounting the vault normally before stopping its runtime.", flush=True)
         stop_runtime(root, manifest, state)
         mount_unmounted = True
+        print("Acquiring exclusive access to the retained local cache.", flush=True)
         lock = uninstall._acquire_cache_lock(root, 10)
         stopped = True
         if delete_cache:
             require_clean_cache(root)
         names = snapshot_program(root, backup)
         try:
-            install_package(root, package, lock)
+            print("Installing the verified package; configuration and local writes are preserved.", flush=True)
+            with progress("Installing the package"):
+                install_package(root, package, lock)
             if not installed_matches(root, identity):
                 raise UpdateError("the installed package does not match the downloaded program payload")
             manifest = installer.load_manifest(root)
@@ -709,10 +838,23 @@ def run(args: argparse.Namespace) -> int:
         workspace = Path(temporary)
         if args.archive:
             archive, source = Path(args.archive).expanduser().absolute(), {"source": "archive"}
+            download = None
+            print("Using the local package archive.", flush=True)
         else:
-            archive, source = ActionsSource().download(workspace)
-        package, archive_hash = extract_package(archive, workspace / "extracted")
-        identity = validate_package(package, source)
+            download = ActionsSource()
+            archive, source = download.download(workspace, installed_root=root)
+            if archive is None:
+                print("Already up to date; no installation, service, or cache changes.")
+                return 0
+        print("Verifying the archive checksum and extracting the package.", flush=True)
+        with progress("Verifying and extracting the package"):
+            package, archive_hash = extract_package(archive, workspace / "extracted")
+        print("Checking binary provenance, command readiness, and program hashes.", flush=True)
+        with progress("Validating the package"):
+            identity = validate_package(package, source)
+        if download is not None:
+            download.verify_package(identity, archive_hash, archive)
+        print("Package verified; comparing with the installed program.", flush=True)
         if installed_matches(root, identity):
             print("Already up to date; no installation, service, or cache changes.")
             return 0

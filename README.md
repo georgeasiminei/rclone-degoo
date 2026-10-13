@@ -91,11 +91,18 @@ Use the installed command, available on `PATH`:
 degoo-rc info
 degoo-rc logs
 degoo-rc logs --follow
+degoo-rc update
 ```
 
 Press Ctrl+C to stop following logs. `degoo-rc logs` is the viewer; `logs/` is a
 directory. New mounts log notices and errors by default. The upgrade wizard
 offers to stop the contained mount and waits briefly for it to start again.
+The updater checks a small checksum and payload manifest before downloading a
+full package, so an unchanged install needs no large download. Long phases
+report elapsed time every ten seconds. Run an update outside an active mount;
+if the command says the current shell is inside `/mnt/degoo`, run `cd /mnt` in
+that same terminal and retry. See the [update guide](docs/degoo/INSTALLATION.md#update-the-installed-client)
+for metadata validation and recovery details.
 To stop the user service manually:
 
 ```sh

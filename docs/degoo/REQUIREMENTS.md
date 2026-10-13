@@ -235,6 +235,24 @@ The user-requested client update lifecycle (2026-10-13) is:
 - Provide `degoo-rc update` to install the latest successful package from
   `staging`. Package delivery may move to GitHub releases in the future without
   changing the user's update workflow.
+- Publish a small update-metadata artifact with the package checksum and a
+  manifest binding the archive name, size, checksum, binary hash, managed
+  payload hash, source commit, and dirty-source state. The updater checks the
+  actual installed managed files against this metadata before downloading the
+  large archive. A matching payload is a no-op without archive download or
+  service, configuration, or cache changes. For a changed payload, download
+  and verify the full archive against the metadata and workflow provenance.
+  Missing metadata from older runs permits a visible full-archive fallback;
+  present but invalid metadata must fail closed.
+- Report update phases and elapsed time during long operations, repeating the
+  elapsed-time message every ten seconds without estimated percentages.
+- Before changing an active mount, refuse an update launched from inside that
+  mount by the updater or its calling shell. For a remote update, perform this
+  check before downloading the full archive when lightweight metadata is
+  available. A no-op remains allowed from inside the mount. Explain that the
+  child updater cannot change its parent shell's working directory; give the
+  user the mount's parent path to `cd` to and let them retry in the same shell.
+  Do not prompt, force an unmount, or use a lazy unmount.
 - Keep enough installed build identity to recognize an unchanged build. An
   unchanged update is a no-op: do not rewrite configuration or change the
   service, cache, or install state, even when `--delete-cache` is supplied.
