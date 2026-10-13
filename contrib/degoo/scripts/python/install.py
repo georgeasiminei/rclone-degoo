@@ -25,7 +25,7 @@ from typing import Any
 ROOT_NAME = "rclone-degoo"
 REMOTE_NAME = "degoo-live-test"
 ROOT_REL = Path(".local/share") / ROOT_NAME
-SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "mount_prerequisites.py", "mount_setup.py", "connection.py", "restore.py", "backup_config.py", "sync.py", "status.py", "benchmark.py")
+SOURCE_FILES = ("cli.py", "install.py", "info.py", "logs.py", "login.py", "service.py", "setup.py", "uninstall.py", "wizard.py", "mount_prerequisites.py", "mount_setup.py", "connection.py", "restore.py", "backup_config.py", "sync.py", "status.py", "benchmark.py", "update.py")
 DEFAULT_MOUNTPOINT = "/mnt/degoo"
 SOURCE_SHELL_FILES = ("install.sh", "trash.sh", "uninstall.sh")
 GENERATED_SHELL_FILES = ("info.sh", "logs.sh", "login.sh", "setup.sh", "mount.sh", "status.sh", "location.sh", "folders.sh", "stop.sh", "service.sh")
@@ -33,6 +33,9 @@ IMMUTABLE_MOUNT_FILES = ("helper.c", "README.md")
 COMPATIBILITY_SHELL_FILES = (*SOURCE_SHELL_FILES, *GENERATED_SHELL_FILES)
 LEGACY_GENERATED_SHELL_FILES = COMPATIBILITY_SHELL_FILES
 MAX_CONFIG_SIZE = 1024 * 1024
+MAX_BUILD_METADATA_SIZE = 16 * 1024
+BUILD_COMMIT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 DEFAULT_MOUNT_SETTINGS = {
     "cache_max_size": "60G",
     "cache_min_free_space": "60G",
@@ -987,6 +990,123 @@ def validate_binary(binary: Path) -> None:
         raise InstallError("--binary must be an rclone build with the Degoo mount and login commands")
 
 
+def _file_sha256(path: Path) -> str:
+    """Hash one regular file without following links or accepting a changing file."""
+    check_components(path)
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            raise InstallError("an installer-managed package file is not a regular file")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except InstallError:
+        raise
+    except OSError:
+        raise InstallError("an installer-managed package file could not be read safely") from None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise InstallError("an installer-managed package file changed while being opened")
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise InstallError("an installer-managed package file changed while being read")
+        return digest.hexdigest()
+    except OSError:
+        raise InstallError("an installer-managed package file could not be read safely") from None
+    finally:
+        os.close(fd)
+
+
+def _build_commit(source_root: Path, binary_sha256: str) -> str | None:
+    """Return verified clean-build provenance when the package includes it."""
+    path = source_root / "docs" / "BUILD.json"
+    try:
+        check_components(path)
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_size > MAX_BUILD_METADATA_SIZE:
+            return None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except (InstallError, OSError):
+        return None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            return None
+        data = bytearray()
+        while len(data) <= MAX_BUILD_METADATA_SIZE:
+            chunk = os.read(fd, min(4096, MAX_BUILD_METADATA_SIZE + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(fd)
+        if len(data) > MAX_BUILD_METADATA_SIZE or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        metadata = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if (
+        not isinstance(metadata, dict)
+        or type(metadata.get("version")) is not int
+        or metadata["version"] != 1
+        or metadata.get("binary_sha256") != binary_sha256
+        or metadata.get("source_dirty") is not False
+    ):
+        return None
+    commit = metadata.get("commit")
+    return commit if isinstance(commit, str) and BUILD_COMMIT_PATTERN.fullmatch(commit) else None
+
+
+def package_identity(binary: Path, source_root: Path) -> dict[str, str]:
+    """Return stable hashes for an installed package payload and its binary."""
+    files = {
+        Path("bin/rclone"): _file_sha256(binary),
+        Path("degoo-rc"): _file_sha256(source_root / "degoo-rc"),
+        **{
+            Path("scripts") / name: _file_sha256(source_root / "scripts" / name)
+            for name in SOURCE_SHELL_FILES
+        },
+        **{
+            Path("scripts/python") / name: _file_sha256(source_root / "scripts" / "python" / name)
+            for name in SOURCE_FILES
+        },
+        **{
+            Path("immutable-mount") / name: _file_sha256(source_root / "immutable-mount" / name)
+            for name in IMMUTABLE_MOUNT_FILES
+        },
+    }
+    payload = hashlib.sha256()
+    for relative, file_digest in sorted(files.items(), key=lambda item: item[0].as_posix()):
+        payload.update(relative.as_posix().encode("utf-8"))
+        payload.update(b"\0")
+        payload.update(bytes.fromhex(file_digest))
+    binary_sha256 = files[Path("bin/rclone")]
+    identity = {
+        "binary_sha256": binary_sha256,
+        "payload_sha256": payload.hexdigest(),
+    }
+    commit = _build_commit(source_root, binary_sha256)
+    if commit is not None:
+        identity["commit"] = commit
+    return identity
+
+
 def _install(args: argparse.Namespace) -> int:
     root = expected_root()
     ensure_parent_directories(root)
@@ -1174,6 +1294,19 @@ def _install(args: argparse.Namespace) -> int:
     if args.folder_created_by_setup:
         manifest["remote_created_by_setup"] = True
     manifest.setdefault("service_links", [])
+    source_identity = package_identity(Path(args.binary), source_root)
+    installed_identity = package_identity(root / "bin/rclone", root)
+    if (
+        source_identity["binary_sha256"] != installed_identity["binary_sha256"]
+        or source_identity["payload_sha256"] != installed_identity["payload_sha256"]
+    ):
+        raise InstallError("the installed package payload does not match its staged source")
+    manifest["build"] = {"version": 1, **installed_identity}
+    if "commit" in source_identity:
+        manifest["build"]["commit"] = source_identity["commit"]
+    package_sha256 = getattr(args, "package_sha256", None)
+    if package_sha256 is not None:
+        manifest["build"]["package_sha256"] = package_sha256
     path_link_created = _install_path_link(root, manifest)
     manifest_data = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
@@ -1225,17 +1358,25 @@ def _user_service_active(root: Path) -> bool:
     return state.rsplit(";", 1)[-1].strip() in {"active", "activating", "deactivating", "reloading"}
 
 
-def _acquire_upgrade_lock(root: Path) -> int:
+def _upgrade_lock_path(root: Path) -> Path:
+    digest = hashlib.sha256(f"{REMOTE_NAME}:".encode("utf-8")).hexdigest()[:24]
+    return root / "cache" / f"degoo-vault-{digest}.lock"
+
+
+def _check_upgrade_mount_stopped(root: Path) -> None:
     if os.path.ismount(root) or os.path.ismount(configured_mountpoint(root)):
         if _user_service_active(root):
             stop_command = f"{shlex.quote(str(root / 'scripts/service.sh'))} stop"
         else:
             stop_command = shlex.quote(str(root / "scripts/stop.sh"))
         raise InstallError(f"stop the contained mount before upgrading; run {stop_command}")
+
+
+def _acquire_upgrade_lock(root: Path) -> int:
+    _check_upgrade_mount_stopped(root)
     cache = root / "cache"
     check_directory(cache, private=True)
-    digest = hashlib.sha256(f"{REMOTE_NAME}:".encode("utf-8")).hexdigest()[:24]
-    path = cache / f"degoo-vault-{digest}.lock"
+    path = _upgrade_lock_path(root)
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags, 0o600)
@@ -1255,7 +1396,43 @@ def _acquire_upgrade_lock(root: Path) -> int:
     return fd
 
 
+def _validate_upgrade_lock_fd(root: Path, lock_fd: int) -> None:
+    """Validate and lock the inherited descriptor for this install's cache."""
+    _check_upgrade_mount_stopped(root)
+    if type(lock_fd) is not int or lock_fd < 0:
+        raise InstallError("the inherited cache-lock descriptor is invalid")
+    cache = root / "cache"
+    check_directory(cache, private=True)
+    path = _upgrade_lock_path(root)
+    try:
+        path_info = os.lstat(path)
+        fd_info = os.fstat(lock_fd)
+    except OSError:
+        raise InstallError("the inherited cache-lock descriptor could not be verified") from None
+    for info in (path_info, fd_info):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            raise InstallError("the inherited cache-lock file has unsafe ownership or permissions")
+    if (path_info.st_dev, path_info.st_ino) != (fd_info.st_dev, fd_info.st_ino):
+        raise InstallError("the inherited descriptor does not refer to this install's cache lock")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            raise InstallError("the Degoo cache is active; stop the mount before upgrading") from None
+        raise InstallError("the inherited cache-lock descriptor could not be locked") from None
+
+
 def install(args: argparse.Namespace) -> int:
+    upgrade_lock_fd = getattr(args, "upgrade_lock_fd", None)
+    if upgrade_lock_fd is not None and not args.upgrade:
+        raise InstallError("--upgrade-lock-fd can only be used with --upgrade")
+    package_sha256 = getattr(args, "package_sha256", None)
+    if package_sha256 is not None and (not isinstance(package_sha256, str) or not SHA256_PATTERN.fullmatch(package_sha256)):
+        raise InstallError("--package-sha256 must be a lowercase SHA-256 digest")
     supplied_folder_id = validate_folder_id(args.folder_id) if args.folder_id else ""
     folder_name = validate_folder_name(args.folder_name) if args.folder_name else ""
     supplied_parent_folder_id = getattr(args, "parent_folder_id", None)
@@ -1283,13 +1460,18 @@ def install(args: argparse.Namespace) -> int:
         raise InstallError("--upgrade requires an existing contained install")
     check_directory(root, private=True)
     load_manifest(root)
-    lock = _acquire_upgrade_lock(root)
+    if upgrade_lock_fd is None:
+        lock = _acquire_upgrade_lock(root)
+    else:
+        _validate_upgrade_lock_fd(root, upgrade_lock_fd)
+        lock = None
     try:
         if selected_mountpoint != "mount" and selected_mountpoint == DEFAULT_MOUNTPOINT:
             prepare_mountpoint(Path(DEFAULT_MOUNTPOINT))
         return _install(args)
     finally:
-        os.close(lock)
+        if lock is not None:
+            os.close(lock)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1304,6 +1486,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vault-config", help="private existing vault configuration to import on another machine")
     parser.add_argument("--restore-directory", help="private retained backup directory to restore through the interactive wizard")
     parser.add_argument("--upgrade", action="store_true", help="update the contained client while preserving its vault, login, settings, and cache")
+    parser.add_argument("--upgrade-lock-fd", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--package-sha256", help=argparse.SUPPRESS)
     parser.add_argument("--folder-created-by-setup", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--parent-folder-id", help=argparse.SUPPRESS)
     return parser

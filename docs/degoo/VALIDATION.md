@@ -8,6 +8,46 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Unattended client updates — 2026-10-13
+
+`degoo-rc update` now resolves the latest successful staging package, verifies
+its checksum and build provenance, preserves configuration and cache by
+default, and restores the prior active runtime mode. The optional
+`--delete-cache` path refuses pending writes and unknown or incomplete cache
+metadata. Installer failure restores the previous program files; restart
+failure returns an error with the new build and retained state available for
+recovery. An abrupt interruption can leave a program snapshot requiring
+explicit recovery; automated crash rollback has not been established.
+
+Validation passed:
+
+- All 350 Python helper tests, including 18 updater tests and the installer
+  identity and inherited-lock regressions. Focused updater tests also passed
+  after preserving a manual mount's original working directory.
+- A fresh `go build`, package self-check, Python syntax checks, scoped Markdown
+  lint, and `git diff --check`.
+- A real package built with the fresh binary, upgraded into a disposable
+  contained installation holding an older binary. Repeating the update with
+  `--delete-cache` was a no-op. No customer installation or Degoo vault was
+  used for this check.
+- Read-only live GitHub workflow lookup, artifact download, and checksum
+  verification against the latest successful staging package.
+- The full offline Go suite with `RCLONE_CONFIG=/notfound`. The first run used
+  an older system `rclone` lacking `test makefiles`, and lacked `fusermount3`.
+  The archive test and native mount/Docker tests passed with the fresh binary
+  and a temporary PATH alias to the installed root-owned FUSE 2 helper;
+  the complete suite was then rerun in that environment.
+
+Offline updater regressions cover checksum and archive-path rejection, no-op
+behavior without prior build identity, actual staged installation with inherited
+cache-lock ownership, byte-preserved configuration and pending data, rollback,
+service ownership conflicts, inactive-service handling, manual restart
+arguments and private logging, busy mounts and cache-lock conflicts, clean
+cache deletion without changing the held lock inode, orphan-data refusal, and
+cleanup/startup failure reporting. Runtime control is mocked in these updater
+checks. A live service-managed or manual Degoo mount update, provider behavior,
+and power-loss recovery remain unverified.
+
 ## Explicit installation startup errors
 
 Inspection confirmed that the installer already returned status `2` after an

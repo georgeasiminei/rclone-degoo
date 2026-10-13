@@ -422,6 +422,14 @@ checkout instead:
 ./contrib/degoo/degoo-rc install --binary ./build/rclone --upgrade --no-wizard
 ```
 
+On Linux amd64, `degoo-rc update` installs the latest successful staging
+package using the authenticated GitHub CLI (`gh`). The local fallback is
+`degoo-rc update --archive PATH`, which takes a `.tar.gz` package and its
+adjacent `.sha256` sidecar. The updater preserves configuration and cache by
+default. See the
+[installation guide](../../docs/degoo/INSTALLATION.md#update-the-installed-client)
+for validation, service lifecycle, and optional clean-cache removal.
+
 Cleanup stops the service linked to this install, removes its owned systemd
 links, reloads the user manager, and deletes the contained local files. Remote
 encrypted files, the external `/mnt/degoo` directory, account-wide sessions,
@@ -432,8 +440,8 @@ untouched. Empty shared directories under the user systemd config path may remai
 
 Use `degoo-rc help` to list commands. Run `degoo-rc COMMAND help` for that
 command's options and examples. The interface includes `install`, `uninstall`,
-`login`, `setup`, `mount`, `mount-setup`, `stop`, `status`, `location`,
-`folders`, `service`, `info`, `logs`, `trash`, and `empty-trash`. Run
+`login`, `setup`, `mount`, `mount-setup`, `stop`, `status`, `update`,
+`location`, `folders`, `service`, `info`, `logs`, `trash`, and `empty-trash`. Run
 `mount-setup` explicitly with `sudo` to install the helper for an immutable
 `/mnt/degoo`; it does not mount the vault or start its service. `service`
 accepts `enable`, `disable`, `start`, `stop`, `restart`, and `status`. Existing

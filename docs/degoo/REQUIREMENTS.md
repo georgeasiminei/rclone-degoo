@@ -230,6 +230,24 @@ form, and access/refresh tokens. Restoring a backup requires a fresh login.
   subdirectory. Select a dedicated vault under a discovered Degoo device
   folder by default when creation at account root ID `0` is unsupported.
 
+The user-requested client update lifecycle (2026-10-13) is:
+
+- Provide `degoo-rc update` to install the latest successful package from
+  `staging`. Package delivery may move to GitHub releases in the future without
+  changing the user's update workflow.
+- Keep enough installed build identity to recognize an unchanged build. An
+  unchanged update is a no-op: do not rewrite configuration or change the
+  service, cache, or install state, even when `--delete-cache` is supplied.
+- Preserve configuration and pending local changes across updates. Keep the
+  cache by default. Optional `--delete-cache` may remove it only when the
+  pending-write state is proven clear; unknown or unverifiable state must block
+  deletion.
+- Respect the prior runtime state. Safely stop the contained service or manual
+  mount before replacement, leave an inactive installation inactive, and
+  restore only a service or mount that was active before the update. Report a
+  nonzero failure when replacement or restart fails. If the new build installed
+  but its restart fails, retain the new build and configuration for recovery.
+
 Configuration must provide a way to set these values or their equivalents:
 
 - The remote root directory reserved for the encrypted vault.

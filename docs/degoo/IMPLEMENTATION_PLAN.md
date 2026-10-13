@@ -22,6 +22,52 @@ encrypted data. This does not establish live Degoo provider behavior.
 
 ## Implementation decisions and validation plan
 
+### Verified unattended package updates
+
+The contained Linux amd64 client provides `degoo-rc update`. Its current
+`ActionsSource` resolver uses authenticated `gh` to select the latest
+successful `degoo-package.yml` workflow artifact on `staging`; it does not
+read GitHub releases. The resolver boundary can later select release assets,
+but that source is not implemented today. `--archive PATH` accepts a local
+`.tar.gz` package with its adjacent SHA-256 sidecar and bypasses GitHub.
+Manual mounts and installs with no owned service links do not require a
+systemd user manager.
+
+The updater verifies the archive checksum, binary hash in `docs/BUILD.json`,
+and (for an Actions download) the clean source commit against the workflow run
+before changing mount or install state. It then compares the installed binary
+and managed helper files. The install manifest records `build.version: 1`,
+`build.binary_sha256`, `build.payload_sha256`, and a verified `build.commit`
+when available. Updates also record `build.package_sha256` and
+`build.source`, including `build.run_id` for Actions downloads.
+Documentation-only changes do not alter the managed payload; an identical
+payload causes a no-op that leaves the service, configuration, manifest, and
+cache untouched, including when `--delete-cache` was requested.
+
+An update stops only a verified owned service or a uniquely identified manual
+mount, waits until the kernel reports it unmounted, and holds the vault cache
+lock through replacement. Service enablement is retained; only a previously
+active service or recognized manual mount is resumed, and the updater confirms
+a connected mount. Manual mounts resume in the background with their prior
+arguments. Inactive installations remain inactive. Busy or ambiguous mounts
+and conflicts in the owned service's links or loaded unit block the update.
+Pending writes and unverifiable cache state block `--delete-cache`; an ordinary
+update preserves the cache.
+
+Cache removal is opt-in and runs only after a different payload was installed.
+The held lock inode remains in place. Deletion requires the known cache
+identity, paired VFS data and metadata, and complete metadata proving clean
+entries with a fingerprint; pending, unknown, unpaired, and unexpected entries
+are preserved by refusal. Installer failure restores the previous managed
+program snapshot. A restart failure returns nonzero and leaves the installed
+build and configuration available for recovery. An abrupt termination can
+leave the snapshot at `tmp/update-backup`, which blocks another update and
+requires explicit recovery; automatic crash rollback is not provided. Offline
+tests cover archive validation, no-op behavior, and install rollback. They
+also cover pending-cache refusal and cache-lock preservation. They do not
+establish live Degoo service
+behavior.
+
 ### Explicit installation startup errors
 
 When automatic startup is selected, a rejected service request or an
@@ -184,7 +230,8 @@ cannot be inferred from mock results or from the partial live probes.
 
 The contained install and cleanup experience is part of the user handoff. The
 unified `degoo-rc` entrypoint provides `install`, `uninstall`, `backup-config`,
-`login`, `setup`, `mount`, `stop`, `status`, `benchmark`, `sync`, `location`,
+`login`, `setup`, `mount`, `stop`, `status`, `update`, `benchmark`, `sync`,
+`location`,
 `folders`, `service`, `info`, `logs`, `trash`, and `empty-trash`. Source
 checkouts use
 `./contrib/degoo/degoo-rc install`; archive users run

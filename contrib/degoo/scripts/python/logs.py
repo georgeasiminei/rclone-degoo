@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 import install as installer
 
 
-LOG_NAMES = ("mount.log", "login.log", "setup.log", "status.log", "diagnostics.log")
+LOG_NAMES = ("update-mount.log", "mount.log", "login.log", "setup.log", "status.log", "diagnostics.log")
 AUTH_LOG_NAMES = ("mount.log", "login.log", "diagnostics.log")
 DEFAULT_LINES = 100
 MAX_LOG_BYTES = 4 * 1024 * 1024
