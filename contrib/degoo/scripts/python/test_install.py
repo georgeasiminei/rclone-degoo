@@ -85,6 +85,15 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(mountpoint.is_dir())
         self.assertEqual(stat.S_IMODE(mountpoint.stat().st_mode), 0o700)
 
+    def test_binary_help_cannot_create_configuration_in_the_real_home(self) -> None:
+        self.binary.write_text(
+            "#!/bin/sh\nmkdir -p \"$HOME/.config/rclone\"\necho 'degoo login mount'\n",
+            encoding="utf-8",
+        )
+        self.binary.chmod(0o700)
+        install.validate_binary(self.binary)
+        self.assertFalse((self.home / ".config").exists())
+
     def test_package_identity_is_stable_and_accepts_matching_clean_build_provenance(self) -> None:
         package = self.base / "package"
         binary = self.base / "rclone"

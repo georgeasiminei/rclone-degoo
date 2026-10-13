@@ -21,9 +21,10 @@ explicit recovery; automated crash rollback has not been established.
 
 Validation passed:
 
-- All 350 Python helper tests, including 18 updater tests and the installer
+- All 351 Python helper tests, including 18 updater tests and the installer
   identity and inherited-lock regressions. Focused updater tests also passed
-  after preserving a manual mount's original working directory.
+  after preserving a manual mount's original working directory. Binary help
+  checks also prove they cannot create configuration in the real home.
 - A fresh `go build`, package self-check, Python syntax checks, scoped Markdown
   lint, and `git diff --check`.
 - A real package built with the fresh binary, upgraded into a disposable

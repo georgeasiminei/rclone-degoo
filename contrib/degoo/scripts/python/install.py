@@ -18,6 +18,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -975,15 +976,19 @@ def install_fuse_helper(root: Path) -> None:
 
 def validate_binary(binary: Path) -> None:
     try:
-        result = subprocess.run(
-            [str(binary), "degoo", "--help"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env={"HOME": str(home_directory()), "PATH": "/usr/bin:/bin", "LANG": "C"},
-            timeout=30,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(prefix="degoo-binary-check-") as temporary:
+            isolated = Path(temporary)
+            result = subprocess.run(
+                [str(binary), "degoo", "--help"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env={"HOME": temporary, "PATH": "/usr/bin:/bin", "LANG": "C",
+                     "XDG_CONFIG_HOME": str(isolated / "config"),
+                     "XDG_CACHE_HOME": str(isolated / "cache"), "RCLONE_CONFIG": os.devnull},
+                timeout=30,
+                check=False,
+            )
     except (OSError, subprocess.TimeoutExpired):
         raise InstallError("the supplied rclone binary could not verify its Degoo command") from None
     if result.returncode != 0 or b"mount" not in result.stdout or b"login" not in result.stdout:
