@@ -47,6 +47,7 @@ type syncEndpoint struct {
 	socketDev  uint64
 	socketIno  uint64
 	refreshMu  sync.Mutex
+	updates    *updateControl
 }
 
 func startSyncEndpoint(socketPath string, mountedVFS *vfs.VFS, flushRaw func()) (*syncEndpoint, error) {
@@ -82,6 +83,7 @@ func startSyncEndpoint(socketPath string, mountedVFS *vfs.VFS, flushRaw func()) 
 		socketPath: socketPath,
 		socketDev:  socketStat.Dev,
 		socketIno:  socketStat.Ino,
+		updates:    &updateControl{mountedVFS: mountedVFS, lease: updateLease},
 	}
 	handler := &syncHandler{mountedVFS: mountedVFS, flushRaw: flushRaw, endpoint: endpoint}
 	endpoint.server = &http.Server{
@@ -98,6 +100,7 @@ func (endpoint *syncEndpoint) Close() error {
 	if endpoint == nil {
 		return nil
 	}
+	endpoint.updates.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := endpoint.server.Shutdown(ctx)
@@ -155,6 +158,12 @@ func queueStatus(ctx context.Context, mountedVFS *vfs.VFS) (uploadQueueStatus, e
 }
 
 func (handler *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/update/") {
+		handler.endpoint.refreshMu.Lock()
+		defer handler.endpoint.refreshMu.Unlock()
+		handler.endpoint.updates.ServeHTTP(w, r)
+		return
+	}
 	if r.URL.Path == "/status" && r.URL.RawQuery == "" && r.Method == http.MethodGet {
 		status, err := queueStatus(r.Context(), handler.mountedVFS)
 		if err != nil {
@@ -191,6 +200,10 @@ func (handler *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	handler.endpoint.refreshMu.Lock()
 	defer handler.endpoint.refreshMu.Unlock()
+	if handler.endpoint.updates.busy() {
+		writeSyncError(w, http.StatusConflict, "mount is preparing for an update")
+		return
+	}
 	started := time.Now()
 	fs.Logf(nil, "degoo: refreshing mounted remote view (path %q, recursive %t)", cleanPath, *request.Recursive)
 	handler.flushRaw()

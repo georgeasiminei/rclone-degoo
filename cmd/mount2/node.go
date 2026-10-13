@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path"
+	"sync"
 	"syscall"
 
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
@@ -219,6 +220,21 @@ func (n *Node) Opendir(ctx context.Context) syscall.Errno {
 
 var _ = (fusefs.NodeOpendirer)((*Node)(nil))
 
+// OpendirHandle retains the VFS directory handle for the lifetime of the FUSE
+// directory handle so maintenance waits for open directory descriptors.
+func (n *Node) OpendirHandle(ctx context.Context, flags uint32) (fusefs.FileHandle, uint32, syscall.Errno) {
+	if !n.node.IsDir() {
+		return nil, 0, syscall.ENOTDIR
+	}
+	handle, err := n.node.Open(int(flags))
+	if err != nil {
+		return nil, 0, translateError(err)
+	}
+	return &dirFileHandle{handle: handle}, 0, 0
+}
+
+var _ fusefs.NodeOpendirHandler = (*Node)(nil)
+
 type dirStream struct {
 	nodes []os.FileInfo
 	i     int
@@ -291,6 +307,75 @@ func (ds *dirStream) Seekdir(_ context.Context, off uint64) syscall.Errno {
 
 var _ fusefs.DirStream = (*dirStream)(nil)
 var _ fusefs.FileSeekdirer = (*dirStream)(nil)
+
+// dirFileHandle couples the seekable directory snapshot with its tracked VFS
+// handle. Its mutex serializes reads, seeks, and release on the same FUSE FD.
+type dirFileHandle struct {
+	mu       sync.Mutex
+	handle   vfs.Handle
+	stream   *dirStream
+	released bool
+}
+
+func (h *dirFileHandle) openStream() syscall.Errno {
+	if h.released {
+		return syscall.EBADF
+	}
+	if h.stream != nil {
+		return 0
+	}
+	items, err := h.handle.Readdir(-1)
+	if err != nil {
+		return translateError(err)
+	}
+	h.stream = &dirStream{nodes: items}
+	return 0
+}
+
+// Readdirent returns the next entry from this open directory's snapshot.
+func (h *dirFileHandle) Readdirent(_ context.Context) (*fuse.DirEntry, syscall.Errno) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if errno := h.openStream(); errno != 0 {
+		return nil, errno
+	}
+	if !h.stream.HasNext() {
+		return nil, 0
+	}
+	entry, errno := h.stream.Next()
+	if errno != 0 {
+		return nil, errno
+	}
+	return &entry, 0
+}
+
+// Seekdir repositions the snapshot, including rewinding this open FD.
+func (h *dirFileHandle) Seekdir(ctx context.Context, off uint64) syscall.Errno {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if errno := h.openStream(); errno != 0 {
+		return errno
+	}
+	return h.stream.Seekdir(ctx, off)
+}
+
+// Releasedir closes the tracked VFS handle once all local callbacks finish.
+func (h *dirFileHandle) Releasedir(_ context.Context, _ uint32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.released {
+		return
+	}
+	h.released = true
+	if h.stream != nil {
+		h.stream.Close()
+	}
+	_ = h.handle.Close()
+}
+
+var _ fusefs.FileReaddirenter = (*dirFileHandle)(nil)
+var _ fusefs.FileSeekdirer = (*dirFileHandle)(nil)
+var _ fusefs.FileReleasedirer = (*dirFileHandle)(nil)
 
 // Readdir opens a stream of directory entries.
 //

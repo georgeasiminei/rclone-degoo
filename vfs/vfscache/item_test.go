@@ -135,6 +135,63 @@ func TestItemSync(t *testing.T) {
 	require.NoError(t, item.Close(nil))
 }
 
+func TestItemSyncDurableAfterClose(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.HandleCaching = 0
+	opt.WriteBack = fs.Duration(time.Hour)
+	_, c := newTestCacheOpt(t, opt)
+	name := "nested/deep/maintenance"
+	item := c.Item(name)
+	require.NoError(t, item.Open(nil))
+	_, err := item.WriteAt([]byte("local data"), 0)
+	require.NoError(t, err)
+	require.NoError(t, item.Close(nil))
+	require.True(t, item.IsDirty())
+
+	require.NoError(t, c.Sync(context.Background()))
+	data, err := os.ReadFile(c.toOSPath(name))
+	require.NoError(t, err)
+	assert.Equal(t, "local data", string(data))
+
+	reloaded := newItem(c, name)
+	assert.True(t, reloaded.IsDirty(), "closed dirty metadata should remain recoverable")
+	assert.Len(t, c.Queue()["queue"], 1, "local sync must not wait for remote writeback")
+}
+
+func TestCacheSyncSkipsUnopenedProbe(t *testing.T) {
+	_, c := newTestCache(t)
+
+	const name = "never-opened"
+	assert.False(t, c.Exists(name))
+	require.NoError(t, c.Sync(context.Background()))
+
+	_, err := os.Stat(c.toOSPath(name))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Stat(c.toOSPathMeta(name))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestCacheSyncFailsForDirtyItemWithoutData(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.HandleCaching = 0
+	opt.WriteBack = fs.Duration(time.Hour)
+	_, c := newTestCacheOpt(t, opt)
+
+	const name = "dirty-without-data"
+	item := c.Item(name)
+	require.NoError(t, item.Open(nil))
+	_, err := item.WriteAt([]byte("local data"), 0)
+	require.NoError(t, err)
+	require.NoError(t, item.Close(nil))
+	require.True(t, item.IsDirty())
+	require.NoError(t, os.Remove(c.toOSPath(name)))
+
+	err = c.Sync(context.Background())
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func TestItemTruncateNew(t *testing.T) {
 	r, c := newItemTestCache(t)
 	item, _ := c.get("potato")

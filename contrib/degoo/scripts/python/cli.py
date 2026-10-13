@@ -16,6 +16,7 @@ import install as installer
 BASE = Path(__file__).resolve().parents[2]
 COMMANDS = {
     "install": "Install or upgrade the client and configure a vault with a guided wizard.",
+    "update": "Install the latest verified package, preserving configuration and pending writes.",
     "uninstall": "Inventory or remove the local installation, with optional state retention.",
     "backup-config": "Back up vault configuration without account passwords or authentication tokens.",
     "login": "Sign in and save an encrypted account password for automatic recovery.",
@@ -34,8 +35,9 @@ COMMANDS = {
     "trash": "List account-wide trash without deleting anything.",
     "empty-trash": "Permanently delete all account trash after confirmation; supports dry-run.",
 }
-PYTHON_COMMANDS = {"install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "service", "info", "logs", "status", "mount-setup"}
+PYTHON_COMMANDS = {"install", "update", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "service", "info", "logs", "status", "mount-setup"}
 DETAILS = {
+    "update": "Downloads the latest successful staging package using authenticated gh. Verifies checksums and build provenance before stopping anything. Waits up to --writer-timeout (30s by default) for open handles and flushes the local cache before normal unmount. --wait-for-uploads optionally waits for remote writeback; preparation failure leaves the mount running. Restores an active service or recognised manual mount; inactive installs stay inactive. Configuration and cache are preserved. --delete-cache refuses pending or unverifiable writes, and has no effect when already current. --archive PATH uses a local tar.gz and its checksum sidecar. Install failures restore the previous program files; startup failures retain the installed update for recovery.",
     "install": "With no parameters, starts the wizard. Installs into ~/.local/share/rclone-degoo and links ~/.local/bin/degoo-rc. An unattended install needs --binary and --no-wizard. Upgrade preserves configuration and cached writes.",
     "uninstall": "With no parameters in a terminal, starts guided cleanup. --inventory is read-only. Removal affects local installation files and owned service/PATH links; remote files remain. Pending writes require retaining both cache and matching configuration.",
     "backup-config": "Creates a private vault configuration backup without stopping the mount. --directory selects a new destination outside the install. Account passwords, authentication tokens, file data, cache, and pending uploads are excluded. Restore with install --wizard --restore-directory PATH and log in again.",

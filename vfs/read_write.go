@@ -17,10 +17,11 @@ import (
 // transferred to the remote.
 type RWFileHandle struct {
 	// read only variables
-	file  *File
-	d     *Dir
-	flags int            // open flags
-	item  *vfscache.Item // cached file item
+	file        *File
+	d           *Dir
+	flags       int            // open flags
+	item        *vfscache.Item // cached file item
+	maintenance *maintenanceHandle
 
 	// read write variables protected by mutex
 	mu          sync.Mutex
@@ -163,6 +164,7 @@ func (fh *RWFileHandle) close() (err error) {
 	}
 
 	fh.closed = true
+	defer fh.maintenance.release()
 	fh.updateSize()
 	if fh.opened {
 		err = fh.item.Close(fh.file.setObject)

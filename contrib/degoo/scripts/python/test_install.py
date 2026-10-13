@@ -72,6 +72,8 @@ class InstallTest(unittest.TestCase):
         prepare_mountpoint.assert_called_once_with(Path(install.DEFAULT_MOUNTPOINT))
         manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["mountpoint"], install.DEFAULT_MOUNTPOINT)
+        self.assertEqual(manifest["build"]["version"], 1)
+        self.assertEqual(manifest["build"]["binary_sha256"], install._file_sha256(self.root / "bin/rclone"))
         wrapper = (self.root / "scripts/mount.sh").read_text(encoding="utf-8")
         self.assertIn(f"MOUNTPOINT={shlex.quote(install.DEFAULT_MOUNTPOINT)}", wrapper)
 
@@ -82,6 +84,59 @@ class InstallTest(unittest.TestCase):
 
         self.assertTrue(mountpoint.is_dir())
         self.assertEqual(stat.S_IMODE(mountpoint.stat().st_mode), 0o700)
+
+    def test_binary_help_cannot_create_configuration_in_the_real_home(self) -> None:
+        self.binary.write_text(
+            "#!/bin/sh\nmkdir -p \"$HOME/.config/rclone\"\necho 'degoo login mount'\n",
+            encoding="utf-8",
+        )
+        self.binary.chmod(0o700)
+        install.validate_binary(self.binary)
+        self.assertFalse((self.home / ".config").exists())
+
+    def test_package_identity_is_stable_and_accepts_matching_clean_build_provenance(self) -> None:
+        package = self.base / "package"
+        binary = self.base / "rclone"
+        self.write_binary(binary, "# package identity fixture\n")
+        source_names = {
+            Path("degoo-rc"),
+            Path("scripts/install.sh"),
+            Path("scripts/python/cli.py"),
+            Path("scripts/python/update.py"),
+            Path("immutable-mount/helper.c"),
+        }
+        with (
+            mock.patch.object(install, "SOURCE_FILES", ("cli.py", "update.py")),
+            mock.patch.object(install, "SOURCE_SHELL_FILES", ("install.sh",)),
+            mock.patch.object(install, "IMMUTABLE_MOUNT_FILES", ("helper.c",)),
+        ):
+            for relative in source_names:
+                path = package / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"fixture:{relative.as_posix()}\n", encoding="utf-8")
+            (package / "docs").mkdir()
+            commit = "a" * 40
+            metadata = {
+                "version": 1,
+                "binary_sha256": install._file_sha256(binary),
+                "commit": commit,
+                "source_dirty": False,
+            }
+            (package / "docs/BUILD.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+            first = install.package_identity(binary, package)
+            self.assertEqual(first, install.package_identity(binary, package))
+            self.assertEqual(first["binary_sha256"], metadata["binary_sha256"])
+            self.assertEqual(first["commit"], commit)
+            self.assertRegex(first["payload_sha256"], r"^[0-9a-f]{64}$")
+
+            (package / "scripts/python/update.py").write_text("changed helper\n", encoding="utf-8")
+            changed = install.package_identity(binary, package)
+            self.assertNotEqual(changed["payload_sha256"], first["payload_sha256"])
+
+            metadata["binary_sha256"] = "0" * 64
+            (package / "docs/BUILD.json").write_text(json.dumps(metadata), encoding="utf-8")
+            self.assertNotIn("commit", install.package_identity(binary, package))
 
     def test_mountpoint_permission_instructions_precede_install_mutation(self) -> None:
         mountpoint = self.base / "restricted" / "degoo"
@@ -503,6 +558,7 @@ class InstallTest(unittest.TestCase):
         cache_file = self.root / "cache/pending-upload"
         cache_file.write_bytes(b"pending local data")
         cache_before = cache_file.read_bytes()
+        original_payload_hash = json.loads((self.root / "install.json").read_text(encoding="utf-8"))["build"]["payload_sha256"]
         (self.root / "config/login.json").write_text('{"email":"owner@example.test"}\n', encoding="utf-8")
         (self.root / "config/login.json").chmod(0o600)
         self.write_binary(self.binary, "# version two\n")
@@ -529,7 +585,11 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn("buffer_size", upgraded_settings)
         self.assertIn('exec "$BASE/scripts/mount.sh" "$@"', legacy_mount.read_text(encoding="utf-8"))
         self.assertEqual(os.readlink(self.home / ".local/bin/degoo-rc"), str(self.root / "degoo-rc"))
-        self.assertEqual(json.loads((self.root / "install.json").read_text(encoding="utf-8"))["path_link"], str(self.home / ".local/bin/degoo-rc"))
+        upgraded_manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        self.assertEqual(upgraded_manifest["path_link"], str(self.home / ".local/bin/degoo-rc"))
+        self.assertEqual(upgraded_manifest["build"]["version"], 1)
+        self.assertEqual(upgraded_manifest["build"]["binary_sha256"], install._file_sha256(self.root / "bin/rclone"))
+        self.assertNotEqual(upgraded_manifest["build"]["payload_sha256"], original_payload_hash)
 
     def test_mount_settings_require_valid_positive_write_back_duration(self) -> None:
         legacy = {
@@ -699,6 +759,50 @@ class InstallTest(unittest.TestCase):
             code, _, stderr = self.invoke("--upgrade")
             self.assertEqual(code, 2)
             self.assertIn("cache is active", stderr)
+        finally:
+            os.close(fd)
+
+    def test_upgrade_accepts_inherited_lock_without_releasing_parent_lock(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        old_binary = (self.root / "bin/rclone").read_bytes()
+        self.write_binary(self.binary, "# version inherited lock\n")
+        fd = install._acquire_upgrade_lock(self.root)
+        try:
+            package_sha256 = "b" * 64
+            code, _, stderr = self.invoke(
+                "--upgrade", "--upgrade-lock-fd", str(fd), "--package-sha256", package_sha256
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertNotEqual((self.root / "bin/rclone").read_bytes(), old_binary)
+            manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["build"]["package_sha256"], package_sha256)
+            with self.assertRaisesRegex(install.InstallError, "cache is active"):
+                install._acquire_upgrade_lock(self.root)
+        finally:
+            os.close(fd)
+
+    def test_upgrade_rejects_invalid_or_unrequested_inherited_lock_fd(self) -> None:
+        code, _, stderr = self.invoke("--upgrade-lock-fd", "999")
+        self.assertEqual(code, 2)
+        self.assertIn("only be used with --upgrade", stderr)
+
+        code, _, stderr = self.invoke("--package-sha256", "not-a-digest")
+        self.assertEqual(code, 2)
+        self.assertIn("lowercase SHA-256 digest", stderr)
+
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        cache_lock_fd = install._acquire_upgrade_lock(self.root)
+        os.close(cache_lock_fd)
+        wrong_lock = self.base / "wrong-lock"
+        wrong_lock.write_text("not this cache lock\n", encoding="ascii")
+        wrong_lock.chmod(0o600)
+        fd = os.open(wrong_lock, os.O_RDWR)
+        try:
+            code, _, stderr = self.invoke("--upgrade", "--upgrade-lock-fd", str(fd))
+            self.assertEqual(code, 2)
+            self.assertIn("does not refer to this install's cache lock", stderr)
         finally:
             os.close(fd)
 

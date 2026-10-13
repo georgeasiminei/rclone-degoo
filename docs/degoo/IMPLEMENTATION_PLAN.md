@@ -22,6 +22,78 @@ encrypted data. This does not establish live Degoo provider behavior.
 
 ## Implementation decisions and validation plan
 
+### Verified unattended package updates
+
+The contained Linux amd64 client provides `degoo-rc update`. Its current
+`ActionsSource` resolver uses authenticated `gh` to select the latest
+successful `degoo-package.yml` workflow artifact on `staging`; it does not
+read GitHub releases. The resolver boundary can later select release assets,
+but that source is not implemented today. `--archive PATH` accepts a local
+`.tar.gz` package with its adjacent SHA-256 sidecar and bypasses GitHub.
+Manual mounts and installs with no owned service links do not require a
+systemd user manager.
+
+The updater verifies the archive checksum, binary hash in `docs/BUILD.json`,
+and (for an Actions download) the clean source commit against the workflow run
+before changing mount or install state. It then compares the installed binary
+and managed helper files. The install manifest records `build.version: 1`,
+`build.binary_sha256`, `build.payload_sha256`, and a verified `build.commit`
+when available. Updates also record `build.package_sha256` and
+`build.source`, including `build.run_id` for Actions downloads.
+Documentation-only changes do not alter the managed payload; an identical
+payload causes a no-op that leaves the service, configuration, manifest, and
+cache untouched, including when `--delete-cache` or wait options were supplied.
+
+For a mounted vault, the updater first calls the running client through its
+owner-private control socket to enter generic VFS maintenance. The barrier
+refuses new opens and file or directory mutations with `EBUSY`, while allowing
+existing operations to finish. It waits for in-flight operations and all
+tracked file and directory handles, including read handles, to close, then
+flushes cached file data and metadata to stable storage. `--writer-timeout`
+defaults to `30s` and is capped at `1h`; the same deadline bounds handle drain
+and local flush. The updater never prints the opaque preparation token.
+
+Local flush is separate from remote upload completion. The default
+`--wait-for-uploads off` preserves closed pending uploads in the cache for the
+mount's retry queue after restart. A positive duration waits for uploads to
+reach zero before shutdown, with a maximum of `1d`. A writer timeout, upload
+timeout, local flush failure, or unsupported older mounted client fails before
+the updater stops the runtime. Preparation failure releases the barrier; an
+abandoned successful preparation is bounded by a 120-second lease. Already
+current packages return before preparation and do not change runtime or cache
+state, even when wait options are supplied.
+
+Only after successful preparation does the updater request a normal FUSE
+unmount and verify that the kernel mount is gone; it asks systemd to stop an
+owned service afterward. A busy normal unmount keeps the service active and
+releases the barrier. The updater then holds the vault cache lock through
+replacement. Service enablement is retained; only a previously active service
+or recognized manual mount is resumed, and the updater confirms a connected
+mount. Manual mounts resume in the background with their prior arguments and
+working directory. Inactive installations remain inactive. Busy or ambiguous
+mounts and conflicts in the owned service's links or loaded unit block the
+update. Pending writes and unverifiable cache state block `--delete-cache`; an
+ordinary update preserves the cache.
+
+A running mount without the preparation endpoint is not stopped automatically.
+The user must unmount it normally and rerun the update while it is inactive; an
+installation old enough to lack the updater command requires a one-time archive
+upgrade after stopping the mount.
+
+Cache removal is opt-in and runs only after a different payload was installed.
+The held lock inode remains in place. Deletion requires the known cache
+identity, paired VFS data and metadata, and complete metadata proving clean
+entries with a fingerprint; pending, unknown, unpaired, and unexpected entries
+are preserved by refusal. Installer failure restores the previous managed
+program snapshot. A restart failure returns nonzero and leaves the installed
+build and configuration available for recovery. An abrupt termination can
+leave the snapshot at `tmp/update-backup`, which blocks another update and
+requires explicit recovery; automatic crash rollback is not provided. Offline
+tests cover archive validation, no-op behavior, and install rollback. They
+also cover pending-cache refusal and cache-lock preservation. They do not
+establish live Degoo service
+behavior.
+
 ### Explicit installation startup errors
 
 When automatic startup is selected, a rejected service request or an
@@ -184,7 +256,8 @@ cannot be inferred from mock results or from the partial live probes.
 
 The contained install and cleanup experience is part of the user handoff. The
 unified `degoo-rc` entrypoint provides `install`, `uninstall`, `backup-config`,
-`login`, `setup`, `mount`, `stop`, `status`, `benchmark`, `sync`, `location`,
+`login`, `setup`, `mount`, `stop`, `status`, `update`, `benchmark`, `sync`,
+`location`,
 `folders`, `service`, `info`, `logs`, `trash`, and `empty-trash`. Source
 checkouts use
 `./contrib/degoo/degoo-rc install`; archive users run

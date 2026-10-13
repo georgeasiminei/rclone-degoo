@@ -283,6 +283,97 @@ login saves tokens only. A rejected refresh can trigger password login; network
 and temporary server errors do not. Long-term unattended renewal remains
 unverified.
 
+### Update the installed client
+
+The Linux amd64 `degoo-rc update` command downloads the latest successful
+`degoo-package.yml` artifact on the fork's `staging` branch. It uses the
+authenticated GitHub CLI (`gh`); install it and run `gh auth login` if needed.
+To use a local package instead, pass the `.tar.gz` path with its matching
+`.tar.gz.sha256` sidecar beside it:
+
+```sh
+degoo-rc update
+degoo-rc update --archive ~/Downloads/rclone-degoo-linux-amd64.tar.gz
+degoo-rc update --delete-cache
+degoo-rc update --writer-timeout 2m
+degoo-rc update --wait-for-uploads 1h
+```
+
+The local archive option does not use GitHub or `gh`. A systemd user manager
+is needed only to inspect or control a service owned by this installation;
+manual mounts and installs with no owned service links do not require systemd.
+Before stopping an owned mount, the updater verifies the archive checksum and
+binary hash in `docs/BUILD.json`. For an Actions download, it also matches the
+source commit against the workflow run. It compares the installed binary and
+helper payload. An identical payload is a no-op, even with `--delete-cache` or
+wait options, and leaves the service, configuration, install manifest, and
+cache untouched. Documentation changes alone do not change this payload hash.
+
+For a mounted vault, the updater briefly refuses new opens and file or
+directory changes while existing operations finish and every open file or
+directory handle closes. `--writer-timeout` defaults to `30s`, accepts up to
+`1h`, and includes read handles. A timeout or local cache-flush failure leaves
+the mount running. Local cached data and metadata are flushed before shutdown.
+Pending uploads remain locally available for retry by default; use
+`--wait-for-uploads DURATION` to wait for remote completion first (off by
+default, maximum `1d`). If the upload wait expires, the runtime remains running.
+
+The private `install.json` manifest records `build.version: 1`,
+`build.binary_sha256`, `build.payload_sha256`, and verified `build.commit` when
+available. The payload covers the executable, `degoo-rc`, managed shell and
+Python helpers, and immutable-mount files, not documentation. An update also
+records `build.package_sha256` and `build.source`; Actions packages include
+`build.run_id`. This identifies the installed program separately from vault
+configuration and cache.
+
+After preparation, the updater requests a normal FUSE unmount and verifies that
+the kernel mount is gone before asking systemd to stop an owned service. A busy
+unmount keeps the service active and releases the preparation barrier. Timeouts,
+flush failures, and running mounts without preparation support fail before
+runtime shutdown. Unmount an older running mount normally, then retry the
+update. After unmount, the updater holds the cache lock while installing. It
+keeps service enablement unchanged, restarts only a service that was active,
+and confirms that the new mount is connected. A recognized manual mount
+resumes in the background with its original arguments and working directory,
+logging to the private `logs/update-mount.log`; an inactive install stays
+inactive. Busy or unidentified mounts and conflicts in the owned service's
+recorded/matching links or loaded unit stop the update before program
+replacement. Pending uploads or unverifiable cache state block
+`--delete-cache`; an ordinary update preserves pending and unknown cache data.
+
+The cache stays in place by default. `--delete-cache` applies only when a new
+payload is installed. The updater retains the held cache-lock inode and
+requires the known cache identity, paired VFS data and metadata, and metadata
+proving every entry clean with a fingerprint. Pending, unknown, unpaired, or
+unexpected cache data blocks deletion.
+
+If installation fails, the previous program files are restored from
+`~/.local/share/rclone-degoo/tmp/update-backup`. If restart fails, the command
+returns nonzero and leaves the new program and configuration available for
+recovery. By default the cache is also preserved. Check `degoo-rc info` and
+`degoo-rc logs`, then retry with `degoo-rc service start` or `degoo-rc mount`.
+An abrupt process or system interruption can leave the backup behind; a later
+update refuses to overwrite it. Keep the backup intact and resolve it manually
+before retrying, since crash rollback is not automatic.
+
+An older installation without the `update` command needs one ordinary archive
+upgrade first. Stop an active service normally and run the new archive's
+installer. If an existing updater reports that a running mount lacks safe
+preparation support, unmount normally and rerun `degoo-rc update` while it is
+inactive:
+
+```sh
+degoo-rc service stop
+./degoo-rc install --binary ./bin/rclone --upgrade --no-wizard
+degoo-rc service start
+```
+
+For a manual mount, use `degoo-rc stop` before upgrading and `degoo-rc mount`
+For a manual mount, run `degoo-rc stop` before the archive upgrade and
+`degoo-rc mount` afterward. Future updates can prepare the upgraded running
+mount before stopping it. Future versions may use GitHub releases as the remote
+package source; the current remote source is the workflow artifact.
+
 Run `degoo-rc info` to inspect mount, service, cache, and
 pending-upload status. Keep the cache until pending uploads reach zero. A
 locally saved file may still await remote upload; pending changes and their
@@ -357,7 +448,8 @@ rclone-degoo/
   licenses/degoo-NOTICE
 ```
 
-The archive root has one Degoo command: `degoo-rc`. It dispatches to shell
+The archive root has one Degoo command: `degoo-rc`, including the `update`
+command for unattended Linux amd64 package updates. It dispatches to shell
 helpers in `scripts/` and Python implementations in `scripts/python/`, including
 the internal `scripts/trash.sh` helper. Fresh installs also have `degoo-rc` as
 their only root-level Degoo command. In-place upgrades may retain root-level

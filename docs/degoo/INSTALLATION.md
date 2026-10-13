@@ -188,6 +188,8 @@ Download the `rclone-degoo-linux-amd64` artifact from a successful
 Extract the artifact ZIP to get `rclone-degoo-linux-amd64.tar.gz` and its
 `.sha256` sidecar, then verify the checksum as shown below. These builds are
 workflow artifacts rather than GitHub releases.
+The unattended updater reads the latest successful run of this same workflow
+on `staging`; GitHub release assets are not a current update source.
 
 From the repository root, build the Degoo-enabled binary and create the Linux
 amd64 archive with its SHA-256 sidecar:
@@ -557,6 +559,120 @@ For a manual foreground mount, use `degoo-rc stop` to unmount.
 Upgrade preserves the vault secret, account tokens, email, remote settings,
 mount settings, and cache; it refuses a change to the folder ID.
 
+### Update the installed client
+
+On Linux amd64, `degoo-rc update` downloads the latest successful
+`degoo-package.yml` artifact from the fork's `staging` branch. The updater uses
+the authenticated GitHub CLI (`gh`); install it and run `gh auth login` if the
+command is unavailable or unauthenticated. A local package can be used instead
+with `--archive PATH`; `PATH` must name the `.tar.gz` file with its matching
+`.tar.gz.sha256` sidecar next to it. This local path does not use GitHub or
+`gh`. A systemd user manager is needed only when the updater inspects or
+controls a service owned by this installation; manual mounts and installs with
+no owned service links do not require systemd.
+
+```sh
+degoo-rc update
+degoo-rc update --archive ~/Downloads/rclone-degoo-linux-amd64.tar.gz
+degoo-rc update --delete-cache
+degoo-rc update --writer-timeout 2m
+degoo-rc update --wait-for-uploads 1h
+```
+
+Before stopping a mounted vault, the updater asks the running client to prepare
+for maintenance. New opens and file or directory changes are briefly refused
+with a busy error while active operations finish and all existing open file or
+directory handles close. The default `--writer-timeout` is `30s`; it accepts
+durations up to `1h`. This wait includes reads and directory handles, not only
+writes, so applications should close files and directory views promptly. If
+handles do not close or the local cache cannot be flushed before the deadline,
+the update fails without stopping the runtime. A no-op update returns before
+preparation and does not change mount, service, configuration, or cache state,
+regardless of these options.
+
+Preparation flushes local cached data and metadata to stable storage. It does
+not wait for Degoo to finish uploading by default: pending closed-file uploads
+remain in the cache and resume through the mount's normal retry queue after
+restart. Use `--wait-for-uploads DURATION` to request remote completion before
+shutdown; it is off by default, accepts durations up to `1d`, and can be set to
+`off`. If uploads do not finish by that deadline, the update fails and leaves
+the mount running. The option separates local persistence from remote upload
+completion; it does not make an ordinary update discard pending data.
+
+Before stopping a mount, the updater checks the archive checksum and verifies
+the package's `docs/BUILD.json` binary hash. For an Actions download, it also
+checks the source commit against the workflow run. It then compares a
+managed-payload hash covering the installed binary and helper files.
+Documentation-only archive changes do not trigger an installation. When the
+managed payload already matches, the command is a true no-op: it leaves the
+service, configuration, install manifest, and cache alone, even when
+`--delete-cache` or either wait option is supplied.
+
+The install manifest records `build.version: 1`, `build.binary_sha256`, and
+`build.payload_sha256`, plus `build.commit` when a clean source commit is
+verified. The payload covers `bin/rclone`, `degoo-rc`, the managed shell and
+Python helpers, and immutable-mount files; it excludes documentation. An
+update also records `build.package_sha256` and `build.source`; Actions downloads
+include `build.run_id`. These values identify the installed program separately
+from configuration and local cache state.
+
+After preparation, the updater requests a normal FUSE unmount and verifies that
+the kernel mount is gone before asking systemd to stop an owned service. If the
+normal unmount is busy, it leaves the service and mount running, releases the
+preparation barrier, and refuses the update. Timeouts, cache-flush failures,
+and mounts that do not support preparation also fail before runtime shutdown.
+An abandoned preparation releases automatically after a two-minute lease. If
+the preparation response is lost, the updater leaves the mount running and
+advises waiting for that lease to expire before retrying.
+
+The updater stops only an owned service or a uniquely identified manual mount
+and acquires the cache lock before replacing files. It leaves service
+enablement unchanged, restarts a service only if it was active, and confirms
+the restarted mount is connected. A recognized manual mount is resumed in the
+background with its original command arguments and working directory; its
+output goes to the private `logs/update-mount.log`. An installation that was
+inactive stays inactive. Unidentified mounts and conflicts in the owned
+service's links or loaded unit cause the update to stop without replacing the
+program. Pending uploads or cache state that cannot be verified refuse
+`--delete-cache`; an ordinary update preserves that cache.
+
+The cache is preserved by default. `--delete-cache` applies only when a
+different payload is installed. It keeps the held cache-lock inode and removes
+cache data only when the known VFS data and metadata files pair correctly, the
+cache identity is present, and metadata proves every entry clean with a
+fingerprint. Pending, unknown, unpaired, or unexpected cache data makes the
+option fail closed. A no-op update never removes cache data.
+
+If the staged installer fails, the updater restores the previous program files
+from its snapshot in `~/.local/share/rclone-degoo/tmp/update-backup`. A failure
+to restart a previously active mount returns a nonzero status but keeps the
+installed build and configuration for recovery. By default its cache remains
+available; `--delete-cache` may already have removed verified clean data. Use
+`degoo-rc info` and `degoo-rc logs`, then retry with `degoo-rc service start`
+for a service or `degoo-rc mount` for a manual mount. An abrupt process or
+system interruption can leave the snapshot behind; a later update refuses to
+overwrite it. Keep that directory intact and restore or resolve the program
+files from a verified package before retrying; crash recovery is not automatic.
+
+If a running mount predates safe update preparation, the updater refuses to
+stop it automatically. Unmount it normally with `degoo-rc stop` or
+`degoo-rc service stop`, then retry the update while it is inactive. Once the
+updated mount is running, future mounted updates can prepare it automatically.
+
+Installations created before the updater command was added need one ordinary
+archive upgrade to install that command. Stop an active service normally, then
+run this from the extracted package directory:
+
+```sh
+degoo-rc service stop
+./degoo-rc install --binary ./bin/rclone --upgrade --no-wizard
+degoo-rc service start
+```
+
+For an active manual mount, run `degoo-rc stop` before the install and start it
+again with `degoo-rc mount`. Future versions may use GitHub release assets as
+the remote package source; the current remote source is the workflow artifact.
+
 ## Inspect local status
 
 `degoo-rc info` reports the mount and service state,
@@ -771,10 +887,10 @@ unless both cache and matching configuration are retained in a private backup.
 
 Run `degoo-rc help` to list commands and `degoo-rc COMMAND help` for detailed
 parameters and examples. Available commands are `install`, `uninstall`,
-`login`, `setup`, `mount`, `stop`, `status`, `location`, `folders`, `service`,
-`info`, `logs`, `trash`, and `empty-trash`. The `service` actions are `enable`,
-`disable`, `start`, `stop`, `restart`, and `status`. Current installer and
-helper options remain supported; the command-specific help is authoritative.
+`login`, `setup`, `mount`, `stop`, `status`, `update`, `location`, `folders`,
+`service`, `info`, `logs`, `trash`, and `empty-trash`. The `service` actions are
+`enable`, `disable`, `start`, `stop`, `restart`, and `status`. Current installer
+and helper options remain supported; command-specific help is authoritative.
 `trash` lists account trash. `empty-trash` is a separate account-wide deletion
 command with its own confirmation behavior.
 

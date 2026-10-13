@@ -940,6 +940,15 @@ func (d *Dir) Size() int64 {
 
 // SetModTime sets the modTime for this dir
 func (d *Dir) SetModTime(modTime time.Time) error {
+	done, err := d.vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return d.setModTime(modTime)
+}
+
+func (d *Dir) setModTime(modTime time.Time) error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
@@ -1019,12 +1028,23 @@ const accessModeMask = (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)
 
 // Open the directory according to the flags provided
 func (d *Dir) Open(flags int) (fd Handle, err error) {
+	done, err := d.vfs.beginMaintenanceOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	return d.open(flags)
+}
+
+func (d *Dir) open(flags int) (fd Handle, err error) {
 	rdwrMode := flags & accessModeMask
 	if rdwrMode != os.O_RDONLY {
 		fs.Errorf(d, "Can only open directories read only")
 		return nil, EPERM
 	}
-	return newDirHandle(d), nil
+	fd = newDirHandle(d)
+	d.vfs.trackMaintenanceHandle(fd)
+	return fd, nil
 }
 
 // checkName returns EINVAL if name isn't a single safe path element,
@@ -1045,6 +1065,15 @@ func (d *Dir) checkName(name string) error {
 //
 // It returns EINVAL if name isn't a single safe path element.
 func (d *Dir) Create(name string, flags int) (*File, error) {
+	done, err := d.vfs.beginMaintenanceOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	return d.create(name, flags)
+}
+
+func (d *Dir) create(name string, flags int) (*File, error) {
 	// fs.Debugf(path, "Dir.Create")
 	if err := d.checkName(name); err != nil {
 		return nil, err
@@ -1069,7 +1098,7 @@ func (d *Dir) Create(name string, flags int) (*File, error) {
 	if d.vfs.Opt.ReadOnly {
 		return nil, EROFS
 	}
-	if err = d.SetModTime(time.Now()); err != nil {
+	if err = d.setModTime(time.Now()); err != nil {
 		fs.Errorf(d, "Dir.Create failed to set modtime on parent dir: %v", err)
 		return nil, err
 	}
@@ -1081,6 +1110,15 @@ func (d *Dir) Create(name string, flags int) (*File, error) {
 //
 // It returns EINVAL if name isn't a single safe path element.
 func (d *Dir) Mkdir(name string) (*Dir, error) {
+	done, err := d.vfs.beginMaintenanceOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	return d.mkdir(name)
+}
+
+func (d *Dir) mkdir(name string) (*Dir, error) {
 	if d.vfs.Opt.ReadOnly {
 		return nil, EROFS
 	}
@@ -1112,7 +1150,7 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 	fsDir := fs.NewDir(path, time.Now())
 	dir := newDir(d.vfs, d.f, d, fsDir)
 	d.addObject(dir)
-	if err = d.SetModTime(time.Now()); err != nil {
+	if err = d.setModTime(time.Now()); err != nil {
 		fs.Errorf(d, "Dir.Mkdir failed to set modtime on parent dir: %v", err)
 		return nil, err
 	}
@@ -1122,6 +1160,15 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 
 // Remove the directory
 func (d *Dir) Remove() error {
+	done, err := d.vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return d.remove()
+}
+
+func (d *Dir) remove() error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
@@ -1150,6 +1197,15 @@ func (d *Dir) Remove() error {
 
 // RemoveAll removes the directory and any contents recursively
 func (d *Dir) RemoveAll() error {
+	done, err := d.vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return d.removeAll()
+}
+
+func (d *Dir) removeAll() error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
@@ -1160,13 +1216,24 @@ func (d *Dir) RemoveAll() error {
 		return err
 	}
 	for _, node := range nodes {
-		err = node.RemoveAll()
+		err = removeNodeAll(node)
 		if err != nil {
 			fs.Errorf(node.Path(), "Dir.RemoveAll failed to remove: %v", err)
 			return err
 		}
 	}
-	return d.Remove()
+	return d.remove()
+}
+
+func removeNodeAll(node Node) error {
+	switch n := node.(type) {
+	case *File:
+		return n.remove()
+	case *Dir:
+		return n.removeAll()
+	default:
+		return node.RemoveAll()
+	}
 }
 
 // DirEntry returns the underlying fs.DirEntry
@@ -1178,6 +1245,11 @@ func (d *Dir) DirEntry() (entry fs.DirEntry) {
 // which must be a directory.  The entry to be removed may correspond
 // to a file (unlink) or to a directory (rmdir).
 func (d *Dir) RemoveName(name string) error {
+	done, err := d.vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
@@ -1187,17 +1259,33 @@ func (d *Dir) RemoveName(name string) error {
 		fs.Errorf(d, "Dir.Remove error: %v", err)
 		return err
 	}
-	if err = d.SetModTime(time.Now()); err != nil {
+	if err = d.setModTime(time.Now()); err != nil {
 		fs.Errorf(d, "Dir.Remove failed to set modtime on parent dir: %v", err)
 		return err
 	}
-	return node.Remove()
+	switch n := node.(type) {
+	case *File:
+		return n.remove()
+	case *Dir:
+		return n.remove()
+	default:
+		return node.Remove()
+	}
 }
 
 // Rename the file
 //
 // It returns EINVAL if newName isn't a single safe path element.
 func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
+	done, err := d.vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return d.renameEntry(oldName, newName, destDir)
+}
+
+func (d *Dir) renameEntry(oldName, newName string, destDir *Dir) error {
 	// fs.Debugf(d, "BEFORE\n%s", d.dump())
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
@@ -1266,7 +1354,7 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	// Show moved - delete from old dir and add to new
 	d.delObject(oldName)
 	destDir.addObject(oldNode)
-	if err = d.SetModTime(time.Now()); err != nil {
+	if err = d.setModTime(time.Now()); err != nil {
 		fs.Errorf(d, "Dir.Rename failed to set modtime on parent dir: %v", err)
 		return err
 	}

@@ -17,6 +17,7 @@ import (
 // WriteFileHandle is an open for write handle on a File
 type WriteFileHandle struct {
 	baseHandle
+	maintenance *maintenanceHandle
 	mu          sync.Mutex
 	cond        sync.Cond // cond lock for out of sequence writes
 	remote      string
@@ -216,6 +217,7 @@ func (fh *WriteFileHandle) closeWithError(reason error) (err error) {
 		return ECLOSED
 	}
 	fh.closed = true
+	defer fh.maintenance.release()
 	// Release the upload context once the upload has finished
 	defer fh.cancel()
 	// leave writer open until file is transferred
@@ -237,7 +239,7 @@ func (fh *WriteFileHandle) closeWithError(reason error) (err error) {
 	} else {
 		if fh.file.getObject() == nil {
 			// Remove vfs file entry when no object is present
-			_ = fh.file.Remove()
+			_ = fh.file.remove()
 		}
 		if reason != nil {
 			// The upload's own error is usually just the cancellation
