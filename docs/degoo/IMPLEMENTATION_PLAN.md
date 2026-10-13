@@ -42,17 +42,43 @@ when available. Updates also record `build.package_sha256` and
 `build.source`, including `build.run_id` for Actions downloads.
 Documentation-only changes do not alter the managed payload; an identical
 payload causes a no-op that leaves the service, configuration, manifest, and
-cache untouched, including when `--delete-cache` was requested.
+cache untouched, including when `--delete-cache` or wait options were supplied.
 
-An update stops only a verified owned service or a uniquely identified manual
-mount, waits until the kernel reports it unmounted, and holds the vault cache
-lock through replacement. Service enablement is retained; only a previously
-active service or recognized manual mount is resumed, and the updater confirms
-a connected mount. Manual mounts resume in the background with their prior
-arguments. Inactive installations remain inactive. Busy or ambiguous mounts
-and conflicts in the owned service's links or loaded unit block the update.
-Pending writes and unverifiable cache state block `--delete-cache`; an ordinary
-update preserves the cache.
+For a mounted vault, the updater first calls the running client through its
+owner-private control socket to enter generic VFS maintenance. The barrier
+refuses new opens and file or directory mutations with `EBUSY`, while allowing
+existing operations to finish. It waits for in-flight operations and all
+tracked file and directory handles, including read handles, to close, then
+flushes cached file data and metadata to stable storage. `--writer-timeout`
+defaults to `30s` and is capped at `1h`; the same deadline bounds handle drain
+and local flush. The updater never prints the opaque preparation token.
+
+Local flush is separate from remote upload completion. The default
+`--wait-for-uploads off` preserves closed pending uploads in the cache for the
+mount's retry queue after restart. A positive duration waits for uploads to
+reach zero before shutdown, with a maximum of `1d`. A writer timeout, upload
+timeout, local flush failure, or unsupported older mounted client fails before
+the updater stops the runtime. Preparation failure releases the barrier; an
+abandoned successful preparation is bounded by a 120-second lease. Already
+current packages return before preparation and do not change runtime or cache
+state, even when wait options are supplied.
+
+Only after successful preparation does the updater request a normal FUSE
+unmount and verify that the kernel mount is gone; it asks systemd to stop an
+owned service afterward. A busy normal unmount keeps the service active and
+releases the barrier. The updater then holds the vault cache lock through
+replacement. Service enablement is retained; only a previously active service
+or recognized manual mount is resumed, and the updater confirms a connected
+mount. Manual mounts resume in the background with their prior arguments and
+working directory. Inactive installations remain inactive. Busy or ambiguous
+mounts and conflicts in the owned service's links or loaded unit block the
+update. Pending writes and unverifiable cache state block `--delete-cache`; an
+ordinary update preserves the cache.
+
+A running mount without the preparation endpoint is not stopped automatically.
+The user must unmount it normally and rerun the update while it is inactive; an
+installation old enough to lack the updater command requires a one-time archive
+upgrade after stopping the mount.
 
 Cache removal is opt-in and runs only after a different payload was installed.
 The held lock inode remains in place. Deletion requires the known cache

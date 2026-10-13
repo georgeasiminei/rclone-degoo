@@ -426,7 +426,16 @@ On Linux amd64, `degoo-rc update` installs the latest successful staging
 package using the authenticated GitHub CLI (`gh`). The local fallback is
 `degoo-rc update --archive PATH`, which takes a `.tar.gz` package and its
 adjacent `.sha256` sidecar. The updater preserves configuration and cache by
-default. See the
+default. For a mounted vault, it waits for open file and directory handles to
+close and flushes local cached data before normal unmount. New opens and file or
+directory changes are briefly refused during preparation. The default
+`--writer-timeout` is `30s` (maximum `1h`); this includes read handles. Pending
+uploads remain cached for retry by default. `--wait-for-uploads DURATION` can
+wait for remote completion first (off by default, maximum `1d`). If either wait
+or the local flush fails, the mount remains running. The updater refuses to
+force-stop an older running mount that lacks preparation support; unmount it
+normally and retry. An already-current package is a no-op, even with wait flags.
+See the
 [installation guide](../../docs/degoo/INSTALLATION.md#update-the-installed-client)
 for validation, service lifecycle, and optional clean-cache removal.
 

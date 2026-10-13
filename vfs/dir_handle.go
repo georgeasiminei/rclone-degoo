@@ -8,8 +8,9 @@ import (
 // DirHandle represents an open directory
 type DirHandle struct {
 	baseHandle
-	d   *Dir
-	fis []os.FileInfo // where Readdir got to
+	d           *Dir
+	fis         []os.FileInfo // where Readdir got to
+	maintenance *maintenanceHandle
 }
 
 // newDirHandle opens a directory for read
@@ -102,6 +103,12 @@ func (fh *DirHandle) Readdirnames(n int) (names []string, err error) {
 
 // Close closes the handle
 func (fh *DirHandle) Close() (err error) {
+	defer fh.maintenance.release()
 	fh.fis = nil
 	return nil
+}
+
+// Release releases the directory handle.
+func (fh *DirHandle) Release() error {
+	return fh.Close()
 }

@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import http.client
 import json
+import math
 import os
 import platform
 import re
@@ -21,6 +23,7 @@ from typing import Any
 
 import install as installer
 import service
+import sync as mount_sync
 import uninstall
 import wizard
 
@@ -32,6 +35,10 @@ ARCHIVE_NAME = f"{ARTIFACT_NAME}.tar.gz"
 MAX_PACKAGE_BYTES = 1024 * 1024 * 1024
 MAX_PACKAGE_FILES = 4096
 ACTIVE_STATES = {"active", "activating", "deactivating", "reloading"}
+UPDATE_CONTROL_TIMEOUT = 5.0
+UPDATE_RESPONSE_LIMIT = 4096
+UPDATE_PREPARE_TOKEN = re.compile(r"[0-9a-f]{64}\Z")
+UPDATE_PREPARATION_LEASE_SECONDS = 120
 MANAGED_DIRECTORIES = ("bin", "scripts", "tools", "immutable-mount")
 MANAGED_FILES = ("degoo-rc", "install.json", "rclone-degoo.service",
                  *installer.COMPATIBILITY_SHELL_FILES, *installer.SOURCE_FILES)
@@ -213,6 +220,122 @@ def runtime_state(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             "manual_arguments": arguments, "manual_directory": directory, "mounted": mounted == "mounted"}
 
 
+def _update_socket_path(root: Path) -> Path:
+    """Return the verified mounted VFS socket or refuse an unsafe update."""
+    try:
+        return mount_sync._socket_path(root)
+    except mount_sync.SyncError as exc:
+        raise UpdateError(
+            f"the running mount cannot prepare safely for an update ({exc}); "
+            "close applications, stop the mount manually, then retry"
+        ) from None
+
+
+def _update_request(socket_path: Path, route: str, payload: dict[str, Any], *, timeout: float) -> tuple[int, bytes]:
+    """Send one bounded update-control request over the private mount socket."""
+    try:
+        body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise UpdateError("the mount update request could not be encoded safely") from None
+    connection = None
+    try:
+        connection = mount_sync.UnixHTTPConnection(socket_path, timeout=timeout)
+        connection.request("POST", route, body=body, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        data = response.read(UPDATE_RESPONSE_LIMIT + 1)
+    except (OSError, http.client.HTTPException, TimeoutError):
+        if route == "/update/prepare":
+            raise UpdateError(_uncertain_preparation_message()) from None
+        raise UpdateError("the mounted VFS update request failed; the mount was left running") from None
+    finally:
+        if connection is not None:
+            connection.close()
+    if len(data) > UPDATE_RESPONSE_LIMIT:
+        if route == "/update/prepare":
+            raise UpdateError(_uncertain_preparation_message())
+        raise UpdateError("the mounted VFS returned an oversized update response")
+    return response.status, data
+
+
+def _uncertain_preparation_message() -> str:
+    """Explain how to recover when the preparation response could be lost."""
+    return (
+        "the updater left the old mount running, but the preparation response could not be verified. "
+        f"The server may have accepted preparation, which can block new operations for up to "
+        f"{UPDATE_PREPARATION_LEASE_SECONDS // 60} minutes; wait for the preparation lease to expire, then retry"
+    )
+
+
+def _update_response(data: bytes) -> dict[str, Any] | None:
+    """Decode a bounded JSON object without exposing server response text."""
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def prepare_mount_for_update(root: Path, *, writer_timeout: float, upload_timeout: float) -> tuple[Path, str]:
+    """Quiesce mounted writers before updater shutdown and return its lease token."""
+    socket_path = _update_socket_path(root)
+    timeout = max(UPDATE_CONTROL_TIMEOUT, writer_timeout + upload_timeout + 10.0)
+    status, data = _update_request(
+        socket_path,
+        "/update/prepare",
+        {"writer_timeout": writer_timeout, "upload_timeout": upload_timeout},
+        timeout=timeout,
+    )
+    if status == 409:
+        response = _update_response(data)
+        if (response is not None and set(response) == {"error"}
+                and type(response.get("error")) is str
+                and response["error"] == "another update preparation is active"):
+            raise UpdateError(
+                "another update preparation is already active; no update was made and the mount is still running. "
+                f"Wait for it to finish, or for its {UPDATE_PREPARATION_LEASE_SECONDS // 60}-minute lease to expire, then retry"
+            )
+        detail = "open handles or requested uploads did not become idle before the deadline"
+        if upload_timeout == 0:
+            detail = "open file or directory handles did not close before the deadline"
+        raise UpdateError(
+            f"{detail}; no update was made and the mount is still running. "
+            "Close files using the vault and retry, or increase the applicable timeout"
+        )
+    if status == 404:
+        raise UpdateError(
+            "the running mount does not support safe update preparation; no update was made. "
+            "Close applications, stop the mount manually, then retry with it inactive"
+        )
+    if status == 500:
+        raise UpdateError(
+            "the mounted VFS could not flush or verify its local cache; "
+            "no update was made and the mount is still running"
+        )
+    response = _update_response(data)
+    if (status != 200 or response is None or set(response) != {"token", "prepared"}
+            or response.get("prepared") is not True
+            or not isinstance(response.get("token"), str)
+            or UPDATE_PREPARE_TOKEN.fullmatch(response["token"]) is None):
+        raise UpdateError(_uncertain_preparation_message())
+    return socket_path, response["token"]
+
+
+def renew_mount_preparation(socket_path: Path, token: str) -> None:
+    """Extend an update barrier lease without exposing its token."""
+    status, data = _update_request(socket_path, "/update/renew", {"token": token}, timeout=UPDATE_CONTROL_TIMEOUT)
+    response = _update_response(data)
+    if status != 200 or response is None or set(response) != {"renewed"} or response.get("renewed") is not True:
+        raise UpdateError("the mounted VFS update barrier could not be renewed; the mount was left running")
+
+
+def cancel_mount_preparation(socket_path: Path, token: str) -> None:
+    """Release a preparation barrier when shutdown leaves the mount running."""
+    status, data = _update_request(socket_path, "/update/cancel", {"token": token}, timeout=UPDATE_CONTROL_TIMEOUT)
+    response = _update_response(data)
+    if status != 200 or response is None or set(response) != {"cancelled"} or response.get("cancelled") is not True:
+        raise UpdateError("the mounted VFS update barrier could not be cancelled; check the running mount")
+
+
 def manual_mount_arguments(root: Path, mountpoint: Path) -> tuple[list[str], str]:
     """Find a single owned mount process whose original arguments can be restored."""
     matches = []
@@ -241,14 +364,63 @@ def manual_mount_arguments(root: Path, mountpoint: Path) -> tuple[list[str], str
 
 
 def stop_runtime(root: Path, manifest: dict[str, Any], state: dict[str, Any]) -> None:
-    """Stop owned runtime processes without disabling the service or discarding writes."""
+    """Unmount normally before asking systemd to stop the owned service."""
+    mountpoint = installer.configured_mountpoint(root, manifest)
+    mounted = wizard._mounted_state(mountpoint)
+    if state["service_active"] and not state["mounted"]:
+        raise UpdateError("the active service has no confirmed mount; the update was refused without stopping it")
+    if state["mounted"]:
+        if mounted != "mounted":
+            raise UpdateError("the prepared mount state changed before shutdown; the update was refused")
+        wizard._stop_owned_mount(root)
+        if wizard._mounted_state(mountpoint) != "not mounted":
+            raise UpdateError("the normal FUSE unmount did not complete; close files using the mount and retry")
+    elif mounted != "not mounted":
+        raise UpdateError("a mount appeared after update inspection; no runtime process was stopped")
     if state["service_owned"]:
         uninstall._stop_owned_service(root, manifest, disable=False)
-    mountpoint = installer.configured_mountpoint(root, manifest)
-    if wizard._mounted_state(mountpoint) == "mounted":
-        wizard._stop_owned_mount(root)
-    if wizard._wait_for_mount_state(mountpoint, "not mounted") != "not mounted":
-        raise UpdateError("the mount is busy or cannot be unmounted; close files using it and retry")
+    if wizard._mounted_state(mountpoint) != "not mounted":
+        raise UpdateError("the mount returned during shutdown; inspect the service and retry")
+
+
+def _wait_for_service_mount(root: Path, manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a service startup race before deciding whether preparation is required."""
+    if not state["service_active"] or state["mounted"]:
+        return state
+    if wizard._wait_for_mount(root) != "mounted":
+        raise UpdateError("the owned service is active but its mount was not confirmed; the update left it running")
+    refreshed = runtime_state(root, manifest)
+    if not refreshed["service_active"] or not refreshed["mounted"]:
+        raise UpdateError("the owned service state changed during mount startup; the update left it untouched")
+    return refreshed
+
+
+def _bounded_duration(value: str, *, allow_zero: bool, maximum: int, label: str) -> float:
+    """Parse an rclone duration in seconds within an update timeout bound."""
+    if value == "off" and allow_zero:
+        return 0.0
+    nanoseconds = installer._mount_duration_ns(value)
+    if nanoseconds is None:
+        requirement = "nonnegative" if allow_zero else "positive"
+        raise argparse.ArgumentTypeError(f"{label} must be a {requirement} duration no longer than {maximum}s")
+    if (nanoseconds > maximum * 1_000_000_000 or (nanoseconds == 0 and not allow_zero)
+            or 0 < nanoseconds < 1):
+        requirement = "nonnegative" if allow_zero else "positive"
+        raise argparse.ArgumentTypeError(f"{label} must be a {requirement} duration no longer than {maximum}s")
+    seconds = float(nanoseconds / 1_000_000_000)
+    if not math.isfinite(seconds):
+        raise argparse.ArgumentTypeError(f"{label} is outside the supported range")
+    return seconds
+
+
+def parse_writer_timeout(value: str) -> float:
+    """Parse a positive writer-quiescence timeout up to one hour."""
+    return _bounded_duration(value, allow_zero=False, maximum=3600, label="--writer-timeout")
+
+
+def parse_upload_timeout(value: str) -> float:
+    """Parse an optional upload-drain timeout up to one day."""
+    return _bounded_duration(value, allow_zero=True, maximum=86400, label="--wait-for-uploads")
 
 
 def start_runtime(root: Path, state: dict[str, Any]) -> None:
@@ -404,7 +576,8 @@ def install_package(root: Path, package: Path, lock: int) -> None:
 
 
 def apply_update(root: Path, package: Path, identity: dict[str, Any], source: dict[str, Any],
-                 archive_hash: str, *, delete_cache: bool) -> bool:
+                 archive_hash: str, *, delete_cache: bool, writer_timeout: float = 30.0,
+                 upload_timeout: float = 0.0) -> bool:
     """Serialize installation, preserve state, and restore the previous runtime mode."""
     installer.check_directory(root / "tmp", private=True)
     path = root / "tmp/update.lock"
@@ -418,10 +591,12 @@ def apply_update(root: Path, package: Path, identity: dict[str, Any], source: di
         raise UpdateError("the update lock could not be opened safely")
     lock = None
     stopped = False
+    mount_unmounted = False
     changed = False
     backup = root / "tmp/update-backup"
     names = None
     state = None
+    preparation = None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -434,12 +609,23 @@ def apply_update(root: Path, package: Path, identity: dict[str, Any], source: di
         layout = uninstall._validate_layout(root)
         manifest = layout["manifest"]
         state = runtime_state(root, manifest)
+        state = _wait_for_service_mount(root, manifest, state)
+        mount_unmounted = not state["mounted"]
         if state["service_active"] or state["manual_arguments"]:
             if wizard._mount_preflight(root, installer.configured_mountpoint(root, manifest),
                                        systemd_available=state["service_active"]):
                 raise UpdateError("mount prerequisites need repair before updating; follow the setup commands above")
+        if state["mounted"]:
+            wait_for = "open handles and requested uploads" if upload_timeout > 0 else "open handles"
+            print(f"Preparing the mounted vault for update; waiting for {wait_for}.", flush=True)
+            preparation = prepare_mount_for_update(
+                root, writer_timeout=writer_timeout, upload_timeout=upload_timeout
+            )
+        if preparation is not None:
+            renew_mount_preparation(*preparation)
         print("Installing the verified package, preserving configuration and local writes.", flush=True)
         stop_runtime(root, manifest, state)
+        mount_unmounted = True
         lock = uninstall._acquire_cache_lock(root, 10)
         stopped = True
         if delete_cache:
@@ -469,6 +655,15 @@ def apply_update(root: Path, package: Path, identity: dict[str, Any], source: di
             delete_clean_cache(root)
             print("Removed the clean local cache.", flush=True)
     finally:
+        active_error = sys.exc_info()[1]
+        barrier_error = None
+        if preparation is not None and not mount_unmounted and state is not None:
+            mountpoint = installer.configured_mountpoint(root, manifest)
+            try:
+                if wizard._mounted_state(mountpoint) != "not mounted":
+                    cancel_mount_preparation(*preparation)
+            except UpdateError as exc:
+                barrier_error = exc
         if lock is not None:
             os.close(lock)
         try:
@@ -476,6 +671,10 @@ def apply_update(root: Path, package: Path, identity: dict[str, Any], source: di
                 start_runtime(root, state)
         finally:
             os.close(fd)
+        if barrier_error is not None:
+            if isinstance(active_error, UpdateError):
+                raise UpdateError(f"{active_error}; {barrier_error}") from None
+            raise barrier_error
     if changed:
         print(f"Updated Degoo client ({identity['binary_sha256'][:12]}). Configuration preserved.")
         if state and state["manual_arguments"]:
@@ -488,6 +687,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", required=True, help="contained installation directory")
     parser.add_argument("--archive", help="use a local package tar.gz with its adjacent .sha256 sidecar instead of GitHub")
     parser.add_argument("--delete-cache", action="store_true", help="delete clean cache only when an update is installed; refuse pending or unverifiable writes")
+    parser.add_argument("--writer-timeout", type=parse_writer_timeout, default=30.0,
+                        metavar="DURATION", help="wait for mounted file and directory handles to close (default: 30s; maximum: 1h)")
+    parser.add_argument("--wait-for-uploads", type=parse_upload_timeout, default=0.0,
+                        metavar="DURATION", help="also wait for uploads (default: off; maximum: 1d)")
     return parser
 
 
@@ -513,7 +716,9 @@ def run(args: argparse.Namespace) -> int:
         if installed_matches(root, identity):
             print("Already up to date; no installation, service, or cache changes.")
             return 0
-        changed = apply_update(root, package, identity, source, archive_hash, delete_cache=args.delete_cache)
+        changed = apply_update(root, package, identity, source, archive_hash,
+                               delete_cache=args.delete_cache, writer_timeout=args.writer_timeout,
+                               upload_timeout=args.wait_for_uploads)
         if not changed:
             print("Already up to date; no installation, service, or cache changes.")
     return 0

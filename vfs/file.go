@@ -487,6 +487,15 @@ func (f *File) Size() int64 {
 //
 // if NoModTime is set then it does nothing
 func (f *File) SetModTime(modTime time.Time) error {
+	done, err := f.VFS().beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return f.setModTime(modTime)
+}
+
+func (f *File) setModTime(modTime time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.d.vfs.Opt.NoModTime {
@@ -702,6 +711,15 @@ func (f *File) Sync() error {
 
 // Remove the file
 func (f *File) Remove() (err error) {
+	done, err := f.VFS().beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return f.remove()
+}
+
+func (f *File) remove() (err error) {
 	defer log.Trace(f.Path(), "")("err=%v", &err)
 	f.mu.RLock()
 	d := f.d
@@ -744,7 +762,12 @@ func (f *File) Remove() (err error) {
 
 // RemoveAll the file - same as remove for files
 func (f *File) RemoveAll() error {
-	return f.Remove()
+	done, err := f.VFS().beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return f.remove()
 }
 
 // DirEntry returns the underlying fs.DirEntry - may be nil
@@ -868,6 +891,15 @@ const o_SYMLINK = 0x4000_0000 //nolint:revive
 //
 // We ignore O_SYNC and O_EXCL
 func (f *File) Open(flags int) (fd Handle, err error) {
+	done, err := f.VFS().beginMaintenanceOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	return f.open(flags)
+}
+
+func (f *File) open(flags int) (fd Handle, err error) {
 	defer log.Trace(f.Path(), "flags=%s", decodeOpenFlags(flags))("fd=%v, err=%v", &fd, &err)
 	var (
 		write    bool // if set need write support
@@ -880,6 +912,12 @@ func (f *File) Open(flags int) (fd Handle, err error) {
 		target, err := f.resolveNode()
 		if err != nil {
 			return nil, err
+		}
+		if targetFile, ok := target.(*File); ok {
+			return targetFile.open(flags)
+		}
+		if targetDir, ok := target.(*Dir); ok {
+			return targetDir.open(flags)
 		}
 		return target.Open(flags)
 	}
@@ -961,11 +999,23 @@ func (f *File) Open(flags int) (fd Handle, err error) {
 		// called without File.mu held
 		d.addObject(f)
 	}
+	if err == nil {
+		d.vfs.trackMaintenanceHandle(fd)
+	}
 	return fd, err
 }
 
 // Truncate changes the size of the named file.
 func (f *File) Truncate(size int64) (err error) {
+	done, err := f.VFS().beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return f.truncate(size)
+}
+
+func (f *File) truncate(size int64) (err error) {
 	// make a copy of fh.writers with the lock held then unlock so
 	// we can call other file methods.
 	f.mu.Lock()
@@ -1011,7 +1061,7 @@ func (f *File) Truncate(size int64) (err error) {
 	if size == 0 {
 		flags |= os.O_TRUNC
 	}
-	fh, err := f.Open(flags)
+	fh, err := f.open(flags)
 	if err != nil {
 		return err
 	}

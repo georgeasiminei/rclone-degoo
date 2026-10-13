@@ -54,6 +54,114 @@ class ArchiveTest(unittest.TestCase):
             update.extract_package(self.archive, self.base / "extracted")
 
 
+class UpdatePreparationProtocolTest(unittest.TestCase):
+    def _connection(self, status, body):
+        from unittest import mock
+        response = mock.Mock()
+        response.status = status
+        response.read.return_value = body
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        return connection
+
+    def test_prepare_sends_bounded_timeouts_and_validates_token(self):
+        from unittest import mock
+        socket_path = Path("/private/update.sock")
+        token = "a" * 64
+        connection = self._connection(200, json.dumps({"token": token, "prepared": True}).encode())
+        with mock.patch.object(update.mount_sync, "_socket_path", return_value=socket_path), \
+                mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection) as client:
+            result = update.prepare_mount_for_update(Path("/private"), writer_timeout=12.5, upload_timeout=60.0)
+        self.assertEqual(result, (socket_path, token))
+        self.assertEqual(client.call_args.kwargs["timeout"], 82.5)
+        self.assertEqual(connection.request.call_args.args[:2], ("POST", "/update/prepare"))
+        self.assertEqual(json.loads(connection.request.call_args.kwargs["body"]),
+                         {"writer_timeout": 12.5, "upload_timeout": 60.0})
+        connection.close.assert_called_once_with()
+
+    def test_prepare_fails_closed_for_timeout_old_mount_and_flush_error(self):
+        from unittest import mock
+        cases = [
+            (409, b'{"error":"busy"}', "open file or directory handles"),
+            (404, b'{"error":"unsupported"}', "does not support safe update preparation"),
+            (500, b'{"error":"flush failed"}', "could not flush or verify"),
+        ]
+        for status, body, message in cases:
+            with self.subTest(status=status):
+                connection = self._connection(status, body)
+                with mock.patch.object(update.mount_sync, "_socket_path", return_value=Path("/private/update.sock")), \
+                        mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection):
+                    with self.assertRaisesRegex(update.UpdateError, message):
+                        update.prepare_mount_for_update(Path("/private"), writer_timeout=30.0, upload_timeout=0.0)
+
+    def test_prepare_distinguishes_active_lease_from_handle_timeout(self):
+        from unittest import mock
+        connection = self._connection(409, b'{"error":"another update preparation is active"}')
+        with mock.patch.object(update.mount_sync, "_socket_path", return_value=Path("/private/update.sock")), \
+                mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection):
+            with self.assertRaisesRegex(update.UpdateError, "another update preparation is already active") as raised:
+                update.prepare_mount_for_update(Path("/private"), writer_timeout=30.0, upload_timeout=0.0)
+        self.assertIn("2-minute lease", str(raised.exception))
+        self.assertNotIn("increase", str(raised.exception))
+
+    def test_prepare_transport_failure_explains_possible_lost_lease_without_server_text(self):
+        from unittest import mock
+        connection = self._connection(200, b"")
+        connection.request.side_effect = OSError("private socket details")
+        with mock.patch.object(update.mount_sync, "_socket_path", return_value=Path("/private/update.sock")), \
+                mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection):
+            with self.assertRaisesRegex(update.UpdateError, "old mount running") as raised:
+                update.prepare_mount_for_update(Path("/private"), writer_timeout=30.0, upload_timeout=0.0)
+        self.assertIn("up to 2 minutes", str(raised.exception))
+        self.assertIn("wait for the preparation lease to expire, then retry", str(raised.exception))
+        self.assertNotIn("private socket details", str(raised.exception))
+        connection.close.assert_called_once_with()
+
+    def test_prepare_rejects_malformed_success_without_exposing_response(self):
+        from unittest import mock
+        connection = self._connection(200, json.dumps({"token": "private-value", "prepared": True}).encode())
+        with mock.patch.object(update.mount_sync, "_socket_path", return_value=Path("/private/update.sock")), \
+                mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection):
+            with self.assertRaisesRegex(update.UpdateError, "preparation response could not be verified") as raised:
+                update.prepare_mount_for_update(Path("/private"), writer_timeout=30.0, upload_timeout=0.0)
+        self.assertNotIn("private-value", str(raised.exception))
+
+    def test_renew_and_cancel_require_their_explicit_success_replies(self):
+        from unittest import mock
+        socket_path = Path("/private/update.sock")
+        token = "b" * 64
+        for route, body, function in (
+            ("/update/renew", b'{"renewed":true}', update.renew_mount_preparation),
+            ("/update/cancel", b'{"cancelled":true}', update.cancel_mount_preparation),
+        ):
+            with self.subTest(route=route):
+                connection = self._connection(200, body)
+                with mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection):
+                    function(socket_path, token)
+                self.assertEqual(connection.request.call_args.args[:2], ("POST", route))
+                self.assertEqual(json.loads(connection.request.call_args.kwargs["body"]), {"token": token})
+        connection = self._connection(409, b'{"error":"expired"}')
+        with mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection):
+            with self.assertRaisesRegex(update.UpdateError, "could not be cancelled"):
+                update.cancel_mount_preparation(socket_path, token)
+
+    def test_update_timeout_arguments_are_bounded_rclone_durations(self):
+        self.assertEqual(update.parse_writer_timeout("30s"), 30.0)
+        self.assertEqual(update.parse_writer_timeout("1h"), 3600.0)
+        self.assertEqual(update.parse_upload_timeout("off"), 0.0)
+        self.assertEqual(update.parse_upload_timeout("1d"), 86400.0)
+        for value in ("0s", "3601s", "junk"):
+            with self.subTest(writer=value), self.assertRaises(update.argparse.ArgumentTypeError):
+                update.parse_writer_timeout(value)
+        for value in ("86401s", "-1s", "junk"):
+            with self.subTest(upload=value), self.assertRaises(update.argparse.ArgumentTypeError):
+                update.parse_upload_timeout(value)
+        args = update.build_parser().parse_args(["--root", "/private/root", "--writer-timeout", "15s",
+                                                 "--wait-for-uploads", "off"])
+        self.assertEqual(args.writer_timeout, 15.0)
+        self.assertEqual(args.wait_for_uploads, 0.0)
+
+
 class UpdateTest(unittest.TestCase):
     def setUp(self):
         import os
@@ -238,6 +346,103 @@ class UpdateTest(unittest.TestCase):
             code, output, error = self.invoke()
         self.assertEqual(code, 2)
         start.assert_not_called()
+
+
+    def test_preparation_timeout_keeps_runtime_and_program_untouched(self):
+        from unittest import mock
+        state = {"service_active": False, "service_owned": False, "manual_arguments": ["owned"],
+                 "manual_directory": str(self.home), "mounted": True}
+        identity = {"payload_sha256": "f" * 64, "binary_sha256": "e" * 64}
+        with mock.patch.object(update, "runtime_state", return_value=state), \
+                mock.patch.object(update.wizard, "_mount_preflight", return_value=[]), \
+                mock.patch.object(update, "prepare_mount_for_update", side_effect=update.UpdateError("busy deadline")) as prepare, \
+                mock.patch.object(update, "stop_runtime") as stop, \
+                mock.patch.object(update, "start_runtime") as start:
+            with self.assertRaisesRegex(update.UpdateError, "busy deadline"):
+                update.apply_update(self.root, self.base / "unused-package", identity, {}, "a" * 64,
+                                    delete_cache=False, writer_timeout=45.0, upload_timeout=600.0)
+        prepare.assert_called_once_with(self.root, writer_timeout=45.0, upload_timeout=600.0)
+        stop.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual((self.root / "bin/rclone").read_bytes(), self.binary.read_bytes())
+
+    def test_prepare_endpoint_404_prevents_service_stop(self):
+        from unittest import mock
+        state = {"service_active": True, "service_owned": True, "manual_arguments": None,
+                 "manual_directory": None, "mounted": True}
+        identity = {"payload_sha256": "f" * 64, "binary_sha256": "e" * 64}
+        connection = mock.Mock()
+        response = mock.Mock(status=404)
+        response.read.return_value = b'{"error":"unsupported"}'
+        connection.getresponse.return_value = response
+        with mock.patch.object(update, "runtime_state", return_value=state), \
+                mock.patch.object(update.wizard, "_mount_preflight", return_value=[]), \
+                mock.patch.object(update.mount_sync, "_socket_path", return_value=self.root / "tmp/vfs-sync.sock"), \
+                mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection), \
+                mock.patch.object(update, "stop_runtime") as stop, \
+                mock.patch.object(update.uninstall, "_stop_owned_service") as service_stop:
+            with self.assertRaisesRegex(update.UpdateError, "does not support safe update preparation"):
+                update.apply_update(self.root, self.base / "unused-package", identity, {}, "a" * 64,
+                                    delete_cache=False)
+        stop.assert_not_called()
+        service_stop.assert_not_called()
+
+    def test_failed_unmount_releases_barrier_and_cancel_failure_is_an_error(self):
+        from unittest import mock
+        state = {"service_active": False, "service_owned": False, "manual_arguments": ["owned"],
+                 "manual_directory": str(self.home), "mounted": True}
+        identity = {"payload_sha256": "f" * 64, "binary_sha256": "e" * 64}
+        token = "c" * 64
+        with mock.patch.object(update, "runtime_state", return_value=state), \
+                mock.patch.object(update.wizard, "_mount_preflight", return_value=[]), \
+                mock.patch.object(update, "prepare_mount_for_update", return_value=(Path("/private/sock"), token)), \
+                mock.patch.object(update, "renew_mount_preparation") as renew, \
+                mock.patch.object(update, "stop_runtime", side_effect=update.UpdateError("busy unmount")), \
+                mock.patch.object(update.wizard, "_mounted_state", return_value="mounted"), \
+                mock.patch.object(update, "cancel_mount_preparation", side_effect=update.UpdateError("cancel failed")) as cancel, \
+                mock.patch.object(update, "start_runtime") as start:
+            with self.assertRaisesRegex(update.UpdateError, "busy unmount; cancel failed"):
+                update.apply_update(self.root, self.base / "unused-package", identity, {}, "a" * 64,
+                                    delete_cache=False)
+        renew.assert_called_once_with(Path("/private/sock"), token)
+        cancel.assert_called_once_with(Path("/private/sock"), token)
+        start.assert_not_called()
+
+    def test_normal_unmount_happens_before_owned_service_stop(self):
+        from unittest import mock
+        import uninstall
+        import wizard
+        manifest = update.installer.load_manifest(self.root)
+        events = []
+        state = {"service_active": True, "service_owned": True, "mounted": True}
+        with mock.patch.object(wizard, "_mounted_state", side_effect=["mounted", "not mounted", "not mounted"]), \
+                mock.patch.object(wizard, "_stop_owned_mount", side_effect=lambda _root: events.append("unmount")), \
+                mock.patch.object(uninstall, "_stop_owned_service", side_effect=lambda *_a, **_k: events.append("systemd-stop")):
+            update.stop_runtime(self.root, manifest, state)
+        self.assertEqual(events, ["unmount", "systemd-stop"])
+
+    def test_busy_normal_unmount_never_stops_systemd_service(self):
+        from unittest import mock
+        import uninstall
+        import wizard
+        manifest = update.installer.load_manifest(self.root)
+        state = {"service_active": True, "service_owned": True, "mounted": True}
+        with mock.patch.object(wizard, "_mounted_state", side_effect=["mounted", "mounted"]), \
+                mock.patch.object(wizard, "_stop_owned_mount"), \
+                mock.patch.object(uninstall, "_stop_owned_service") as service_stop:
+            with self.assertRaisesRegex(update.UpdateError, "normal FUSE unmount did not complete"):
+                update.stop_runtime(self.root, manifest, state)
+        service_stop.assert_not_called()
+
+    def test_active_service_mount_start_race_must_be_confirmed(self):
+        from unittest import mock
+        manifest = update.installer.load_manifest(self.root)
+        state = {"service_active": True, "mounted": False}
+        with mock.patch.object(update.wizard, "_wait_for_mount", return_value="not mounted"), \
+                mock.patch.object(update, "runtime_state") as recheck:
+            with self.assertRaisesRegex(update.UpdateError, "active but its mount was not confirmed"):
+                update._wait_for_service_mount(self.root, manifest, state)
+        recheck.assert_not_called()
 
 
     def test_cache_lock_conflict_does_not_launch_duplicate_mount(self):

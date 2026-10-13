@@ -1,4 +1,4 @@
-# Degoo validation status — 2026-10-11
+# Degoo validation status — 2026-10-13
 
 Offline implementation checks are recorded separately from live acceptance.
 Live smoke checks passed against a dedicated disposable Degoo folder. A full
@@ -48,6 +48,57 @@ cache deletion without changing the held lock inode, orphan-data refusal, and
 cleanup/startup failure reporting. Runtime control is mocked in these updater
 checks. A live service-managed or manual Degoo mount update, provider behavior,
 and power-loss recovery remain unverified.
+
+## Pending-write upgrade protection — 2026-10-13
+
+An active mount prepares for upgrade through its private Unix socket. During
+preparation, new opens and mutations return busy while existing file and
+directory handles can finish. The default 30-second `--writer-timeout` covers
+handle drainage and syncing cached data, recovery metadata, and their parent
+directories to local storage. Timeout, cache errors, or a busy normal FUSE
+unmount leave the old runtime running. Systemd is stopped only after normal
+unmount succeeds. Preparation is cancelled on failure or expires after a
+two-minute lease if the updater disappears.
+
+Default upgrades retain pending local uploads for the restarted mount.
+`--wait-for-uploads DURATION` optionally requires both an empty writeback queue
+and no dirty cache items within a separate deadline before shutdown. This is
+distinct from local persistence. No-op updates bypass preparation and cache
+deletion. A mounted older binary without the preparation protocol must be
+stopped explicitly for its first upgrade.
+
+Validation includes:
+
+- Go endpoint and VFS tests cover handle drainage, blocked admission, timeout
+  and client-disconnect recovery, token ownership, lease renewal and expiry,
+  dirty cache detection outside the upload queue, and optional upload drainage.
+- Cache tests cover closed dirty files, nested directory syncing, missing dirty
+  data, atomic metadata replacement, and bounded waits for locked cache items.
+  An operating-system sync already in progress can finish after timeout; failed
+  preparation releases admission and never authorizes shutdown.
+- Python updater tests cover preparation and renewal before shutdown, failed
+  preparation without stopping the runtime, normal-unmount failure without
+  stopping systemd, cancellation after unsuccessful shutdown, and lost-response
+  lease guidance. All 364 Python helper tests passed, including 31 updater tests.
+- An opt-in native FUSE test uses a generated encrypted local vault, closes an
+  application writer and directory during preparation, retains a pending cached
+  write across unmount and restart, and verifies its eventual encrypted-remote
+  publication. Both `mount` and `mount2` passed. This fixture uses no Degoo
+  account or customer files.
+- A fresh build, package self-check, scoped Go race checks and lint passed.
+  The optional `cmount` adapter compiled with locally extracted FUSE 2 headers;
+  native `cmount` behavior was not exercised.
+- The full offline Go suite passed with the fresh executable, isolated cache,
+  and temporary FUSE-helper alias. An initial S3 cached-write failure did not
+  reproduce in focused runs, the entire S3 package with a fresh cache, or the
+  final full suite. A run overlapping test-source edits had a compilation error;
+  the final suite was repeated with source files fixed in place.
+- A disposable inactive installation passed an actual archive update and
+  unchanged-package `--delete-cache` check. Configuration and pending-cache
+  fixture bytes, the cache-lock inode, and the complete no-op install snapshot
+  were preserved.
+
+A live service-managed Degoo update and power-loss recovery remain unverified.
 
 ## Explicit installation startup errors
 

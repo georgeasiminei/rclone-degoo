@@ -100,6 +100,8 @@ func translateError(err error) error {
 		return syscall.ENOSYS
 	case vfs.EINVAL:
 		return fuse.Errno(syscall.EINVAL)
+	case vfs.EBUSY:
+		return fuse.Errno(syscall.EBUSY)
 	case vfs.ELOOP:
 		return fuse.Errno(syscall.ELOOP)
 	}

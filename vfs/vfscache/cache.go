@@ -48,6 +48,7 @@ type Cache struct {
 	opt        *vfscommon.Options   // vfs Options
 	root       string               // root of the cache directory
 	metaRoot   string               // root of the cache metadata directory
+	tmpRoot    string               // parent cache directory for atomic metadata replacements
 	hashType   hash.Type            // hash to use locally and remotely
 	hashOption *fs.HashesOption     // corresponding OpenOption
 	writeback  *writeback.WriteBack // holds Items for writeback
@@ -124,6 +125,7 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 		opt:        opt,
 		root:       dataOSPath,
 		metaRoot:   metaOSPath,
+		tmpRoot:    parentOSPath,
 		item:       make(map[string]*Item),
 		errItems:   make(map[string]error),
 		hashType:   hashType,
@@ -887,6 +889,97 @@ func (c *Cache) TotalInUse() (n int) {
 		}
 	}
 	return n
+}
+
+// Sync syncs each cache item's local data and metadata to stable storage.
+// It does not wait for or perform remote writeback. If ctx expires while an
+// item is syncing, Sync returns promptly but that item's sync may finish later.
+func (c *Cache) Sync(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	items, err := c.snapshotItems(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		done := make(chan error, 1)
+		go func(item *Item) {
+			done <- item.SyncDurable()
+		}(item)
+		select {
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("sync cache item %q: %w", item.GetName(), err)
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+// HasDirty reports whether any cache item remains dirty. It does not wait for
+// remote writeback and returns promptly if ctx expires while inspecting items.
+func (c *Cache) HasDirty(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	items, err := c.snapshotItems(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		dirty := make(chan bool, 1)
+		go func(item *Item) {
+			dirty <- item.IsDirty()
+		}(item)
+		select {
+		case isDirty := <-dirty:
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			if isDirty {
+				return true, nil
+			}
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	return false, ctx.Err()
+}
+
+func (c *Cache) snapshotItems(ctx context.Context) ([]*Item, error) {
+	snapshot := make(chan []*Item, 1)
+	go func() {
+		c.mu.Lock()
+		items := make([]*Item, 0, len(c.item))
+		for _, item := range c.item {
+			items = append(items, item)
+		}
+		c.mu.Unlock()
+		snapshot <- items
+	}()
+	var items []*Item
+	select {
+	case items = <-snapshot:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 // Dump the cache into a string for debugging purposes

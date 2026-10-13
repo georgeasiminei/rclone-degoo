@@ -258,8 +258,7 @@ func (fsys *FS) Readdir(dirPath string,
 
 // Releasedir finished reading the directory
 func (fsys *FS) Releasedir(path string, fh uint64) (errc int) {
-	defer log.Trace(path, "fh=0x%X", fh)("errc=%d", &errc)
-	return fsys.closeHandle(fh)
+	return fsys.Release(path, fh)
 }
 
 // Statfs reads overall stats on the filesystem
@@ -633,6 +632,8 @@ func translateError(err error) (errc int) {
 		return -fuse.ENOSYS
 	case vfs.EINVAL:
 		return -fuse.EINVAL
+	case vfs.EBUSY:
+		return -fuse.EBUSY
 	case vfs.ELOOP:
 		return -fuse.ELOOP
 	}

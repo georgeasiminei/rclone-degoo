@@ -242,11 +242,23 @@ The user-requested client update lifecycle (2026-10-13) is:
   cache by default. Optional `--delete-cache` may remove it only when the
   pending-write state is proven clear; unknown or unverifiable state must block
   deletion.
-- Respect the prior runtime state. Safely stop the contained service or manual
-  mount before replacement, leave an inactive installation inactive, and
-  restore only a service or mount that was active before the update. Report a
-  nonzero failure when replacement or restart fails. If the new build installed
-  but its restart fails, retain the new build and configuration for recovery.
+- Prepare an active mount for update without forcibly terminating application
+  handles. Briefly refuse new opens and file or directory changes while existing
+  work completes. Wait up to 30 seconds by default, configurable to at most one
+  hour; if applications keep handles open or local changes cannot be flushed,
+  fail before stopping the mount or changing the installation.
+- Make completed local changes durable before shutdown. Do not require cloud
+  upload completion for an ordinary update: pending uploads remain locally
+  available for retry. Offer an optional upload wait, off by default and capped
+  at one day; if that wait expires, leave the runtime and installation intact.
+- Respect the prior runtime state. Normally unmount before stopping the
+  contained service, leave an inactive installation inactive, and restore only
+  a service or mount that was active before the update. A busy unmount must not
+  force-stop the service. Refuse automatic shutdown of a running mount that
+  cannot prepare safely; require a normal unmount first. An already-current
+  update is a no-op without preparation or runtime changes. Report a nonzero
+  failure when replacement or restart fails. If the new build installed but its
+  restart fails, retain the new build and configuration for recovery.
 
 Configuration must provide a way to set these values or their equivalents:
 

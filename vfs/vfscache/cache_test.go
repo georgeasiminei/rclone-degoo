@@ -119,6 +119,63 @@ func newTestCache(t *testing.T) (r *fstest.Run, c *Cache) {
 	return newTestCacheOpt(t, opt)
 }
 
+func TestCacheSyncHonorsContextWhileSnapshotWaits(t *testing.T) {
+	_, c := newTestCache(t)
+
+	const name = "snapshot-wait"
+	c.Item(name)
+	require.NoError(t, os.WriteFile(c.toOSPath(name), []byte("cached"), 0o600))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	c.mu.Lock()
+	started := time.Now()
+	err := c.Sync(ctx)
+	elapsed := time.Since(started)
+	c.mu.Unlock()
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, time.Second, "cache snapshot should honor its context")
+	_, err = os.Stat(c.toOSPathMeta(name))
+	assert.ErrorIs(t, err, os.ErrNotExist, "a canceled snapshot must not sync items")
+}
+
+func TestCacheHasDirtyAfterWritebackEntryRemoved(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.HandleCaching = 0
+	opt.WriteBack = fs.Duration(time.Hour)
+	_, c := newTestCacheOpt(t, opt)
+
+	item := c.Item("orphaned-dirty")
+	require.NoError(t, item.Open(nil))
+	_, err := item.WriteAt([]byte("local data"), 0)
+	require.NoError(t, err)
+	require.NoError(t, item.Close(nil))
+	assert.Len(t, c.writeback.Queue(), 1)
+	require.True(t, c.writeback.Remove(item.writeBackID))
+	assert.Empty(t, c.writeback.Queue())
+
+	dirty, err := c.HasDirty(context.Background())
+	require.NoError(t, err)
+	assert.True(t, dirty, "dirty local data must remain visible without a queue entry")
+}
+
+func TestCacheHasDirtyHonorsContextWhileItemLocked(t *testing.T) {
+	_, c := newTestCache(t)
+	item := c.Item("locked-item")
+	item.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	dirty, err := c.HasDirty(ctx)
+	item.mu.Unlock()
+
+	assert.False(t, dirty)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(started), time.Second, "dirty scan should honor its context")
+}
+
 func TestCacheNew(t *testing.T) {
 	r, c := newTestCache(t)
 

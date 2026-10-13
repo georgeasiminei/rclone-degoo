@@ -134,6 +134,8 @@ func translateError(err error) syscall.Errno {
 		return syscall.ENOSYS
 	case vfs.EINVAL:
 		return syscall.EINVAL
+	case vfs.EBUSY:
+		return syscall.EBUSY
 	case vfs.ELOOP:
 		return syscall.ELOOP
 	}
