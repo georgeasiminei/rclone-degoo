@@ -1,9 +1,18 @@
 # Degoo private vault implementation plan
 
-**Status (2026-10-11):** Core implementation and offline validation are
-complete; limited live smoke checks passed against a dedicated disposable
-Degoo folder. A 2 MiB logical file was published and verified after remounting
-with a fresh cache, including a CDN range read and matching full SHA-256.
+**Status (2026-10-14):** The earlier core implementation passed offline
+validation, and limited live smoke checks passed against a dedicated
+disposable Degoo folder, as recorded below. Follow-up fixes for cross-process
+cooldown-state merging and bounded metadata calls passed scoped unit, race,
+vet, and lint checks; Windows API/auth cross-compilation also passed. The final
+full Go suite passed after a small error-path fix. A rebuilt localhost FUSE
+smoke test confirmed fail-fast behavior and pending-write retention under
+cooldown. Live provider upload
+recovery with the current code remains unverified. The
+external cache copy is complete, but checksum comparison is still running;
+the migration is not yet verified. A 2 MiB logical file was previously
+published and verified after remounting with a fresh cache, including a CDN
+range read and matching full SHA-256.
 Root-level empty-file, overwrite, truncate, and rename readbacks passed after a
 fresh-cache remount. Nested creation, readback, rename, and deletion also
 passed, followed by an empty fresh-cache remount. An expired-token refresh
@@ -21,6 +30,54 @@ unmounts `/mnt/degoo` while retaining its immutable flag, using generated local
 encrypted data. This does not establish live Degoo provider behavior.
 
 ## Implementation decisions and validation plan
+
+### Provider cooldown and external cache placement (2026-10-13)
+
+The public-source review found no published numeric GraphQL request quota. A
+live `GetFileChildren5` request instead returned HTTP 429 with a 65,043-second
+`Retry-After`; the evidence and limitations are recorded in
+[API_EVIDENCE.md](API_EVIDENCE.md). The backend persists the provider's value
+as a request deadline and returns a typed rate-limit error during the active
+period without sending another API request. After expiry, the deadline no
+longer blocks requests. A throttled listing fails promptly instead of becoming
+an empty directory, leaving VFS and its pending local writes intact.
+
+Metadata lookups use bounded, context-aware retries under a ten-second total
+deadline that covers all pages. They stop when Degoo supplies `Retry-After`;
+retrying inside that interval defeats the cooldown. Background VFS writeback
+schedules the pending upload at the provider deadline rather than sleeping in
+the request path. Reuse returned download URLs for their short validity
+window. During upload publication, use the targeted item lookup first and omit
+the additional canonical directory listing only when the exact expected item
+metadata matches. Any uncertain publication remains pending for VFS retry.
+
+On Linux, clients coordinate the persisted cooldown through a private sidecar
+lock. They re-read state before token retrieval, refresh work, and HTTP calls,
+and merge concurrent deadlines by retaining the latest expiry. Lock waits are
+bounded to five seconds and honor cancellation. Non-Unix builds use the
+existing fallback; Windows API/auth cross-compilation passed, but that check
+does not validate cross-process lock behavior there.
+
+`GetFileChildren5` uses a bounded snapshot cache with a five-second lifetime
+and at most 32 cached parent listings. Mutations and explicit directory-cache
+flushes invalidate snapshots, and a generation guard prevents an older
+in-flight list response from repopulating the cache after invalidation. Tests
+cover the cache bounds, invalidation, and in-flight race. This reduces
+duplicate listing calls during bursts; it does not establish or change
+Degoo's unpublished request quota.
+
+Large local caches can be moved to a separate volume while preserving the
+`cache_dir` value in the vault configuration. Stop the mount with its normal
+unmount path, copy the private cache, compare final checksums, then bind-mount
+the external directory at that same recorded path and add the bind entry to
+`/etc/fstab`. Keeping the recorded path preserves the cache identity and lets
+the existing runtime helpers keep using their configured location. Use an
+owner-private destination such as `/data.tr/degoo-cache`; see
+[USAGE.md](USAGE.md) for the operator steps. This local storage move does not
+complete pending uploads or validate remote state.
+The current copy's checksum comparison is still running, but its checked
+portion has found no mismatches. Migration is not complete until the full
+comparison and bind-mount verification finish.
 
 ### Bash command completion
 
@@ -568,8 +625,9 @@ Treat these as known gaps to verify, not settled provider guarantees:
   nonzero size and a download URL; it does not compare complete content.
 - Classify expired credentials separately from transient failures. Refresh an
   expired token as appropriate; fail fast on a wrong password. Retry rate
-  limits and network/server failures with bounded backoff, honoring provider
-  retry guidance when present. Never log passwords, tokens, or file contents.
+  limits by persisting the provider deadline and making no API requests before
+  expiry. Retry other transient network/server failures with bounded,
+  context-aware backoff. Never log passwords, tokens, or file contents.
 
 Use authenticated crypt reads and generated-file size/hash comparisons for
 integrity evidence. Missing or invalid chunks must fail the whole read; never
@@ -610,8 +668,10 @@ detect content tampering, but it does not prevent remote deletion or rollback.
    transfers between data upload and metadata registration, then restart and
    prove that pending local writes recover, incomplete remote objects are not
    exposed as complete files, and orphans can be identified or cleaned up.
-   Inject 429s, network timeouts, and 5xx responses; verify bounded retries
-   and that wrong credentials do not loop.
+   Inject 429s, network timeouts, and 5xx responses; verify persisted cooldown
+   fast-fail, no requests before expiry, bounded context-aware retries for
+   other transient failures, and that wrong credentials do not loop. Verify
+   that throttled listings fail rather than appearing as empty directories.
 
 6. **Run the backend suite and realistic vault validation.** Run unit tests,
    the backend's rclone integration suite, and practical Linux mount checks.

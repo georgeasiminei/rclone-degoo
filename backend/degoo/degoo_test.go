@@ -24,7 +24,6 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/object"
-	"github.com/rclone/rclone/lib/pacer"
 )
 
 type mockItem struct {
@@ -43,6 +42,7 @@ type mockDegoo struct {
 	items                        map[string]mockItem
 	uploads                      map[string][]byte
 	downloadCalls                int
+	expireNextDownload           bool
 	nextID                       int
 	failRegister                 bool
 	nullRegisterAcknowledgement  bool
@@ -51,9 +51,14 @@ type mockDegoo struct {
 	registrationVisibilityLag    time.Duration
 	registerCalls                int
 	blockListing                 bool
+	blockListingPage2            bool
+	listPage2Started             chan struct{}
+	listNextToken                string
+	blockGetItem                 bool
 	listRetryAfter               string
 	listStatusCode               int
 	listCalls                    int
+	getItemCalls                 int
 	failInitialMkdirAck          bool
 	corruptUpload                bool
 	registeredSizeDelta          int64
@@ -140,6 +145,12 @@ func (mock *mockDegoo) download(writer http.ResponseWriter, request *http.Reques
 	id := strings.TrimPrefix(request.URL.Path, "/download/")
 	mock.mu.Lock()
 	mock.downloadCalls++
+	if mock.expireNextDownload {
+		mock.expireNextDownload = false
+		mock.mu.Unlock()
+		writer.WriteHeader(http.StatusForbidden)
+		return
+	}
 	item, ok := mock.items[id]
 	content := append([]byte(nil), item.content...)
 	mock.mu.Unlock()
@@ -165,6 +176,11 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 	var data any
 	switch input.Operation {
 	case "GetOverlay4":
+		mock.getItemCalls++
+		if mock.blockGetItem {
+			<-request.Context().Done()
+			return
+		}
 		idObject, _ := input.Variables["ID"].(map[string]any)
 		id, _ := idObject["FileID"].(string)
 		item, ok := mock.items[id]
@@ -182,6 +198,17 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 		}
 	case "GetFileChildren5":
 		mock.listCalls++
+		nextToken, _ := input.Variables["NextToken"].(string)
+		if nextToken != "" && mock.blockListingPage2 {
+			if mock.listPage2Started != nil {
+				select {
+				case mock.listPage2Started <- struct{}{}:
+				default:
+				}
+			}
+			<-request.Context().Done()
+			return
+		}
 		if mock.blockListing {
 			<-request.Context().Done()
 			return
@@ -207,7 +234,11 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 				items = append(items, mock.itemJSON(listedItem, request))
 			}
 		}
-		data = map[string]any{"getFileChildren5": map[string]any{"Items": items}}
+		responseNextToken := ""
+		if nextToken == "" {
+			responseNextToken = mock.listNextToken
+		}
+		data = map[string]any{"getFileChildren5": map[string]any{"Items": items, "NextToken": responseNextToken}}
 	case "GetBucketWriteAuth4":
 		data = map[string]any{"getBucketWriteAuth4": []any{map[string]any{"AuthData": map[string]any{
 			"PolicyBase64": "policy", "Signature": "signature", "BaseURL": "http://" + request.Host + "/gcs",
@@ -632,37 +663,312 @@ func TestNegativeRegistrationAcknowledgementReconcilesAppliedItem(t *testing.T) 
 	}
 }
 
-func TestWaitForItemTimeoutDoesNotWaitOnQueuedPacerRetry(t *testing.T) {
+func TestWaitForItemFailsFastOnProviderCooldown(t *testing.T) {
 	mock := newMockDegoo()
-	mock.listRetryAfter = "1"
+	mock.listRetryAfter = "120"
 	f, server := newTestFs(t, mock)
 	defer server.Close()
-	f.pacer.SetRetries(1)
 	mock.mu.Lock()
 	initialListCalls := mock.listCalls
 	mock.mu.Unlock()
-	ctx := context.Background()
-	for i := 0; i < 2; i++ {
-		if _, err := f.listDir(ctx, "vault"); err == nil {
-			t.Fatal("throttled listing unexpectedly succeeded")
-		}
-	}
-
 	started := time.Now()
-	_, err := f.waitForItem(ctx, "vault", "missing", 400*time.Millisecond)
+	_, err := f.waitForItem(context.Background(), "vault", "missing", 10*time.Second)
 	if err == nil {
 		t.Fatal("lookup succeeded for a missing item")
 	}
-	if delay, ok := pacer.IsRetryAfter(err); !ok || delay != time.Second {
-		t.Fatalf("lookup error retry-after = %v, %t; want 1s, true", delay, ok)
+	var rateLimitErr *api.RateLimitError
+	if !errors.As(err, &rateLimitErr) || api.Retryable(err) {
+		t.Fatalf("lookup error = %v; want non-retryable provider cooldown", err)
 	}
-	if elapsed := time.Since(started); elapsed > 800*time.Millisecond {
-		t.Fatalf("lookup waited for queued pacer retry: %v", elapsed)
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("lookup waited during provider cooldown: %v", elapsed)
+	}
+	secondStarted := time.Now()
+	if _, err := f.listDir(context.Background(), "vault"); err == nil || !errors.As(err, &rateLimitErr) {
+		t.Fatalf("lookup during persisted cooldown = %v, want rate-limit error", err)
+	}
+	if elapsed := time.Since(secondStarted); elapsed > 100*time.Millisecond {
+		t.Fatalf("lookup did not fail fast during persisted cooldown: %v", elapsed)
 	}
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
-	if mock.listCalls != initialListCalls+3 {
-		t.Fatalf("listing requests = %d, want %d (two pacer setup calls and one bounded lookup)", mock.listCalls, initialListCalls+3)
+	if mock.listCalls != initialListCalls+1 {
+		t.Fatalf("listing requests = %d, want %d (one failed request; cooldown blocks retries)", mock.listCalls, initialListCalls+1)
+	}
+}
+
+func TestMetadataCallBoundsBlockedRequests(t *testing.T) {
+	tests := []struct {
+		name  string
+		block func(*mockDegoo)
+		call  func(*Fs, context.Context) error
+	}{
+		{
+			name:  "list",
+			block: func(mock *mockDegoo) { mock.blockListing = true },
+			call: func(f *Fs, ctx context.Context) error {
+				_, err := f.listDir(ctx, "vault")
+				return err
+			},
+		},
+		{
+			name:  "get item",
+			block: func(mock *mockDegoo) { mock.blockGetItem = true },
+			call: func(f *Fs, ctx context.Context) error {
+				_, err := f.getItem(ctx, "vault")
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mock := newMockDegoo()
+			f, server := newTestFs(t, mock)
+			defer server.Close()
+			mock.mu.Lock()
+			initialListCalls, initialGetItemCalls := mock.listCalls, mock.getItemCalls
+			test.block(mock)
+			mock.mu.Unlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			started := time.Now()
+			err := test.call(f, ctx)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("metadata lookup error = %v, want context deadline", err)
+			}
+			if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+				t.Fatalf("metadata lookup exceeded caller deadline: %v", elapsed)
+			}
+			mock.mu.Lock()
+			defer mock.mu.Unlock()
+			if test.name == "list" && mock.listCalls != initialListCalls+1 {
+				t.Fatalf("listing requests = %d, want %d", mock.listCalls, initialListCalls+1)
+			}
+			if test.name == "get item" && mock.getItemCalls != initialGetItemCalls+1 {
+				t.Fatalf("GetItem requests = %d, want %d", mock.getItemCalls, initialGetItemCalls+1)
+			}
+		})
+	}
+}
+
+func TestMetadataCallDeadlineCoversAllListingPages(t *testing.T) {
+	mock := newMockDegoo()
+	mock.listNextToken = "second-page"
+	mock.blockListingPage2 = true
+	mock.listPage2Started = make(chan struct{}, 1)
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	started := time.Now()
+	err := metadataCallWithTimeout(context.Background(), 150*time.Millisecond, func(ctx context.Context) error {
+		_, err := f.api.ListDir(ctx, "vault")
+		return err
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("metadata listing error = %v, want the shared lookup deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("paginated metadata lookup exceeded its total deadline: %v", elapsed)
+	}
+	select {
+	case <-mock.listPage2Started:
+	default:
+		t.Fatal("listing did not reach page two before the shared deadline")
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.listCalls != 2 {
+		t.Fatalf("listing requests = %d, want two pages under one deadline", mock.listCalls)
+	}
+}
+
+func TestMetadataCallRetriesRetryableErrorsWithinBound(t *testing.T) {
+	mock := newMockDegoo()
+	mock.listStatusCode = http.StatusInternalServerError
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	mock.mu.Lock()
+	initialListCalls := mock.listCalls
+	mock.mu.Unlock()
+
+	started := time.Now()
+	_, err := f.listDir(context.Background(), "vault")
+	if api.HTTPStatus(err) != http.StatusInternalServerError {
+		t.Fatalf("listing error status = %d, want %d (error: %v)", api.HTTPStatus(err), http.StatusInternalServerError, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("metadata retry exceeded its bounded delays: %v", elapsed)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if got := mock.listCalls - initialListCalls; got != metadataMaxAttempts {
+		t.Fatalf("metadata listing requests = %d, want %d", got, metadataMaxAttempts)
+	}
+}
+
+func TestNewFsUsesRootValidationProofDuringCooldown(t *testing.T) {
+	mock := newMockDegoo()
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	proofData, err := auth.ReadPrivateFile(f.rootValidationProofPath())
+	if err != nil {
+		t.Fatalf("read saved root proof: %v", err)
+	}
+	var proof rootValidationProof
+	if err := json.Unmarshal(proofData, &proof); err != nil || proof.Version != rootProofVersion || !proof.Validated || proof.APIURL != f.opt.APIURL || proof.RootFolderID != f.opt.RootFolderID {
+		t.Fatalf("saved root proof = %#v, decode error %v", proof, err)
+	}
+
+	until := time.Now().Add(2*time.Minute).Unix() + 1
+	rateLimitData, err := json.Marshal(struct {
+		Version   int   `json:"version"`
+		UntilUnix int64 `json:"until_unix"`
+	}{Version: 1, UntilUnix: until})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.WritePrivateFile(f.opt.AuthFile+".rate-limit.json", rateLimitData); err != nil {
+		t.Fatalf("write synthetic rate-limit state: %v", err)
+	}
+
+	mock.mu.Lock()
+	initialGetItemCalls := mock.getItemCalls
+	mock.mu.Unlock()
+	options := configmap.Simple{
+		"auth_file": f.opt.AuthFile, "root_folder_id": f.opt.RootFolderID, "api_key": f.opt.APIKey,
+		"api_url": f.opt.APIURL, "rest_url": f.opt.RESTURL,
+	}
+	offline, err := NewFs(context.Background(), "test", "", options)
+	if err != nil {
+		t.Fatalf("NewFs during a matching provider cooldown: %v", err)
+	}
+	if offline.Root() != "" {
+		t.Fatalf("offline root = %q, want vault root", offline.Root())
+	}
+	mock.mu.Lock()
+	if mock.getItemCalls != initialGetItemCalls {
+		t.Fatalf("GetItem requests during cooldown = %d, want %d", mock.getItemCalls, initialGetItemCalls)
+	}
+	mock.mu.Unlock()
+
+	options["root_folder_id"] = "different-root"
+	if _, err := NewFs(context.Background(), "test", "", options); err == nil {
+		t.Fatal("NewFs accepted a root proof for a different root ID")
+	}
+	options["root_folder_id"] = f.opt.RootFolderID
+	if _, err := NewFs(context.Background(), "test", "nested", options); err == nil {
+		t.Fatal("NewFs accepted offline root validation for a non-empty backend path")
+	}
+}
+
+func TestOpenReusesFreshListedDownloadURL(t *testing.T) {
+	mock := newMockDegoo()
+	content := []byte("generated encrypted test payload")
+	mock.items["payload"] = mockItem{id: "payload", name: "cipher", parentID: "vault", category: 6, size: int64(len(content)), content: content}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	obj, err := f.NewObject(context.Background(), "cipher")
+	if err != nil {
+		t.Fatalf("NewObject: %v", err)
+	}
+	mock.mu.Lock()
+	getItemCalls, downloadCalls := mock.getItemCalls, mock.downloadCalls
+	mock.mu.Unlock()
+	body, err := obj.Open(context.Background())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got, err := io.ReadAll(body)
+	closeTestBody(t, body)
+	if err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("downloaded payload = %q, read error %v", got, err)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.getItemCalls != getItemCalls {
+		t.Fatalf("GetItem requests for fresh listed URL = %d, want %d", mock.getItemCalls-getItemCalls, 0)
+	}
+	if mock.downloadCalls != downloadCalls+1 {
+		t.Fatalf("download requests = %d, want %d", mock.downloadCalls-downloadCalls, 1)
+	}
+}
+
+func TestOpenRefreshesExpiredOrRejectedListedURL(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		expireByAge bool
+	}{
+		{name: "proactive age", expireByAge: true},
+		{name: "provider rejection"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock := newMockDegoo()
+			content := []byte("generated encrypted test payload")
+			mock.items["payload"] = mockItem{id: "payload", name: "cipher", parentID: "vault", category: 6, size: int64(len(content)), content: content}
+			f, server := newTestFs(t, mock)
+			defer server.Close()
+			obj, err := f.NewObject(context.Background(), "cipher")
+			if err != nil {
+				t.Fatalf("NewObject: %v", err)
+			}
+			if test.expireByAge {
+				obj.(*Object).urlAt = time.Now().Add(-downloadURLMaxAge - time.Second)
+			} else {
+				mock.mu.Lock()
+				mock.expireNextDownload = true
+				mock.mu.Unlock()
+			}
+			mock.mu.Lock()
+			getItemCalls, downloadCalls := mock.getItemCalls, mock.downloadCalls
+			mock.mu.Unlock()
+
+			body, err := obj.Open(context.Background())
+			if err != nil {
+				t.Fatalf("Open after URL expiry: %v", err)
+			}
+			got, err := io.ReadAll(body)
+			closeTestBody(t, body)
+			if err != nil || !bytes.Equal(got, content) {
+				t.Fatalf("downloaded payload = %q, read error %v", got, err)
+			}
+			mock.mu.Lock()
+			defer mock.mu.Unlock()
+			if mock.getItemCalls != getItemCalls+1 {
+				t.Fatalf("GetItem requests = %d, want 1", mock.getItemCalls-getItemCalls)
+			}
+			wantDownloads := 1
+			if !test.expireByAge {
+				wantDownloads = 2
+			}
+			if got := mock.downloadCalls - downloadCalls; got != wantDownloads {
+				t.Fatalf("download requests = %d, want %d", got, wantDownloads)
+			}
+		})
+	}
+}
+
+func TestUploadPublicationUsesVerifiedItemWithoutParentListing(t *testing.T) {
+	mock := newMockDegoo()
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	mock.mu.Lock()
+	initialListCalls, initialGetItemCalls := mock.listCalls, mock.getItemCalls
+	mock.mu.Unlock()
+
+	content := []byte("generated encrypted test payload")
+	_, err := f.Put(context.Background(), bytes.NewReader(content), object.NewStaticObjectInfo("cipher", time.Now(), int64(len(content)), true, nil, f))
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if got := mock.listCalls - initialListCalls; got != 2 {
+		t.Fatalf("parent listing requests = %d, want cached Put lookup and fresh registration visibility only", got)
+	}
+	if got := mock.getItemCalls - initialGetItemCalls; got != 2 {
+		t.Fatalf("targeted metadata requests = %d, want upload verification and publication confirmation", got)
 	}
 }
 
@@ -901,6 +1207,7 @@ func TestDirectoryPlaceholderAndDuplicateNames(t *testing.T) {
 	delete(mock.items, "duplicate-1")
 	delete(mock.items, "duplicate-2")
 	mock.mu.Unlock()
+	f.api.ClearMetadataCache()
 	entries, err := f.List(context.Background(), "")
 	if err != nil {
 		t.Fatalf("List after removing ambiguous entries: %v", err)
@@ -1293,25 +1600,61 @@ func TestWaitForIDsGoneRequiresAbsence(t *testing.T) {
 	mock.mu.Lock()
 	delete(mock.items, "target")
 	mock.mu.Unlock()
+	f.api.ClearMetadataCache()
 	if err := f.waitForIDsGone(context.Background(), "vault", []string{"target"}, time.Second); err != nil {
 		t.Fatalf("waitForIDsGone for absent target: %v", err)
+	}
+}
+
+func TestWaitForIDsGoneBypassesStaleListingSnapshot(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["target"] = mockItem{id: "target", name: "file", parentID: "vault", category: 6}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+
+	if _, err := f.listDir(context.Background(), "vault"); err != nil {
+		t.Fatalf("prime cached listing: %v", err)
+	}
+	mock.mu.Lock()
+	delete(mock.items, "target")
+	mock.mu.Unlock()
+	// Keep the old snapshot to verify that reconciliation explicitly requests fresh metadata.
+	if err := f.waitForIDsGone(context.Background(), "vault", []string{"target"}, 500*time.Millisecond); err != nil {
+		t.Fatalf("waitForIDsGone with a stale cached target listing: %v", err)
 	}
 }
 
 func TestPublishedParentDiagnosticComparesPreAndPostRename(t *testing.T) {
 	mock := newMockDegoo()
 	mock.items["staged-private-id"] = mockItem{
-		id: "staged-private-id", name: "final-cipher-name", parentID: "other-private-parent", category: 6, size: 4,
+		id: "staged-private-id", name: "final-cipher-name", parentID: "vault", category: 6, size: 4,
 		content: []byte("data"),
 	}
 	f, server := newTestFs(t, mock)
 	defer server.Close()
 
 	staged := api.Item{ID: "staged-private-id", Name: temporaryPrefix + "pending", ParentID: "vault", Size: 4}
+	if _, err := f.listDir(context.Background(), "vault"); err != nil {
+		t.Fatalf("prime canonical listing: %v", err)
+	}
+	mock.mu.Lock()
+	item := mock.items["staged-private-id"]
+	item.parentID = "other-private-parent"
+	mock.items[item.id] = item
+	mock.mu.Unlock()
+	mock.mu.Lock()
+	initialListCalls := mock.listCalls
+	mock.mu.Unlock()
 	_, err := f.waitForPublishedObject(context.Background(), "final-cipher-name", "final-cipher-name", "vault", staged, "vault", 4, time.Millisecond)
 	if err == nil {
 		t.Fatal("waitForPublishedObject succeeded with an unpublished parent")
 	}
+	mock.mu.Lock()
+	if got := mock.listCalls - initialListCalls; got != 1 {
+		mock.mu.Unlock()
+		t.Fatalf("canonical parent listing requests after parent mismatch = %d, want 1", got)
+	}
+	mock.mu.Unlock()
 	for _, want := range []string{
 		"pre_parent_expected=true", "pre_parent_staged=true", "pre_parent_vault=true",
 		"post_parent_expected=false", "post_parent_staged=false", "post_parent_vault=false",

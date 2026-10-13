@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	stdhash "hash"
@@ -48,8 +49,12 @@ const (
 	uploadRegistrationTimeout   = 20 * time.Second
 	negativeRegistrationTimeout = 2 * time.Second
 
-	minPacerSleep = 100 * time.Millisecond
-	maxPacerSleep = 30 * time.Second
+	metadataLookupTimeout = 10 * time.Second
+	metadataRetryDelay    = 100 * time.Millisecond
+	metadataMaxAttempts   = 3
+	maxPacerSleep         = 30 * time.Second
+	downloadURLMaxAge     = 30 * time.Second
+	rootProofVersion      = 1
 )
 
 func init() {
@@ -115,7 +120,6 @@ type Fs struct {
 	root     string
 	opt      Options
 	api      *api.Client
-	pacer    *fs.Pacer
 	dirCache *dircache.DirCache
 	features *fs.Features
 
@@ -133,6 +137,15 @@ type Object struct {
 	name     string
 	size     int64
 	modTime  time.Time
+	url      string
+	urlAt    time.Time
+}
+
+type rootValidationProof struct {
+	Version      int    `json:"version"`
+	APIURL       string `json:"api_url"`
+	RootFolderID string `json:"root_folder_id"`
+	Validated    bool   `json:"validated"`
 }
 
 // NewFs constructs a Degoo filesystem rooted under a configured vault folder.
@@ -180,8 +193,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root:         root,
 		opt:          *opt,
 		api:          api.New(httpClient, authClient, opt.APIURL, opt.APIKey),
-		pacer:        fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minPacerSleep), pacer.MaxSleep(maxPacerSleep), pacer.DecayConstant(2))),
 		placeholders: make(map[string]struct{}),
+	}
+	if err := f.api.SetRateLimitFile(opt.AuthFile + ".rate-limit.json"); err != nil {
+		return nil, fmt.Errorf("degoo: load provider rate-limit state: %w", err)
 	}
 	f.dirCache = dircache.New(root, opt.RootFolderID, f)
 	f.features = (&fs.Features{
@@ -196,19 +211,33 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 
 	rootItem, err := f.getItem(ctx, opt.RootFolderID)
+	offlineRoot := false
 	if err != nil {
-		return nil, fmt.Errorf("degoo: inspect configured vault folder ID %q: %w", opt.RootFolderID, err)
-	}
-	isDir, err := f.itemIsDirectory(ctx, rootItem)
-	if err != nil {
-		return nil, fmt.Errorf("degoo: inspect configured vault folder children: %w", err)
-	}
-	if !isDir {
-		return nil, errors.New("degoo: root_folder_id does not identify a directory")
-	}
-	fs.Debugf(f, "degoo: vault folder resolved (ID %q, parent ID %q, category %d)", rootItem.ID, rootItem.ParentID, rootItem.Category)
-	if err := f.retireConfiguredRootPlaceholder(ctx, rootItem); err != nil {
-		return nil, fmt.Errorf("degoo: reconcile configured vault folder: %w", err)
+		var rateLimitErr *api.RateLimitError
+		if !errors.As(err, &rateLimitErr) || root != "" {
+			return nil, fmt.Errorf("degoo: inspect configured vault folder ID %q: %w", opt.RootFolderID, err)
+		}
+		valid, proofErr := f.hasRootValidationProof()
+		if proofErr != nil {
+			return nil, fmt.Errorf("degoo: inspect cached vault root validation: %w", proofErr)
+		}
+		if !valid {
+			return nil, fmt.Errorf("degoo: cannot validate configured vault folder during provider rate limit; no matching prior validation proof is available: %w", err)
+		}
+		offlineRoot = true
+		fs.Logf(f, "degoo: using previously validated vault root during provider cooldown until %s", rateLimitErr.Until.UTC().Format(time.RFC3339))
+	} else {
+		isDir, err := f.itemIsDirectory(ctx, rootItem)
+		if err != nil {
+			return nil, fmt.Errorf("degoo: inspect configured vault folder children: %w", err)
+		}
+		if !isDir {
+			return nil, errors.New("degoo: root_folder_id does not identify a directory")
+		}
+		fs.Debugf(f, "degoo: vault folder resolved (ID %q, parent ID %q, category %d)", rootItem.ID, rootItem.ParentID, rootItem.Category)
+		if err := f.retireConfiguredRootPlaceholder(ctx, rootItem); err != nil {
+			return nil, fmt.Errorf("degoo: reconcile configured vault folder: %w", err)
+		}
 	}
 	if err := f.dirCache.FindRoot(ctx, false); err != nil {
 		if root == "" {
@@ -218,6 +247,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		parentCache := dircache.New(parentPath, opt.RootFolderID, f)
 		if parentErr := parentCache.FindRoot(ctx, false); parentErr != nil {
 			if errors.Is(parentErr, fs.ErrorDirNotFound) {
+				if !offlineRoot {
+					f.saveRootValidationProof()
+				}
 				return f, nil
 			}
 			return nil, fmt.Errorf("degoo: resolve root parent: %w", parentErr)
@@ -229,11 +261,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		item, isDir, _, lookupErr := f.lookupChild(ctx, parentID, leaf)
 		if lookupErr != nil {
 			if isNotFoundError(lookupErr) {
+				if !offlineRoot {
+					f.saveRootValidationProof()
+				}
 				return f, nil
 			}
 			return nil, fmt.Errorf("degoo: inspect root path: %w", lookupErr)
 		}
 		if item == nil {
+			if !offlineRoot {
+				f.saveRootValidationProof()
+			}
 			return f, nil
 		}
 		if isDir {
@@ -243,7 +281,45 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.dirCache = parentCache
 		return f, fs.ErrorIsFile
 	}
+	if !offlineRoot {
+		f.saveRootValidationProof()
+	}
 	return f, nil
+}
+
+func (f *Fs) rootValidationProofPath() string {
+	return f.opt.AuthFile + ".root.json"
+}
+
+func (f *Fs) hasRootValidationProof() (bool, error) {
+	data, err := auth.ReadPrivateFile(f.rootValidationProofPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var proof rootValidationProof
+	if err := json.Unmarshal(data, &proof); err != nil {
+		return false, nil
+	}
+	return proof.Version == rootProofVersion && proof.Validated && proof.APIURL == f.opt.APIURL && proof.RootFolderID == f.opt.RootFolderID, nil
+}
+
+func (f *Fs) saveRootValidationProof() {
+	proof := rootValidationProof{
+		Version:      rootProofVersion,
+		APIURL:       f.opt.APIURL,
+		RootFolderID: f.opt.RootFolderID,
+		Validated:    true,
+	}
+	data, err := json.Marshal(proof)
+	if err == nil {
+		err = auth.WritePrivateFile(f.rootValidationProofPath(), data)
+	}
+	if err != nil {
+		fs.Errorf(f, "degoo: could not save prior root validation proof: %v", err)
+	}
 }
 
 // RootFolderID returns the configured root ID for wrapper validation.
@@ -385,8 +461,7 @@ func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout tim
 			}
 			return api.Item{}, fs.ErrorDirNotFound
 		}
-		// The shared pacer can wait between retries without honoring lookupCtx.
-		items, err := f.api.ListDir(lookupCtx, parentID)
+		items, err := f.api.ListDirFresh(lookupCtx, parentID)
 		delay := 250 * time.Millisecond
 		if err == nil {
 			lastErr = nil
@@ -500,6 +575,18 @@ func (f *Fs) lookupChild(ctx context.Context, parentID, name string) (*api.Item,
 	if err != nil {
 		return nil, false, nil, err
 	}
+	return f.lookupChildInItems(ctx, name, items)
+}
+
+func (f *Fs) lookupChildFresh(ctx context.Context, parentID, name string) (*api.Item, bool, []api.Item, error) {
+	items, err := f.listDirFresh(ctx, parentID)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	return f.lookupChildInItems(ctx, name, items)
+}
+
+func (f *Fs) lookupChildInItems(ctx context.Context, name string, items []api.Item) (*api.Item, bool, []api.Item, error) {
 	matches := make([]api.Item, 0, 1)
 	var backups []api.Item
 	for _, item := range items {
@@ -903,7 +990,7 @@ func validateLeaf(leaf string) error {
 }
 
 // DirCacheFlush resets the directory ID cache.
-func (f *Fs) DirCacheFlush() { f.dirCache.ResetRoot() }
+func (f *Fs) DirCacheFlush() { f.dirCache.ResetRoot(); f.api.ClearMetadataCache() }
 
 func (f *Fs) findDir(ctx context.Context, remote string, create bool) (string, error) {
 	if err := validateRemote(remote); err != nil {
@@ -1023,6 +1110,8 @@ func newObject(f *Fs, remote string, item api.Item) *Object {
 		name:     item.Name,
 		size:     item.Size,
 		modTime:  modTime,
+		url:      item.URL,
+		urlAt:    time.Now(),
 	}
 }
 
@@ -1291,14 +1380,29 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			rangeHeader = value
 		}
 	}
-	item, err := o.fs.getItem(ctx, o.id)
-	if err != nil {
-		return nil, fmt.Errorf("degoo: refresh download metadata: %w", err)
+	downloadURL := o.url
+	refreshURL := downloadURL == "" || time.Since(o.urlAt) >= downloadURLMaxAge
+	if refreshURL {
+		item, err := o.fs.getItem(ctx, o.id)
+		if err != nil {
+			return nil, fmt.Errorf("degoo: refresh download metadata: %w", err)
+		}
+		downloadURL = item.URL
 	}
-	if item.URL == "" {
+	if downloadURL == "" {
 		return nil, errors.New("degoo: item has no download URL")
 	}
-	resp, err := o.fs.api.Download(ctx, item.URL, rangeHeader)
+	resp, err := o.fs.api.Download(ctx, downloadURL, rangeHeader)
+	if err != nil && !refreshURL && (api.HTTPStatus(err) == http.StatusUnauthorized || api.HTTPStatus(err) == http.StatusForbidden) {
+		item, refreshErr := o.fs.getItem(ctx, o.id)
+		if refreshErr != nil {
+			return nil, fmt.Errorf("degoo: refresh expired download URL: %w", refreshErr)
+		}
+		if item.URL == "" {
+			return nil, errors.New("degoo: item has no download URL")
+		}
+		resp, err = o.fs.api.Download(ctx, item.URL, rangeHeader)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1495,7 +1599,7 @@ func (f *Fs) waitForIDsGoneInDirs(ctx context.Context, parentIDs, ids []string, 
 		present := make(map[string]struct{})
 		var listingErr error
 		for _, parentID := range parentIDs {
-			items, err := f.listDir(ctx, parentID)
+			items, err := f.listDirFresh(ctx, parentID)
 			if err != nil {
 				if isNotFoundError(err) {
 					continue
@@ -1809,14 +1913,17 @@ func (f *Fs) waitForPublishedObject(ctx context.Context, remote, leaf, parentID 
 					item.ParentID == parentID, item.ParentID == staged.ParentID, item.ParentID == f.opt.RootFolderID,
 					item.ParentID == preRenameParentID, item.ParentID == "", item.ParentID == "0", item.Category)
 			}
-			visible, listErr := f.NewObject(ctx, remote)
+			if item.ParentID == parentID && item.Size > 0 && !f.isProviderDirectoryCategory(item.Category) {
+				return newObject(f, remote, item), nil
+			}
+			visible, isDir, _, listErr := f.lookupChildFresh(ctx, parentID, leaf)
 			if listErr != nil {
 				lastErr = listErr
 				if overlayDiagnostic != "" {
 					lastErr = fmt.Errorf("%s; canonical listing: %w", overlayDiagnostic, listErr)
 				}
-			} else if published, ok := visible.(*Object); ok && published.id == staged.ID && published.parentID == parentID && published.size == size {
-				return published, nil
+			} else if visible != nil && !isDir && visible.ID == staged.ID && visible.ParentID == parentID && visible.Size == size {
+				return newObject(f, remote, *visible), nil
 			} else {
 				lastErr = errors.New("published listing does not match the verified upload")
 				if overlayDiagnostic != "" {
@@ -1935,22 +2042,67 @@ func (o *Object) ParentID() string { return o.parentID }
 
 func (f *Fs) listDir(ctx context.Context, parentID string) ([]api.Item, error) {
 	var items []api.Item
-	err := f.pacer.Call(func() (bool, error) {
-		var callErr error
-		items, callErr = f.api.ListDir(ctx, parentID)
-		return api.Retryable(callErr), callErr
+	err := f.metadataCall(ctx, func(callCtx context.Context) error {
+		var err error
+		items, err = f.api.ListDir(callCtx, parentID)
+		return err
+	})
+	return items, err
+}
+
+func (f *Fs) listDirFresh(ctx context.Context, parentID string) ([]api.Item, error) {
+	var items []api.Item
+	err := f.metadataCall(ctx, func(callCtx context.Context) error {
+		var err error
+		items, err = f.api.ListDirFresh(callCtx, parentID)
+		return err
 	})
 	return items, err
 }
 
 func (f *Fs) getItem(ctx context.Context, id string) (api.Item, error) {
 	var item api.Item
-	err := f.pacer.Call(func() (bool, error) {
-		var callErr error
-		item, callErr = f.api.GetItem(ctx, id)
-		return api.Retryable(callErr), callErr
+	err := f.metadataCall(ctx, func(callCtx context.Context) error {
+		var err error
+		item, err = f.api.GetItem(callCtx, id)
+		return err
 	})
 	return item, err
+}
+
+func (f *Fs) metadataCall(ctx context.Context, call func(context.Context) error) error {
+	return metadataCallWithTimeout(ctx, metadataLookupTimeout, call)
+}
+
+func metadataCallWithTimeout(ctx context.Context, timeout time.Duration, call func(context.Context) error) error {
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	delay := metadataRetryDelay
+	for attempt := 0; attempt < metadataMaxAttempts; attempt++ {
+		if err := lookupCtx.Err(); err != nil {
+			return err
+		}
+		err := call(lookupCtx)
+		if err == nil || !api.Retryable(err) || attempt+1 == metadataMaxAttempts {
+			return err
+		}
+		if _, hasRetryAfter := pacer.IsRetryAfter(err); hasRetryAfter {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-lookupCtx.Done():
+			timer.Stop()
+			return lookupCtx.Err()
+		case <-timer.C:
+		}
+		delay *= 2
+	}
+	return nil
 }
 
 func isNotFoundError(err error) bool {

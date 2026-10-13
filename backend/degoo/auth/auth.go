@@ -146,6 +146,20 @@ func lockAuthFile(ctx context.Context, path string) (func(), error) {
 	}, nil
 }
 
+// WithPrivateFileLock runs fn while holding the cross-process lock associated
+// with path. The lock file is a private sibling of path.
+func WithPrivateFileLock(ctx context.Context, path string, fn func() error) error {
+	if fn == nil {
+		return errors.New("private file lock callback is nil")
+	}
+	unlock, err := lockAuthFile(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return fn()
+}
+
 type loginAttemptError struct {
 	statusCode int
 	retryAfter time.Time

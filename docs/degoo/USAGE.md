@@ -18,6 +18,13 @@ verification is still pending. Larger live files and the provider object-size
 limit remain acceptance gates; see
 [VALIDATION.md](VALIDATION.md) for the tested scope.
 
+Follow-up fixes for cross-process cooldown-state merging and bounded metadata
+calls passed scoped checks and a rebuilt localhost FUSE smoke test. The final
+full Go suite passed after a small error-path fix. Live Degoo upload recovery
+with the current code remains unverified.
+The external cache copy is complete, but its full checksum comparison and
+bind-mount verification are still pending; see [VALIDATION.md](VALIDATION.md).
+
 The contained installer and maintenance commands use one `degoo-rc` entrypoint.
 Start it from a source checkout with `./contrib/degoo/degoo-rc install`,
 from the archive root with `./degoo-rc install`, or use `degoo-rc help` after
@@ -209,6 +216,15 @@ replacement or renaming can require an explicit refresh or mount restart.
 Neither setting determines remote change visibility. `attr_timeout: "1s"`
 controls an additional kernel attribute cache.
 
+`cache_max_size: "60G"` and `cache_min_free_space: "60G"` are soft targets
+for evicting clean cached data, not hard limits on disk use. Dirty entries
+must remain until their logical write is fully uploaded and published. Uploading
+some encrypted chunks does not make an unfinished logical file safe to evict;
+the VFS cache entry remains dirty until the whole backend write succeeds. If
+the cache contains only dirty entries, these targets cannot reclaim its space.
+The `750h` maximum age makes unused clean content eligible during cleanup; it
+does not mean that content is deleted immediately or exactly 30 days later.
+
 Refresh the current mounted directory tree without waiting for the listing TTL:
 
 ```sh
@@ -308,6 +324,67 @@ private token file. Logging in again can therefore restore a running mount
 without changing its vault secret or discarding pending writes. Rejected
 refresh errors report `degoo login required` and a sanitized HTTP status;
 passwords and provider response bodies stay out of logs.
+
+## API rate limits and cache placement
+
+On 2026-10-13, a `GetFileChildren5` listing request received HTTP 429 with
+`Retry-After: 65043` seconds. From the captured time, the requested retry time
+was 2026-10-14 17:06:16 EEST. The official public material reviewed does not
+publish a numeric API request quota. Degoo's web viewer also displays a daily
+limit message for HTTP 429 from a content-download URL; that is a separate
+request path and does not explain the listing response.
+
+The backend persists the provider deadline beside the private auth file. On
+Linux, processes coordinate through a private sidecar lock, re-read state
+before token retrieval and requests, and retain the longest concurrent
+deadline. A call during the cooldown returns a typed rate-limit error without
+another request; after expiry, that deadline no longer blocks requests.
+Metadata calls have a ten-second total bound across pagination and retries,
+honor cancellation, and stop on provider `Retry-After`; a failed listing is an
+error, never an empty-directory result. Background writeback keeps pending
+uploads in the VFS queue until the provider deadline rather than sleeping in
+the request path. `GetFileChildren5` uses a five-second cache with at most 32
+parent listings; mutations, `DirCacheFlush`, and fresh-list requests invalidate
+snapshots, including in-flight results. Live upload recovery with the current
+code has not yet been tested against Degoo.
+
+The cache contains plaintext VFS data, including pending writes. To move it to
+a separate volume, keep the vault configuration's `cache_dir` unchanged and
+bind the new storage at that exact path. For an installed cache, the default
+path is under `$HOME/.local/share/rclone-degoo`; the `cache_dir` field in the
+vault JSON is authoritative if it was set elsewhere.
+
+1. Stop the user service or unmount the foreground mount normally, then verify
+   the mount is gone and no process holds the cache. Do not copy a live cache.
+2. Create an owner-private directory on the mounted external filesystem, such
+   as `/data.tr/degoo-cache`, and copy the complete recorded cache into it
+   while preserving file ownership and permissions.
+3. With the mount still stopped, compare checksums for all files under the old
+   and copied cache, checking file contents rather than only names, sizes, or
+   timestamps. Keep the old directory as a rollback copy until the new bind
+   mount is verified.
+4. Add a required bind entry to `/etc/fstab`, using absolute paths. For
+   example, replace the second path with the exact `cache_dir` from the vault
+   configuration:
+
+   ```text
+   /data.tr/degoo-cache  /home/USERNAME/.local/share/rclone-degoo/cache  none  bind  0  0
+   ```
+
+   `fstab` does not expand `$HOME`; substitute the account's absolute home
+   directory and the configured cache path. Do not add `nofail`: the mount
+   should not start with an empty underlying cache if the external volume is
+   unavailable.
+5. Mount the bind entry, confirm it targets the external filesystem and is
+   still private to the owner, then start the service or mount. Keep the
+   original vault configuration and cache identity unchanged.
+
+The ordinary startup helper continues to use the saved cache path. A bind
+mount moves the backing storage without rebinding the vault identity. The
+local copy preserves pending writes; it does not send them to Degoo. The
+current copy is complete, but its final whole-cache checksum comparison and
+bind-mount verification remain pending; do not treat the migration as complete
+until both finish.
 
 ## Mounted throughput benchmark
 

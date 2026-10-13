@@ -1019,3 +1019,57 @@ and preserving vault/cache bytes without startup when final login fails.
 These changes affect Python helpers and documentation only. No live cloud
 benchmark or fresh installation over the user's vault was run. The upload
 state is a local VFS observation, not an independent remote integrity check.
+
+## API cooldown, listing cache, and writeback retry validation — 2026-10-14
+
+The follow-up source changes passed the final validation available for this
+run:
+
+- Build passed. Degoo auth, API, backend, command, and writeback unit tests,
+  scoped race tests, `go vet`, and scoped lint passed with no issues.
+- The final credential-free `go test ./...` passed after a small
+  rate-limit-persistence error-path fix. The command used the freshly built
+  rclone first on `PATH` and private XFS-backed temporary directories for both
+  `TMPDIR` and `GOTMPDIR`.
+- The first full-suite attempt used the host-installed rclone and default
+  tmpfs-backed temporary directories. The host binary lacked a command used
+  by tests, tmpfs did not support required xattrs, and a non-private
+  socket-parent path failed the command's safety check. These were environment
+  setup failures; the corrected final run passed.
+- Windows API/auth cross-compilation passed. This verifies compilation only;
+  the non-Unix fallback does not provide the Linux cross-process `flock`
+  behavior.
+- API tests cover the five-second `GetFileChildren5` snapshot, 32-parent
+  bound, expiry, explicit and mutation invalidation, and generation protection
+  against stale in-flight results. Cooldown tests cover preinitialized clients
+  re-reading the sidecar, keeping the longest concurrent deadline when a
+  shorter 429 races with it, rejecting unsafe or symlink lock files, avoiding
+  a token refresh after an in-flight 401 arrives during another process's
+  cooldown, and returning the longest deadline when persistence fails.
+- Metadata lookup tests verify a ten-second total deadline across all listing
+  pages and retries, and that caller cancellation remains effective. A
+  paginated fixture blocks its second page and confirms both pages share the
+  same lookup deadline.
+- Writeback tests verify that wrapped `Retry-After` deadlines schedule pending
+  writes in the VFS queue, prevent an early retry, and preserve ordinary
+  backoff behavior after an expired deadline.
+
+A rebuilt native Linux FUSE smoke test against a localhost HTTP fixture passed.
+A matching root-validation proof allowed the mount to initialize while a
+persisted cooldown was active, with zero HTTP requests sent during the hold. A
+generated 47-byte dirty write remained pending. Native `ls` received `EIO` in
+about 3 ms instead of hanging or reporting an empty remote. After the short
+fixture cooldown expired, reading the generated data returned the expected
+bytes. Rejected upload authorization preserved the pending write, and normal
+unmount completed. This verifies local fail-fast and retention behavior; it
+does not exercise Degoo's live service.
+
+The captured live `GetFileChildren5` 429 requested a retry after
+`2026-10-14 17:06:16 EEST`; the already-running mount retried until it was
+stopped. The follow-up validation made no live upload-recovery claim. Live
+provider upload recovery with the current code remains unverified.
+
+The external-cache copy has completed, but its whole-cache checksum comparison
+is still running. The checked portion has found no mismatches so far. Do not
+consider the migration complete until the full comparison and bind-mount
+verification finish.
