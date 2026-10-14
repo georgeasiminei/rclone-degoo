@@ -54,6 +54,32 @@ class ArchiveTest(unittest.TestCase):
             update.extract_package(self.archive, self.base / "extracted")
 
 
+class PayloadInventoryTest(unittest.TestCase):
+    def test_literal_inventory_is_read_without_importing_the_installer(self):
+        source = b"""\
+SOURCE_FILES = ("install.py", "stats.py")
+SOURCE_SHELL_FILES = ("install.sh",)
+IMMUTABLE_MOUNT_FILES = ("helper.c",)
+"""
+        self.assertEqual(update._parse_payload_inventory(source), (
+            Path("scripts/python/install.py"), Path("scripts/python/stats.py"),
+            Path("scripts/install.sh"), Path("immutable-mount/helper.c"),
+        ))
+
+    def test_nonliteral_duplicate_and_unsafe_names_are_rejected(self):
+        declarations = (
+            'SOURCE_FILES = inventory()\n',
+            'SOURCE_FILES = ("install.py", "install.py")\n',
+            'SOURCE_FILES = ("install.py", "../secret.py")\n',
+            'SOURCE_FILES = ("install.py", "nested/helper.py")\n',
+        )
+        for declaration in declarations:
+            source = (declaration + 'SOURCE_SHELL_FILES = ()\n'
+                      'IMMUTABLE_MOUNT_FILES = ()\n').encode()
+            with self.subTest(declaration=declaration), self.assertRaises(update.UpdateError):
+                update._parse_payload_inventory(source)
+
+
 class UpdatePreparationProtocolTest(unittest.TestCase):
     def _connection(self, status, body):
         from unittest import mock
@@ -220,6 +246,58 @@ class UpdateTest(unittest.TestCase):
                 archive.addfile(member, io.BytesIO(data))
         digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
         self.archive.with_name(self.archive.name + ".sha256").write_text(f"{digest}  {self.archive.name}\n")
+
+    def test_payload_identity_follows_each_trees_declared_inventory(self):
+        from unittest import mock
+        import install
+
+        self.package()
+        package, _ = update.extract_package(self.archive, self.base / "extracted")
+        expected = install.package_identity(package / "bin/rclone", package)
+        self.assertIn("stats.py", install.SOURCE_FILES)
+        old_sources = tuple(name for name in install.SOURCE_FILES if name != "stats.py")
+
+        # Model an updater imported from an older install.py while the target
+        # package and installed tree already carry the newer inventory.
+        with mock.patch.object(update.installer, "SOURCE_FILES", old_sources):
+            self.assertEqual(update.validate_package(package, {"commit": "a" * 40}), expected)
+            self.assertTrue(update.installed_matches(self.root, expected))
+
+            stats = self.root / "scripts/python/stats.py"
+            original = stats.read_bytes()
+            try:
+                stats.write_bytes(original + b"# changed\n")
+                self.assertFalse(update.installed_matches(self.root, expected))
+                stats.write_bytes(original)
+                stats.unlink()
+                self.assertFalse(update.installed_matches(self.root, expected))
+            finally:
+                if not stats.exists():
+                    stats.write_bytes(original)
+
+    def test_package_can_remove_a_helper_known_to_the_updater(self):
+        from unittest import mock
+        import install
+
+        self.package()
+        with tarfile.open(self.archive, "r:gz") as archive:
+            entries = []
+            for member in archive:
+                if member.name == "rclone-degoo/scripts/python/stats.py":
+                    continue
+                with archive.extractfile(member) as stream:
+                    data = stream.read()
+                if member.name == "rclone-degoo/scripts/python/install.py":
+                    data = data.replace(b', "stats.py"', b"")
+                entries.append((member.name, data, tarfile.REGTYPE))
+        ArchiveTest.package(self, entries)
+
+        package, _ = update.extract_package(self.archive, self.base / "removed-helper")
+        reduced = tuple(name for name in install.SOURCE_FILES if name != "stats.py")
+        with mock.patch.object(install, "SOURCE_FILES", reduced):
+            expected = install.package_identity(package / "bin/rclone", package)
+        self.assertEqual(update.validate_package(package, {"commit": "a" * 40}), expected)
+        self.assertFalse(update.installed_matches(self.root, expected))
 
     def invoke(self, *arguments):
         import contextlib

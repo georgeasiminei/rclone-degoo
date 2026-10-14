@@ -34,6 +34,33 @@ run for that follow-up. See [VALIDATION.md](VALIDATION.md).
 
 ## Implementation decisions and validation plan
 
+### Payload inventories across updater versions (2026-10-14)
+
+The first update adding `stats.py` exposed an updater compatibility bug: the
+installed updater hashed the target archive using its imported installer
+constants. Its older inventory omitted the new helper, so the archive and
+binary checks passed while the payload hash differed from the published
+manifest. The failure occurred before mount preparation or shutdown and
+preserved both the running upload queue and installed files.
+
+Payload comparison must read each tree's bundled installer inventory instead
+of the updater process's imported constants. Parse the three literal helper
+lists without executing the installed program; validate their bounds and
+filenames, then apply the existing canonical hash algorithm. The target
+inventory also defines archive completeness. Keep provenance and checksum
+checks and verify the installed tree again after replacement. Regression
+fixtures must cross a helper-addition/removal boundary, since comparing
+packages built from one imported inventory cannot detect this failure.
+
+An older affected updater can bootstrap from a checksum-verified package's
+own `degoo-rc update --archive` command, run as the installing user outside the
+mount with its temporary workspace outside the mount. This selects the new
+helper inventory while retaining normal preparation, cache preservation,
+installation, and runtime restart. It must not replace the installed scripts
+manually or delete the cache. Pending logical files return to the writeback
+queue after restart; an interrupted file retries from its beginning rather
+than resuming a saved chunk or network byte offset.
+
 ### Local performance statistics (2026-10-14)
 
 `degoo-rc stats` reads the running mount's private `/stats` endpoint. It offers
