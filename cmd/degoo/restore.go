@@ -33,6 +33,55 @@ offline: it reads local configuration and cache files without contacting Degoo.`
 	}
 	restore.Flags().StringVar(&folderID, "folder-id", "", "Dedicated Degoo vault folder ID (required)")
 	root.AddCommand(restore)
+	var verifyFolderID string
+	verify := &cobra.Command{
+		Use:   "verify-cache vault.json",
+		Short: "Verify the local cache identity without modifying or locking it.",
+		Long: `Checks the private cache identity against the vault configuration and
+the locally configured Degoo root folder. This command is offline and read-only;
+maintenance callers must hold the cache lock while acting on its result.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return verifyCacheIdentity(args[0], verifyFolderID)
+		},
+	}
+	verify.Flags().StringVar(&verifyFolderID, "folder-id", "", "Dedicated Degoo vault folder ID (required)")
+	root.AddCommand(verify)
+}
+
+func verifyCacheIdentity(filename, folderID string) error {
+	if strings.TrimSpace(folderID) != folderID || folderID == "" || folderID == "0" || strings.ContainsRune(folderID, '\x00') {
+		return errors.New("--folder-id must identify a dedicated Degoo folder")
+	}
+	cfg, err := readConfig(filename)
+	if err != nil {
+		return fmt.Errorf("read vault configuration: %w", err)
+	}
+	if cfg.Remote != restoreCacheRemote {
+		return fmt.Errorf("cache verification is restricted to %s", restoreCacheRemote)
+	}
+	if err := verifyRestoreFolderID(folderID); err != nil {
+		return err
+	}
+	cacheInfo, err := os.Lstat(cfg.CacheDir)
+	if err != nil {
+		return err
+	}
+	if !cacheInfo.IsDir() || cacheInfo.Mode()&os.ModeSymlink != 0 || cacheInfo.Mode().Perm() != 0700 {
+		return errors.New("cache directory must be a private directory with mode 0700")
+	}
+	expected, err := cacheIdentity(cfg, restoreCacheRemote+"\x00"+folderID)
+	if err != nil {
+		return err
+	}
+	current, err := auth.ReadPrivateFile(filepath.Join(cfg.CacheDir, cfg.cacheName()+".identity"))
+	if err != nil {
+		return fmt.Errorf("read cache identity: %w", err)
+	}
+	if !bytes.Equal(current, expected) {
+		return errors.New("cache identity does not match the vault settings")
+	}
+	return nil
 }
 
 func restoreCacheIdentity(originalFilename, newFilename, folderID string) error {

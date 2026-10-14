@@ -29,7 +29,12 @@ ROOT_NAME = "rclone-degoo"
 MAX_MANIFEST_SIZE = 64 * 1024
 MAX_VAULT_SIZE = 1024 * 1024
 MAX_STATUS_SIZE = 4096
+MAX_METADATA_CACHE_FILE_SIZE = (256 << 10) + 1024
+MAX_METADATA_CACHE_BYTES = 64 << 20
+MAX_METADATA_CACHE_ENTRIES = 8192
+MAX_VFS_METADATA_SIZE = 64 << 10
 STATUS_PATTERN = re.compile(r"Pending local uploads: ([0-9]+) files, ([0-9]+) bytes")
+METADATA_CACHE_FILE = re.compile(r"[0-9a-f]{64}\.cache\Z")
 EXPECTED_MANIFEST_PATHS = {
     "binary": "bin/rclone",
     "vault_config": "config/vault.json",
@@ -237,13 +242,19 @@ def _validate_layout(root: Path) -> dict[str, Any]:
     except FileNotFoundError:
         vault_bytes = None
     vault: dict[str, Any] | None = _decode_json(vault_bytes) if vault_bytes is not None else None
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError as exc:
+        raise CleanupError(str(exc)) from None
     if vault is not None:
         if type(vault.get("version")) is not int or vault["version"] != 1 or vault.get("remote") != f"{REMOTE_NAME}:":
             raise CleanupError("the vault configuration does not match this install")
         if not isinstance(vault.get("password"), str) or not vault["password"]:
             raise CleanupError("the vault configuration is incomplete")
-        if vault.get("cache_dir") != str(root / "cache"):
-            raise CleanupError("the vault configuration points outside the isolated cache")
+    if os.path.lexists(cache_dir):
+        _check_directory(cache_dir, private=True)
+        if cache_dir != root / "cache":
+            _cache_mountpoints(cache_dir)
 
     try:
         mount_settings_bytes = _read_private_file(root / "config/mount.json", MAX_MANIFEST_SIZE, missing_ok=True)
@@ -267,7 +278,7 @@ def _validate_layout(root: Path) -> dict[str, Any]:
     elif has_rclone_config:
         raise CleanupError("the isolated rclone executable is missing")
 
-    return {"manifest": manifest, "vault_bytes": vault_bytes, "vault": vault}
+    return {"manifest": manifest, "vault_bytes": vault_bytes, "vault": vault, "cache_dir": cache_dir}
 
 
 def _check_regular_executable(path: Path) -> os.stat_result:
@@ -309,6 +320,12 @@ def _validate_backup(path_arg: str, root: Path, vault_bytes: bytes | None) -> No
     installed_settings = json.dumps(installed_vault, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     if backup_settings != installed_settings:
         raise CleanupError("the vault backup does not match the installed vault configuration")
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError as exc:
+        raise CleanupError(str(exc)) from None
+    if cache_dir == path.parent or cache_dir in path.parents:
+        raise CleanupError("the vault backup must be outside the configured cache")
 
 
 def _default_retention_directory() -> Path:
@@ -343,6 +360,12 @@ def _validate_retention_directory(path_arg: str | Path, root: Path) -> Path:
         raise CleanupError("the retention parent must be owned by the current user and not writable by others")
     if os.path.lexists(path):
         raise CleanupError("the retention directory already exists")
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError as exc:
+        raise CleanupError(str(exc)) from None
+    if cache_dir == path or cache_dir in path.parents or path in cache_dir.parents:
+        raise CleanupError("the retention directory must not overlap the configured cache")
     return path
 
 
@@ -638,7 +661,7 @@ def _retain_state(
     if keep_config:
         _copy_retained_config_directory(root / "config", destination / "config")
     if keep_cache:
-        _copy_retained_directory(root / "cache", destination / "cache")
+        _copy_retained_directory(installer.configured_cache_dir(root), destination / "cache")
     if keep_logs:
         _copy_retained_directory(root / "logs", destination / "logs")
     _copy_retained_file(root / "install.json", destination)
@@ -1048,11 +1071,305 @@ def _unmount(root: Path) -> None:
 
 def _cache_lock_path(root: Path) -> Path:
     digest = hashlib.sha256(f"{REMOTE_NAME}:".encode("utf-8")).hexdigest()[:24]
-    return root / "cache" / f"degoo-vault-{digest}.lock"
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError as exc:
+        raise CleanupError(str(exc)) from None
+    return cache_dir / f"degoo-vault-{digest}.lock"
+
+
+def _ensure_cache_directory(cache_dir: Path) -> None:
+    """Create a missing private cache path component by component."""
+    missing: list[Path] = []
+    current = Path(cache_dir.anchor)
+    for part in cache_dir.parts[1:]:
+        current /= part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            missing.append(current)
+            continue
+        except OSError:
+            raise CleanupError("the configured cache path could not be inspected safely") from None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise CleanupError("the configured cache path has an unsafe parent")
+        if missing:
+            raise CleanupError("the configured cache path changed while being prepared")
+    for path in missing:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            raise CleanupError("the configured cache directory could not be prepared safely") from None
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise CleanupError("the configured cache directory could not be verified") from None
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise CleanupError("the configured cache directory has unsafe ownership or permissions")
+    _check_directory(cache_dir, private=True)
+
+
+def _cache_name() -> str:
+    """Return the VFS namespace bound to the installed Degoo remote."""
+    digest = hashlib.sha256(f"{REMOTE_NAME}:".encode("utf-8")).hexdigest()[:24]
+    return f"degoo-vault-{digest}"
+
+
+def _cache_mountpoints(cache_dir: Path) -> None:
+    """Reject a separate mountpoint nested inside the dedicated cache root."""
+    for raw in read_mountpoints():
+        mountpoint = Path(raw)
+        if mountpoint != cache_dir and cache_dir in mountpoint.parents:
+            raise CleanupError("an unrelated mount exists inside the configured cache")
+
+
+def _check_cache_file(path: Path, *, maximum: int | None = None) -> os.stat_result:
+    """Validate a regular private cache file without following links."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise CleanupError("a configured cache file could not be inspected safely") from None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o077
+        or info.st_mode & 0o6000
+        or info.st_nlink != 1
+        or (maximum is not None and info.st_size > maximum)
+    ):
+        raise CleanupError("a configured cache file has unsafe ownership, permissions, or size")
+    return info
+
+
+def _audit_cache_tree(path: Path, cache_dir: Path, *, metadata: bool = False) -> bool:
+    """Inspect a known cache subtree and report whether it contains data."""
+    _check_directory(path, private=True)
+    _cache_mountpoints(cache_dir)
+    has_data = False
+    if metadata:
+        total_bytes = 0
+        entries = sorted(os.scandir(path), key=lambda entry: entry.name)
+        if len(entries) > MAX_METADATA_CACHE_ENTRIES + 1:
+            raise CleanupError("the persistent metadata cache exceeds its bounded entry count")
+        for entry in entries:
+            entry_path = path / entry.name
+            if entry.name == ".lock":
+                _check_cache_file(entry_path, maximum=4096)
+                continue
+            if not METADATA_CACHE_FILE.fullmatch(entry.name):
+                raise CleanupError("the persistent metadata cache contains an unknown file")
+            info = _check_cache_file(entry_path, maximum=MAX_METADATA_CACHE_FILE_SIZE)
+            total_bytes += info.st_size
+            if total_bytes > MAX_METADATA_CACHE_BYTES:
+                raise CleanupError("the persistent metadata cache exceeds its bounded size")
+            has_data = True
+        return has_data
+
+    try:
+        children = sorted(os.scandir(path), key=lambda entry: entry.name)
+    except OSError:
+        raise CleanupError("the configured cache could not be inspected safely") from None
+    for child in children:
+        child_path = path / child.name
+        try:
+            info = child.stat(follow_symlinks=False)
+        except OSError:
+            raise CleanupError("the configured cache changed while being inspected") from None
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_mode & 0o6000:
+            raise CleanupError("the configured cache contains an unsafe entry")
+        if stat.S_ISDIR(info.st_mode):
+            has_data = _audit_cache_tree(child_path, cache_dir) or has_data
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            has_data = True
+        else:
+            raise CleanupError("the configured cache contains a special or shared file")
+    return has_data
+
+
+def _audit_cache_namespace(root: Path, cache_dir: Path | None = None) -> bool:
+    """Validate only the vault's owned cache namespace and report stored data."""
+    if cache_dir is None:
+        try:
+            cache_dir = installer.configured_cache_dir(root)
+        except installer.InstallError as exc:
+            raise CleanupError(str(exc)) from None
+    try:
+        _check_components(cache_dir, missing_ok=True)
+        os.lstat(cache_dir)
+    except FileNotFoundError:
+        return False
+    except (OSError, CleanupError):
+        raise CleanupError("the configured cache path is unsafe") from None
+    _check_directory(cache_dir, private=True)
+    _cache_mountpoints(cache_dir)
+    cache_name = _cache_name()
+    lock = _cache_lock_path(root)
+    identity = cache_dir / f"{cache_name}.identity"
+    known = {lock.name, identity.name, "vfs", "vfsMeta", "metadata"}
+    try:
+        children = sorted(os.scandir(cache_dir), key=lambda entry: entry.name)
+    except OSError:
+        raise CleanupError("the configured cache could not be inspected safely") from None
+    has_data = False
+    identity_exists = False
+    for child in children:
+        path = cache_dir / child.name
+        try:
+            info = child.stat(follow_symlinks=False)
+        except OSError:
+            raise CleanupError("the configured cache changed while being inspected") from None
+        if child.name not in known:
+            raise CleanupError("the configured cache contains an unknown path")
+        if child.name in {lock.name, identity.name}:
+            _check_cache_file(path, maximum=4096 if child.name == lock.name else 65)
+            if child.name == identity.name:
+                raw = _read_private_file(path, 65)
+                if raw is None or not re.fullmatch(rb"[0-9a-f]{64}\n", raw):
+                    raise CleanupError("the configured cache identity is invalid")
+                identity_exists = True
+                has_data = True
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise CleanupError("the configured cache contains an unsafe namespace")
+        _check_directory(path, private=True)
+        try:
+            namespaces = sorted(os.scandir(path), key=lambda entry: entry.name)
+        except OSError:
+            raise CleanupError("the configured cache namespace could not be inspected") from None
+        if any(entry.name != cache_name for entry in namespaces):
+            raise CleanupError("the configured cache contains another vault namespace")
+        if not namespaces:
+            continue
+        namespace = path / cache_name
+        if child.name == "metadata":
+            has_data = _audit_cache_tree(namespace, cache_dir, metadata=True) or has_data
+        else:
+            has_data = _audit_cache_tree(namespace, cache_dir) or has_data
+    if has_data and not identity_exists:
+        raise CleanupError("the configured cache data or its vault identity is incomplete")
+    return has_data
+
+
+def _validate_vfs_cache_recovery(cache_dir: Path) -> None:
+    """Require each cached data file to have valid, matching recovery metadata."""
+    cache_name = _cache_name()
+    data_root = cache_dir / "vfs" / cache_name
+    metadata_root = cache_dir / "vfsMeta" / cache_name
+    data_files = {
+        path.relative_to(data_root): path
+        for path in data_root.rglob("*")
+        if path.is_file()
+    } if data_root.is_dir() else {}
+    metadata_files = {
+        path.relative_to(metadata_root): path
+        for path in metadata_root.rglob("*")
+        if path.is_file()
+    } if metadata_root.is_dir() else {}
+    if data_files.keys() != metadata_files.keys():
+        raise CleanupError("cache data or its recovery metadata is incomplete; uninstall was refused")
+    for relative, data_path in data_files.items():
+        metadata_path = metadata_files[relative]
+        data_info = _check_cache_file(data_path)
+        try:
+            raw = installer.read_private_file(metadata_path, MAX_VFS_METADATA_SIZE)
+            metadata = json.loads(raw or b"")
+        except (installer.InstallError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise CleanupError("cache recovery metadata is malformed; uninstall was refused") from None
+        if (
+            not isinstance(metadata, dict)
+            or type(metadata.get("Dirty")) is not bool
+            or type(metadata.get("Size")) is not int
+            or metadata["Size"] < 0
+            or metadata["Size"] != data_info.st_size
+        ):
+            raise CleanupError("cache recovery metadata does not match its data; uninstall was refused")
+        fingerprint = metadata.get("Fingerprint")
+        if fingerprint is not None and (not isinstance(fingerprint, str) or len(fingerprint) > 4096):
+            raise CleanupError("cache recovery metadata has an invalid fingerprint; uninstall was refused")
+        if metadata["Dirty"] is False and not fingerprint:
+            raise CleanupError("clean cache data has no recovery fingerprint; uninstall was refused")
+
+
+def _verify_cache_identity(root: Path, cache_dir: Path) -> None:
+    """Ask the offline rclone command to verify this cache's vault identity."""
+    manifest = _validate_manifest(root)
+    folder_id = manifest.get("root_folder_id")
+    if not isinstance(folder_id, str) or not folder_id:
+        raise CleanupError("the configured cache has no matching vault folder identity")
+    binary = root / "bin/rclone"
+    _check_regular_executable(binary)
+    env = {
+        "HOME": str(home_directory()),
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_CACHE_HOME": str(cache_dir),
+        "TMPDIR": str(root / "logs"),
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+    }
+    try:
+        result = subprocess.run(
+            [str(binary), "--config", str(root / "config/rclone.conf"), "degoo", "verify-cache",
+             str(root / "config/vault.json"), "--folder-id", folder_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise CleanupError("the configured cache identity could not be verified offline") from None
+    if result.returncode != 0:
+        raise CleanupError("the configured cache identity does not match the vault")
+
+
+def _remove_owned_cache(root: Path, cache_dir: Path, lock_path: Path) -> None:
+    """Remove verified vault cache entries while retaining the held lock inode."""
+    has_data = _audit_cache_namespace(root, cache_dir)
+    if has_data and (root / "config/vault.json").is_file():
+        _verify_cache_identity(root, cache_dir)
+    _cache_mountpoints(cache_dir)
+    try:
+        children = sorted(os.scandir(cache_dir), key=lambda entry: entry.name)
+    except OSError:
+        raise CleanupError("the configured cache could not be inspected before cleanup") from None
+    known = {lock_path.name, f"{_cache_name()}.identity", "vfs", "vfsMeta", "metadata"}
+    for child in children:
+        if child.name not in known:
+            raise CleanupError("an unknown path appeared in the configured cache before cleanup")
+        if child.name == lock_path.name:
+            continue
+        path = cache_dir / child.name
+        try:
+            info = child.stat(follow_symlinks=False)
+        except OSError:
+            raise CleanupError("the configured cache changed before cleanup") from None
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                raise CleanupError("the owned cache namespace could not be removed safely") from None
+        elif stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            try:
+                path.unlink()
+            except OSError:
+                raise CleanupError("the owned cache entry could not be removed safely") from None
+        else:
+            raise CleanupError("the configured cache changed to an unsafe entry before cleanup")
 
 
 def _acquire_cache_lock(root: Path, wait_seconds: float) -> int:
     path = _cache_lock_path(root)
+    _ensure_cache_directory(path.parent)
+    _cache_mountpoints(path.parent)
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags, 0o600)
@@ -1126,21 +1443,39 @@ def _audit_tree(root: Path) -> list[dict[str, str]]:
 
 
 def _cache_has_data(root: Path, lock_path: Path) -> bool:
-    """Return whether cache contains anything beyond the held lock file."""
-    for directory, dirnames, filenames in os.walk(root / "cache", followlinks=False):
-        for name in dirnames:
-            path = Path(directory) / name
-            info = os.lstat(path)
-            if stat.S_ISLNK(info.st_mode):
-                raise CleanupError("symlinks inside the cache are not allowed")
-        for name in filenames:
-            path = Path(directory) / name
-            if path == lock_path:
-                continue
-            info = os.lstat(path)
-            if not stat.S_ISREG(info.st_mode):
-                raise CleanupError("unexpected files inside the cache are not allowed")
-            return True
+    """Return whether the validated vault cache contains more than its lock."""
+    expected_lock = _cache_lock_path(root)
+    if lock_path != expected_lock:
+        raise CleanupError("the configured cache lock path changed")
+    try:
+        return _audit_cache_namespace(root)
+    except CleanupError as exc:
+        raise CleanupError(f"the cache is not empty or safe: {exc}") from None
+
+
+def _legacy_cache_has_contents(root: Path) -> bool:
+    """Report files left in the install cache after a configured path moved."""
+    cache = root / "cache"
+    try:
+        for directory, dirnames, filenames in os.walk(cache, followlinks=False):
+            for name in dirnames:
+                path = Path(directory) / name
+                info = os.lstat(path)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise CleanupError("the legacy install cache contains an unsafe entry")
+                if os.path.ismount(path):
+                    raise CleanupError("a mount exists inside the legacy install cache")
+            for name in filenames:
+                path = Path(directory) / name
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode):
+                    raise CleanupError("the legacy install cache contains an unsafe entry")
+                if stat.S_ISREG(info.st_mode):
+                    return True
+    except CleanupError:
+        raise
+    except OSError:
+        raise CleanupError("the legacy install cache could not be inspected safely") from None
     return False
 
 
@@ -1149,6 +1484,10 @@ def _pending_uploads(root: Path) -> tuple[int, int]:
     config = root / "config/rclone.conf"
     vault = root / "config/vault.json"
     _check_regular_executable(binary)
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError as exc:
+        raise CleanupError(str(exc)) from None
     try:
         with tempfile.TemporaryFile() as output:
             result = subprocess.run(
@@ -1159,7 +1498,7 @@ def _pending_uploads(root: Path) -> tuple[int, int]:
                 env={
                     "HOME": str(home_directory()),
                     "XDG_CONFIG_HOME": str(root / "config"),
-                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "XDG_CACHE_HOME": str(cache_dir),
                     "TMPDIR": str(root / "logs"),
                     "PATH": "/usr/bin:/bin",
                     "LANG": "C",
@@ -1512,6 +1851,11 @@ def uninstall(args: argparse.Namespace) -> int:
         _inventory(root, layout["manifest"], entries, mounted)
         return 0
 
+    if layout["cache_dir"] != root / "cache" and _legacy_cache_has_contents(root):
+        raise CleanupError(
+            "the legacy install cache still contains local files; recover or move that cache before uninstalling"
+        )
+
     _validate_recorded_path_link(root, layout["manifest"])
     direct_service_link, wanted_service_link = _service_paths(root, layout["manifest"])
     service_links, recorded_service_links = _owned_service_links(root, layout["manifest"])
@@ -1550,6 +1894,10 @@ def uninstall(args: argparse.Namespace) -> int:
         pending_state = pending_files != 0 or pending_bytes != 0
         if pending_state and not (keep_config and keep_cache):
             raise CleanupError("pending local uploads remain; the install and cache were preserved")
+        cache_has_data = _audit_cache_namespace(root, layout["cache_dir"])
+        if cache_has_data:
+            _verify_cache_identity(root, layout["cache_dir"])
+        _validate_vfs_cache_recovery(layout["cache_dir"])
 
     legacy_mountpoint = installer.configured_mountpoint(root, layout["manifest"]) == root / "mount"
     if not mounted:
@@ -1598,6 +1946,11 @@ def uninstall(args: argparse.Namespace) -> int:
         latest = _validate_layout(root)
         if latest["vault_bytes"] != layout["vault_bytes"]:
             raise CleanupError("the vault configuration changed during cleanup")
+        cache_has_data = _audit_cache_namespace(root, latest["cache_dir"])
+        if cache_has_data and latest["vault_bytes"] is not None:
+            _verify_cache_identity(root, latest["cache_dir"])
+        if latest["vault_bytes"] is not None:
+            _validate_vfs_cache_recovery(latest["cache_dir"])
         if args.vault_backup:
             _validate_backup(args.vault_backup, root, latest["vault_bytes"])
         final_points = read_mountpoints()
@@ -1614,6 +1967,7 @@ def uninstall(args: argparse.Namespace) -> int:
                 keep_logs=keep_logs,
                 pending=pending_state,
             )
+        _remove_owned_cache(root, latest["cache_dir"], _cache_lock_path(root))
         _make_install_tree_writable(root)
         # Reload and verify systemd while the install layout is still retryable.
         service_cleanup = _remove_owned_service_links(root, latest["manifest"], previously_owned_service)

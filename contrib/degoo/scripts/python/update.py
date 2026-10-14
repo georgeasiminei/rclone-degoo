@@ -551,8 +551,12 @@ def start_runtime(root: Path, state: dict[str, Any]) -> None:
             raise UpdateError("the updated service could not start; inspect degoo-rc logs and retry degoo-rc service start")
     elif state["manual_arguments"]:
         print("Restarting the previous manual mount in the background.", flush=True)
+        try:
+            cache_dir = installer.configured_cache_dir(root)
+        except installer.InstallError as exc:
+            raise UpdateError(str(exc)) from None
         env = dict(os.environ, PATH=f"{root / 'tools'}:/usr/bin:/bin",
-                   XDG_CONFIG_HOME=str(root / "config"), XDG_CACHE_HOME=str(root / "cache"),
+                   XDG_CONFIG_HOME=str(root / "config"), XDG_CACHE_HOME=str(cache_dir),
                    TMPDIR=str(root / "tmp"), PYTHONDONTWRITEBYTECODE="1")
         log = root / "logs/update-mount.log"
         installer.check_directory(root / "logs", private=True)
@@ -667,7 +671,10 @@ def restore_program(root: Path, backup: Path, names: list[str]) -> None:
 
 def require_clean_cache(root: Path) -> None:
     """Refuse dirty, unpaired, unrecognised, or unverifiable cache data."""
-    cache = root / "cache"
+    try:
+        cache = installer.configured_cache_dir(root)
+    except installer.InstallError as exc:
+        raise UpdateError(str(exc)) from None
     lock = uninstall._cache_lock_path(root)
     cache_name = lock.stem
     identity = cache / f"{cache_name}.identity"
@@ -676,11 +683,15 @@ def require_clean_cache(root: Path) -> None:
             raise UpdateError("pending local uploads remain; --delete-cache was refused and the cache was preserved")
     elif uninstall._cache_has_data(root, lock):
         raise UpdateError("cached data has no matching vault configuration; cache deletion was refused")
-    allowed = {lock.name, identity.name, "vfs", "vfsMeta"}
-    for child in cache.iterdir():
-        if child.name not in allowed:
-            raise UpdateError("unrecognised cache data remains; cache deletion was refused")
-        check_managed_tree(child, root)
+    try:
+        has_data = uninstall._audit_cache_namespace(root, cache)
+    except uninstall.CleanupError as exc:
+        raise UpdateError(f"cache deletion was refused: {exc}") from None
+    if has_data and identity.is_file() and (root / "config/vault.json").is_file():
+        try:
+            uninstall._verify_cache_identity(root, cache)
+        except uninstall.CleanupError as exc:
+            raise UpdateError(f"cache deletion was refused: {exc}") from None
     for parent in (cache / "vfs", cache / "vfsMeta"):
         if parent.exists() and (not parent.is_dir() or any(child.name != cache_name for child in parent.iterdir())):
             raise UpdateError("another cache identity remains; cache deletion was refused")
@@ -705,7 +716,8 @@ def delete_clean_cache(root: Path) -> None:
     """Remove verified clean cached data, retaining the inode of the held writer lock."""
     require_clean_cache(root)
     lock = uninstall._cache_lock_path(root)
-    for child in (root / "cache").iterdir():
+    cache = lock.parent
+    for child in cache.iterdir():
         if child == lock:
             continue
         if child.is_dir():

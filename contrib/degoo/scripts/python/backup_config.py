@@ -157,6 +157,7 @@ def _read_source(root: Path) -> dict[str, bytes]:
 
     try:
         vault, _ = installer.read_vault(files["vault.json"], root, imported=False)
+        installer.configured_cache_dir(root)
         installer.validate_rclone_config(files["rclone.conf"], root, folder_id)
         installer.validate_mount_settings(files["mount.json"])
     except installer.InstallError as exc:

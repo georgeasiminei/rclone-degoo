@@ -621,6 +621,88 @@ def configured_mountpoint(root: Path, manifest: dict[str, Any] | None = None) ->
     return root / value
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    """Report whether either path contains the other after lexical normalization."""
+    return left == right or left in right.parents or right in left.parents
+
+
+def _validate_configured_cache_dir(value: Any, root: Path) -> Path:
+    """Validate a vault cache path without creating it."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(ord(character) < 0x20 or 0x7F <= ord(character) < 0xA0 for character in value)
+    ):
+        raise InstallError("the vault cache path is invalid")
+    cache = Path(value)
+    if not cache.is_absolute() or ".." in cache.parts:
+        raise InstallError("the vault cache path must be absolute and cannot contain parent traversal")
+    cache = Path(os.path.normpath("/" + value.lstrip("/")))
+    root = Path(os.path.normpath(str(root)))
+    home = home_directory()
+    if cache == Path(cache.anchor) or cache in home.parents or cache == home or cache == root or cache in root.parents:
+        raise InstallError("the vault cache path overlaps a protected root directory")
+
+    default_cache = root / "cache"
+    if root in cache.parents:
+        protected = (
+            root / "bin",
+            root / "config",
+            root / "logs",
+            root / "mount",
+            root / "tmp",
+            root / "tools",
+            root / "scripts",
+            root / "immutable-mount",
+            root / "degoo-rc",
+            root / "install.json",
+            root / "rclone-degoo.service",
+        )
+        if cache != default_cache and any(_paths_overlap(cache, path) for path in protected):
+            raise InstallError("the vault cache path overlaps protected install files")
+    mountpoint = configured_mountpoint(root)
+    if _paths_overlap(cache, mountpoint):
+        raise InstallError("the vault cache path overlaps the mountpoint")
+
+    try:
+        check_components(cache, missing_ok=True)
+        for parent in reversed(cache.parents):
+            try:
+                info = os.lstat(parent)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise InstallError("the vault cache path could not be inspected safely") from None
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise InstallError("the vault cache path has an unsafe parent directory")
+            if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+                raise InstallError("the vault cache parent is writable by other users")
+        try:
+            info = os.lstat(cache)
+        except FileNotFoundError:
+            return cache
+        except OSError:
+            raise InstallError("the vault cache path could not be inspected safely") from None
+    except InstallError:
+        raise
+
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise InstallError("the vault cache path is not a regular directory")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise InstallError("the vault cache directory must be owned by this user with mode 0700")
+    return cache
+
+
+def configured_cache_dir(root: Path) -> Path:
+    """Return the normalized, validated cache directory saved in vault.json."""
+    root = Path(os.path.normpath(str(root)))
+    raw = read_private_file(root / "config/vault.json", missing_ok=True)
+    if raw is None:
+        return _validate_configured_cache_dir(str(root / "cache"), root)
+    config, _ = read_vault(raw, root, imported=False)
+    return Path(os.path.normpath(config["cache_dir"]))
+
+
 def mountpoint_instructions(path: Path) -> str:
     """Return commands to create an owner-private immutable mount directory."""
     quoted = shlex.quote(str(path))
@@ -661,8 +743,7 @@ def read_vault(raw: bytes, root: Path, *, imported: bool) -> tuple[dict[str, Any
     if not imported:
         if config.get("remote") != f"{REMOTE_NAME}:":
             raise InstallError("the installed vault configuration points to another remote")
-        if config.get("cache_dir") != str(root / "cache"):
-            raise InstallError("the installed vault configuration points outside this cache")
+        _validate_configured_cache_dir(config.get("cache_dir"), root)
     else:
         remote = config.get("remote")
         if not isinstance(remote, str) or not remote.endswith(":") or not remote[:-1]:
@@ -849,7 +930,13 @@ def shell_wrapper(name: str, root: Path, *, mountpoint: Path | None = None) -> b
     else:
         raise InstallError("an internal wrapper name was invalid")
     path = '"$ROOT/tools:/usr/bin:/bin"' if name in {"mount.sh", "stop.sh"} else "/usr/bin:/bin"
-    content = f"#!/bin/sh\nset -eu\nROOT={root_text}\nMOUNTPOINT={shell_quote(mountpoint)}\numask 077\nexport PYTHONDONTWRITEBYTECODE=1\nexport XDG_CONFIG_HOME=\"$ROOT/config\"\nexport XDG_CACHE_HOME=\"$ROOT/cache\"\nexport TMPDIR=\"$ROOT/tmp\"\nexport PATH={path}\n{command}\n"
+    cache_setup = (
+        "DEGOO_CACHE_DIR=$(python3 -I -B -c "
+        "'import pathlib, sys; sys.path.insert(0, sys.argv[1]); import install; "
+        "print(install.configured_cache_dir(pathlib.Path(sys.argv[2])))' \"$ROOT/scripts/python\" \"$ROOT\")\n"
+        "export XDG_CACHE_HOME=\"$DEGOO_CACHE_DIR\"\n"
+    )
+    content = f"#!/bin/sh\nset -eu\nROOT={root_text}\nMOUNTPOINT={shell_quote(mountpoint)}\numask 077\nexport PYTHONDONTWRITEBYTECODE=1\nexport XDG_CONFIG_HOME=\"$ROOT/config\"\nexport TMPDIR=\"$ROOT/tmp\"\nexport PATH={path}\n{cache_setup}{command}\n"
     return content.encode("utf-8")
 
 
@@ -1363,9 +1450,10 @@ def _user_service_active(root: Path) -> bool:
     return state.rsplit(";", 1)[-1].strip() in {"active", "activating", "deactivating", "reloading"}
 
 
-def _upgrade_lock_path(root: Path) -> Path:
+def _upgrade_lock_path(root: Path, *, cache_dir: Path | None = None) -> Path:
     digest = hashlib.sha256(f"{REMOTE_NAME}:".encode("utf-8")).hexdigest()[:24]
-    return root / "cache" / f"degoo-vault-{digest}.lock"
+    cache = configured_cache_dir(root) if cache_dir is None else cache_dir
+    return cache / f"degoo-vault-{digest}.lock"
 
 
 def _check_upgrade_mount_stopped(root: Path) -> None:
@@ -1379,9 +1467,9 @@ def _check_upgrade_mount_stopped(root: Path) -> None:
 
 def _acquire_upgrade_lock(root: Path) -> int:
     _check_upgrade_mount_stopped(root)
-    cache = root / "cache"
-    check_directory(cache, private=True)
-    path = _upgrade_lock_path(root)
+    cache = configured_cache_dir(root)
+    ensure_private_directory(cache)
+    path = _upgrade_lock_path(root, cache_dir=cache)
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags, 0o600)
@@ -1406,9 +1494,9 @@ def _validate_upgrade_lock_fd(root: Path, lock_fd: int) -> None:
     _check_upgrade_mount_stopped(root)
     if type(lock_fd) is not int or lock_fd < 0:
         raise InstallError("the inherited cache-lock descriptor is invalid")
-    cache = root / "cache"
+    cache = configured_cache_dir(root)
     check_directory(cache, private=True)
-    path = _upgrade_lock_path(root)
+    path = _upgrade_lock_path(root, cache_dir=cache)
     try:
         path_info = os.lstat(path)
         fd_info = os.fstat(lock_fd)

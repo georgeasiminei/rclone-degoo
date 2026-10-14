@@ -591,6 +591,128 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(upgraded_manifest["build"]["binary_sha256"], install._file_sha256(self.root / "bin/rclone"))
         self.assertNotEqual(upgraded_manifest["build"]["payload_sha256"], original_payload_hash)
 
+    def test_external_cache_is_authoritative_for_validation_lock_upgrade_and_wrapper(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        external_cache = self.base / "external cache"
+        external_cache.mkdir(mode=0o700)
+        external_cache.chmod(0o700)
+        pending = external_cache / "pending-upload"
+        pending.write_bytes(b"pending local data")
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        vault["cache_dir"] = str(external_cache)
+        vault_path.write_text(json.dumps(vault) + "\n", encoding="utf-8")
+        vault_path.chmod(0o600)
+        configured = install.configured_cache_dir(self.root)
+        self.assertEqual(configured, external_cache)
+        self.assertEqual(install.read_vault(vault_path.read_bytes(), self.root, imported=False)[0]["cache_dir"],
+                         str(external_cache))
+        lock_path = install._upgrade_lock_path(self.root)
+        self.assertEqual(lock_path.parent, external_cache)
+        lock_fd = install._acquire_upgrade_lock(self.root)
+        try:
+            install._validate_upgrade_lock_fd(self.root, lock_fd)
+        finally:
+            os.close(lock_fd)
+        self.assertTrue(lock_path.is_file())
+
+        before = vault_path.read_bytes()
+        observed_cache = self.base / "wrapper-cache-path"
+        self.write_binary(self.binary, f"printf '%s' \"$XDG_CACHE_HOME\" > {shlex.quote(str(observed_cache))}\n")
+        code, _, stderr = self.invoke("--upgrade")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(vault_path.read_bytes(), before)
+        self.assertEqual(pending.read_bytes(), b"pending local data")
+        wrapper_env = os.environ.copy()
+        wrapper_env.pop("PYTHONDONTWRITEBYTECODE", None)
+        result = subprocess.run([str(self.root / "scripts/status.sh")], check=False, capture_output=True, text=True,
+                                env=wrapper_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(observed_cache.read_text(encoding="utf-8"), str(external_cache))
+        self.assertFalse((self.root / "scripts/python/__pycache__").exists())
+
+    def test_configured_cache_path_is_safe_private_and_does_not_create_it(self) -> None:
+        self.assertEqual(install.configured_cache_dir(self.root), self.root / "cache")
+        self.assertFalse(self.root.exists())
+        external_mountpoint = Path(install.DEFAULT_MOUNTPOINT)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(install, "prepare_mountpoint"):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = install.main(["--binary", str(self.binary), "--folder-id", "dedicated-folder-123"])
+        self.assertEqual(code, 0, stderr)
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        cache_path = self.base / "not-yet-created-cache"
+        vault["cache_dir"] = str(cache_path)
+        vault_path.write_text(json.dumps(vault) + "\n", encoding="utf-8")
+        vault_path.chmod(0o600)
+        self.assertEqual(install.configured_cache_dir(self.root), cache_path)
+        self.assertFalse(cache_path.exists())
+        noncanonical_cache = f"{cache_path.parent}/./{cache_path.name}"
+        vault["cache_dir"] = noncanonical_cache
+        vault_path.write_text(json.dumps(vault) + "\n", encoding="utf-8")
+        vault_path.chmod(0o600)
+        self.assertEqual(install.configured_cache_dir(self.root), cache_path)
+        self.assertEqual(install.read_vault(vault_path.read_bytes(), self.root, imported=False)[0]["cache_dir"],
+                         noncanonical_cache)
+
+        local_custom_cache = self.root / "custom-cache"
+        local_custom_cache.mkdir(mode=0o700)
+        local_custom_cache.chmod(0o700)
+        vault["cache_dir"] = str(local_custom_cache)
+        vault_path.write_text(json.dumps(vault) + "\n", encoding="utf-8")
+        vault_path.chmod(0o600)
+        self.assertEqual(install.configured_cache_dir(self.root), local_custom_cache)
+
+        protected_paths = (
+            str(self.root),
+            str(self.root / "config"),
+            f"//{str(self.root / 'config').lstrip('/')}",
+            str(self.root / "bin"),
+            str(self.root / "tmp"),
+            str(self.root / "logs"),
+            str(self.root / "mount"),
+            str(self.home),
+            "/",
+            "relative/cache",
+            str(self.base / ".." / "traversal"),
+            str(external_mountpoint),
+        )
+        for value in protected_paths:
+            with self.subTest(cache_dir=value):
+                vault["cache_dir"] = value
+                raw = (json.dumps(vault) + "\n").encode()
+                with self.assertRaises(install.InstallError):
+                    install.read_vault(raw, self.root, imported=False)
+
+        vault["cache_dir"] = str(self.base / "bad\ncache")
+        with self.assertRaises(install.InstallError):
+            install.read_vault((json.dumps(vault) + "\n").encode(), self.root, imported=False)
+
+        symlink_parent = self.base / "symlink-parent"
+        symlink_parent.symlink_to(self.base, target_is_directory=True)
+        vault["cache_dir"] = str(symlink_parent / "cache")
+        with self.assertRaises(install.InstallError):
+            install.read_vault((json.dumps(vault) + "\n").encode(), self.root, imported=False)
+
+        real_cache = self.base / "real-cache"
+        real_cache.mkdir(mode=0o700)
+        real_cache.chmod(0o700)
+        symlink_leaf = self.base / "symlink-cache"
+        symlink_leaf.symlink_to(real_cache, target_is_directory=True)
+        vault["cache_dir"] = str(symlink_leaf)
+        with self.assertRaises(install.InstallError):
+            install.read_vault((json.dumps(vault) + "\n").encode(), self.root, imported=False)
+
+        insecure = self.base / "insecure-cache"
+        insecure.mkdir(mode=0o755)
+        insecure.chmod(0o755)
+        vault["cache_dir"] = str(insecure)
+        with self.assertRaises(install.InstallError):
+            install.read_vault((json.dumps(vault) + "\n").encode(), self.root, imported=False)
+
     def test_mount_settings_require_valid_positive_write_back_duration(self) -> None:
         legacy = {
             key: install.DEFAULT_MOUNT_SETTINGS[key]
@@ -889,7 +1011,12 @@ class LoginTest(unittest.TestCase):
 
     def test_cached_email_skips_python_email_prompt_and_go_gets_cached_flag(self) -> None:
         vault_path = self.root / "config/vault.json"
-        vault_path.write_text("{}\n", encoding="ascii")
+        vault_path.write_text(json.dumps({
+            "version": 1,
+            "remote": f"{install.REMOTE_NAME}:",
+            "password": "test-vault-password",
+            "cache_dir": str(self.root / "cache"),
+        }) + "\n", encoding="ascii")
         vault_path.chmod(0o600)
         email_path = self.root / "config/login.json"
         email_path.write_text('{"email":"owner@example.test"}\n', encoding="ascii")

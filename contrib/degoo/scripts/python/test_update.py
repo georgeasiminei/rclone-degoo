@@ -191,6 +191,15 @@ class UpdateTest(unittest.TestCase):
         self.binary.write_text("#!/bin/sh\n# " + revision + "\ncase \"$*\" in\n*'degoo status'*) echo 'pending files: 0, pending bytes: 0';;\n*) echo 'Usage: degoo login mount status folders create-vault location';;\nesac\n")
         self.binary.chmod(0o700)
 
+    def configure_external_cache(self, cache):
+        cache.mkdir(mode=0o700)
+        cache.chmod(0o700)
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        vault["cache_dir"] = str(cache)
+        vault_path.write_text(json.dumps(vault, sort_keys=True) + "\n", encoding="utf-8")
+        vault_path.chmod(0o600)
+
     def package(self):
         import install
         source = Path(install.__file__).resolve().parents[2]
@@ -393,22 +402,37 @@ class UpdateTest(unittest.TestCase):
         from unittest import mock
         self.write_binary("new")
         self.package()
+        cache = self.base / "external-cache"
+        self.configure_external_cache(cache)
+        decoy = self.root / "cache/legacy-decoy"
+        decoy.write_bytes(b"must not be inspected or deleted")
+        decoy.chmod(0o600)
         cache_name = update.uninstall._cache_lock_path(self.root).stem
-        data_root = self.root / "cache/vfs" / cache_name
-        meta_root = self.root / "cache/vfsMeta" / cache_name
+        data_root = cache / "vfs" / cache_name
+        meta_root = cache / "vfsMeta" / cache_name
         data_root.mkdir(parents=True, mode=0o700)
         meta_root.mkdir(parents=True, mode=0o700)
-        (self.root / "cache/vfs").chmod(0o700)
-        (self.root / "cache/vfsMeta").chmod(0o700)
+        (cache / "vfs").chmod(0o700)
+        (cache / "vfsMeta").chmod(0o700)
         cached = data_root / "generated-clean-file"
         cached.write_bytes(b"clean")
         cached.chmod(0o600)
         metadata = meta_root / cached.name
         metadata.write_text(json.dumps({"Dirty": False, "Size": 5, "Fingerprint": "generated fingerprint"}))
         metadata.chmod(0o600)
-        identity = self.root / "cache" / f"{cache_name}.identity"
+        identity = cache / f"{cache_name}.identity"
         identity.write_text("a" * 64 + "\n")
         identity.chmod(0o600)
+        metadata_dir = cache / "metadata" / cache_name
+        metadata_dir.mkdir(parents=True, mode=0o700)
+        metadata_dir.chmod(0o700)
+        (cache / "metadata").chmod(0o700)
+        metadata_entry = metadata_dir / ("b" * 64 + ".cache")
+        metadata_entry.write_bytes(b"generated encrypted metadata cache")
+        metadata_entry.chmod(0o600)
+        metadata_lock = metadata_dir / ".lock"
+        metadata_lock.write_bytes(b"")
+        metadata_lock.chmod(0o600)
         lock = update.uninstall._cache_lock_path(self.root)
         lock.write_bytes(b"")
         lock.chmod(0o600)
@@ -417,7 +441,37 @@ class UpdateTest(unittest.TestCase):
             code, output, error = self.invoke("--delete-cache")
         self.assertEqual(code, 0, output + error)
         self.assertFalse(cached.exists())
+        self.assertFalse(metadata_entry.exists())
+        self.assertFalse(metadata_lock.exists())
         self.assertEqual(lock.stat().st_ino, inode)
+        self.assertEqual(decoy.read_bytes(), b"must not be inspected or deleted")
+
+    def test_external_cache_delete_refuses_dirty_queue_without_touching_legacy_decoy(self):
+        from unittest import mock
+        self.write_binary("new")
+        self.package()
+        cache = self.base / "external-cache"
+        self.configure_external_cache(cache)
+        cache_name = update.uninstall._cache_lock_path(self.root).stem
+        namespace = cache / "vfs" / cache_name
+        namespace.mkdir(parents=True, mode=0o700)
+        namespace.chmod(0o700)
+        (cache / "vfs").chmod(0o700)
+        cached = namespace / "pending"
+        cached.write_bytes(b"generated pending data")
+        cached.chmod(0o600)
+        identity = cache / f"{cache_name}.identity"
+        identity.write_text("a" * 64 + "\n", encoding="ascii")
+        identity.chmod(0o600)
+        decoy = self.root / "cache/legacy-decoy"
+        decoy.write_bytes(b"must not be inspected or deleted")
+        decoy.chmod(0o600)
+        with mock.patch.object(update, "stop_runtime"), mock.patch.object(update, "start_runtime"), \
+                mock.patch.object(update.uninstall, "_pending_uploads", return_value=(1, 23)):
+            code, output, error = self.invoke("--delete-cache")
+        self.assertEqual(code, 2, output + error)
+        self.assertEqual(cached.read_bytes(), b"generated pending data")
+        self.assertEqual(decoy.read_bytes(), b"must not be inspected or deleted")
 
     def test_restart_failure_reports_error_with_new_build_and_cache_preserved(self):
         from unittest import mock

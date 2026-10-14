@@ -80,6 +80,10 @@ def pending_uploads(root: Path, timeout: float = STATUS_TIMEOUT) -> tuple[int, i
         return None
     if not isinstance(vault, dict) or not isinstance(vault.get("remote"), str) or not vault["remote"]:
         return None
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError:
+        return None
 
     binary = root / "bin" / "rclone"
     if not local_info._owned_executable(binary):
@@ -90,7 +94,7 @@ def pending_uploads(root: Path, timeout: float = STATUS_TIMEOUT) -> tuple[int, i
     env = {
         "HOME": str(installer.home_directory()),
         "XDG_CONFIG_HOME": str(root / "config"),
-        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_CACHE_HOME": str(cache_dir),
         "TMPDIR": str(root / "tmp"),
         "PATH": "/usr/bin:/bin",
         "LANG": "C.UTF-8",
@@ -182,8 +186,12 @@ def _cache_roots(root: Path) -> tuple[Path, Path] | None:
     remote = config.get("remote")
     if not isinstance(remote, str) or not remote or len(remote) > 4096:
         return None
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError:
+        return None
     name = _cache_name(remote)
-    return root / "cache" / "vfs" / name, root / "cache" / "vfsMeta" / name
+    return cache_dir / "vfs" / name, cache_dir / "vfsMeta" / name
 
 
 def _checked_private_directory(path: Path) -> bool:
@@ -205,14 +213,14 @@ def _checked_private_directory(path: Path) -> bool:
     return True
 
 
-def _check_cache_directories(base: Path, directory: Path, root: Path) -> bool:
+def _check_cache_directories(base: Path, directory: Path, cache_root: Path) -> bool:
     """Validate every existing directory from the private cache root to directory."""
     try:
         directory.relative_to(base)
-        relative = directory.relative_to(root / "cache")
+        relative = directory.relative_to(cache_root)
     except ValueError:
-        raise StatusError("a local cache path escaped the contained install") from None
-    current = root / "cache"
+        raise StatusError("a local cache path escaped the configured cache directory") from None
+    current = cache_root
     if not _checked_private_directory(current):
         return False
     for component in relative.parts:
@@ -254,12 +262,16 @@ def _cache_record(root: Path, relative: Path, *, displayed: str | None = None) -
     if roots is None:
         return None
     data_root, metadata_root = roots
+    try:
+        cache_root = installer.configured_cache_dir(root)
+    except installer.InstallError:
+        return None
     metadata_path = metadata_root.joinpath(*relative.parts)
     data_path = data_root.joinpath(*relative.parts)
     try:
-        if not _check_cache_directories(metadata_root, metadata_path.parent, root):
+        if not _check_cache_directories(metadata_root, metadata_path.parent, cache_root):
             return None
-        if not _check_cache_directories(data_root, data_path.parent, root):
+        if not _check_cache_directories(data_root, data_path.parent, cache_root):
             return None
         raw = installer.read_private_file(metadata_path, MAX_CACHE_METADATA, missing_ok=True)
     except installer.InstallError:
@@ -470,8 +482,12 @@ def _walk_cache_metadata(
     if roots is None:
         return []
     data_root, metadata_root = roots
+    try:
+        cache_root = installer.configured_cache_dir(root)
+    except installer.InstallError:
+        return []
     start = metadata_root.joinpath(*relative_start.parts)
-    if not _check_cache_directories(metadata_root, start, root):
+    if not _check_cache_directories(metadata_root, start, cache_root):
         return []
     records: list[dict[str, Any]] = []
     stack = [(start, relative_start)]
@@ -494,7 +510,7 @@ def _walk_cache_metadata(
                     path = Path(child.path)
                     relative = relative_directory / child.name
                     if stat.S_ISDIR(child_info.st_mode):
-                        if _check_cache_directories(metadata_root, path, root):
+                        if _check_cache_directories(metadata_root, path, cache_root):
                             stack.append((path, relative))
                     elif stat.S_ISREG(child_info.st_mode):
                         context["files"] += 1

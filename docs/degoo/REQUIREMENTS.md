@@ -34,6 +34,12 @@ These points are the binding product requirements recorded from the user.
   or restarting the client.
 - Preserve pending local changes across restarts, provider outages, and failed
   authentication. Distinguish saved locally from uploaded remotely.
+- The private vault configuration's `cache_dir` controls the persistent cache
+  location for the mount and every installed helper. Support a dedicated
+  owner-private absolute path on another drive without requiring a bind mount.
+  Status, disk reporting, locks, upgrades, retention, and cleanup must use that
+  path. A location change must preserve pending data and its recovery metadata,
+  with explicit identity rebinding after a normal unmount.
 - Backup-only behavior is not the goal. Existing Degoo files are not part of
   the encrypted vault unless explicitly copied into it.
 - Windows-specific support is outside the initial acceptance scope.

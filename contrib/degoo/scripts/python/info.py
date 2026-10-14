@@ -141,6 +141,12 @@ def scan_install_tree(
     partial = False
     started = time.monotonic()
     stack = [root]
+    try:
+        cache_dir.relative_to(root)
+    except ValueError:
+        # An external cache is a separate install-owned tree and still counts
+        # toward the same bounded allocation estimate.
+        stack.append(cache_dir)
     while stack:
         directory = stack.pop()
         if directory == mountpoint or (directory in known_mounts and directory != cache_dir):
@@ -551,6 +557,10 @@ def remote_location(root: Path, *, timeout: float = 12.0) -> tuple[str, list[str
     """Optionally query remote ancestry while discarding raw provider output."""
     binary = root / "bin" / "rclone"
     vault = root / "config" / "vault.json"
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError:
+        return "remote check could not start", None
     if not _owned_executable(binary):
         return "remote check could not start", None
     diagnostic_log = root / "logs" / "diagnostics.log"
@@ -558,7 +568,7 @@ def remote_location(root: Path, *, timeout: float = 12.0) -> tuple[str, list[str
         return "remote check could not start", None
     env = dict(os.environ)
     env.setdefault("HOME", str(installer.home_directory()))
-    env["XDG_CACHE_HOME"] = str(root / "cache")
+    env["XDG_CACHE_HOME"] = str(cache_dir)
     env["TMPDIR"] = str(root / "tmp")
     env["PATH"] = "/usr/bin:/bin"
     try:
@@ -705,8 +715,9 @@ def _validate_root(value: str) -> tuple[Path, dict[str, Any]]:
     root = Path(os.path.normpath(str(root)))
     try:
         installer.check_directory(root, private=True)
-        for name in ("bin", "config", "cache", "mount", "tools", "tmp", "logs"):
+        for name in ("bin", "config", "mount", "tools", "tmp", "logs"):
             installer.check_directory(root / name, private=True)
+        installer.check_directory(installer.configured_cache_dir(root), private=True)
         for name in ("auth.json", "login.json", "mount.json", "rclone.conf", "vault.json"):
             installer.read_private_file(root / "config" / name, missing_ok=True)
         manifest = installer.load_manifest(root)
@@ -717,6 +728,10 @@ def _validate_root(value: str) -> tuple[Path, dict[str, Any]]:
 
 def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) -> str:
     """Build a bounded human-readable report without printing private state."""
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError as exc:
+        raise InfoError(str(exc)) from None
     auth_path = root / "config" / "auth.json"
     auth_error = authentication_error(auth_path, logs_dir=root / "logs")
     lines: list[str] = []
@@ -757,7 +772,7 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
         ("Install manifest", root / "install.json", "local vault identity and owned systemd-link records"),
         ("User service unit", root / service_manager.UNIT_NAME, "mount startup, restart policy, and stop command"),
         ("Service command", root / "degoo-rc", "service enable, disable, start, stop, and inspect the user service"),
-        ("Cache", root / "cache", "local cached file data and pending writes"),
+        ("Cache", cache_dir, "local cached file data and pending writes"),
         ("Logs", root / "logs", "contained command logs"),
     )
     lines.append("Local paths:")
@@ -779,9 +794,9 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
         lines.append(f"Pending uploads: {counts[0]} files, {_format_bytes(counts[1])} (local cache status).")
     lines.append("Pending counts describe local dirty uploads; they do not audit cloud contents or confirm remote integrity.")
 
-    filesystem = filesystem_stats(root / "cache")
-    scan = scan_install_tree(root, root / "cache", installer.configured_mountpoint(root))
-    lines.append(f"Cache backing filesystem: {_display_path(root / 'cache')}")
+    filesystem = filesystem_stats(cache_dir)
+    scan = scan_install_tree(root, cache_dir, installer.configured_mountpoint(root))
+    lines.append(f"Cache backing filesystem: {_display_path(cache_dir)}")
     if filesystem is None:
         lines.append("  Disk usage: unavailable.")
     else:

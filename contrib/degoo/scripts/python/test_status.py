@@ -54,7 +54,7 @@ class StatusTest(unittest.TestCase):
             self.root / "config/vault.json",
             {
                 "version": 1,
-                "remote": "degoo-live-test:",
+                "remote": f"{install.REMOTE_NAME}:",
                 "password": "private-test-vault-secret",
                 "cache_dir": str(self.root / "cache"),
             },
@@ -82,15 +82,16 @@ class StatusTest(unittest.TestCase):
         self.binary.chmod(0o700)
 
     def write_cache_metadata(self, relative: str, metadata: dict[str, object], *, data: bool = True) -> Path:
-        cache_name = status.cache_name("degoo-live-test:")
-        metadata_path = self.root / "cache/vfsMeta" / cache_name / relative
-        data_path = self.root / "cache/vfs" / cache_name / relative
+        cache_name = status.cache_name(f"{install.REMOTE_NAME}:")
+        cache_dir = install.configured_cache_dir(self.root)
+        metadata_path = cache_dir / "vfsMeta" / cache_name / relative
+        data_path = cache_dir / "vfs" / cache_name / relative
         metadata_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         metadata_path.parent.chmod(0o700)
         data_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         data_path.parent.chmod(0o700)
         for tree in (metadata_path.parent, data_path.parent):
-            while tree != self.root / "cache":
+            while tree != cache_dir:
                 tree.chmod(0o700)
                 tree = tree.parent
         self.write_private(metadata_path, metadata)
@@ -178,6 +179,48 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(records[0]["evidence"], "private local cache metadata")
         self.assertEqual(records[0]["size_bytes"], 12)
         self.assertIn("survives process restarts", records[0]["detail"])
+
+    def test_configured_external_cache_drives_pending_environment_and_offline_selection(self) -> None:
+        external_cache = self.base / "private external cache"
+        external_cache.mkdir(mode=0o700)
+        external_cache.chmod(0o700)
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        vault["cache_dir"] = str(external_cache)
+        self.write_private(vault_path, vault)
+
+        # Leave a dirty decoy in the install's old default directory. Offline
+        # inspection must use the configured external cache exclusively.
+        default_cache = self.root / "cache"
+        metadata_name = status.cache_name(f"{install.REMOTE_NAME}:")
+        decoy = default_cache / "vfsMeta" / metadata_name / "folder" / "file.bin"
+        decoy.parent.mkdir(parents=True, mode=0o700)
+        (default_cache / "vfs" / metadata_name / "folder").mkdir(parents=True, mode=0o700)
+        self.write_private(decoy, {"Dirty": True, "Size": 12, "Fingerprint": ""})
+        self.write_private(default_cache / "vfs" / metadata_name / "folder/file.bin", "decoy")
+        self.write_cache_metadata("folder/file.bin", {"Dirty": False, "Size": 12, "Fingerprint": "external-hash"})
+
+        self.assertEqual(
+            status._cache_roots(self.root),
+            (external_cache / "vfs" / metadata_name, external_cache / "vfsMeta" / metadata_name),
+        )
+        records, _ = status.inspect_path(
+            self.root, "folder/file.bin", mount_state="not mounted", cwd=self.root / "mount"
+        )
+        self.assertEqual(records[0]["state"], "cached-uploaded")
+        self.assertEqual(records[0]["evidence"], "private local cache metadata")
+
+        observed: dict[str, object] = {}
+
+        def run(_arguments, **kwargs):
+            observed.update(kwargs["env"])
+            kwargs["stdout"].write(b"Pending local uploads: 2 files, 24 bytes\n")
+            return type("Result", (), {"returncode": 0})()
+
+        with mock.patch.object(status.subprocess, "run", side_effect=run):
+            self.assertEqual(status.pending_uploads(self.root), (2, 24))
+        self.assertEqual(observed["XDG_CACHE_HOME"], str(external_cache))
+        self.assertNotEqual(observed["XDG_CACHE_HOME"], str(default_cache))
 
     def test_live_upload_failures_are_reported_before_pending_counts(self) -> None:
         with (

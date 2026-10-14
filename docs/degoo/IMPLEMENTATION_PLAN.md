@@ -134,27 +134,36 @@ configured size. Changing chunk size changes the local cache identity, so
 drain pending uploads to zero, unmount normally, and back up the vault
 configuration and cache before changing it. Start the new identity with a
 fresh, empty cache namespace and backing directory. The installed helpers
-expect the recorded `cache_dir` path to remain stable, so bind the new backing
-directory at that path. Check that the encrypted chunk size still fits under
+resolve `cache_dir` from the vault configuration; a bind mount is optional.
+Check that the encrypted chunk size still fits under
 `max_object_size`. A 1 GiB setting remains a recommendation to validate with
 the account's limits and workload, not evidence of a provider limit or a
 required production change.
 
-Large local caches can be moved to a separate volume while preserving the
-`cache_dir` value in the vault configuration. Stop the mount with its normal
-unmount path, copy the private cache, compare final checksums, then bind-mount
-the external directory at that same recorded path and add the bind entry to
-`/etc/fstab`. Keeping the recorded path preserves the cache identity and lets
-the existing runtime helpers keep using their configured location. Use an
-owner-private destination such as `/data.tr/degoo-cache`; see
-[USAGE.md](USAGE.md) for the operator steps. The completed migration was
-verified by comparing SHA-256 for 1,886 cache files occupying 258.013 GiB.
-Two dirty files truncated by an out-of-space copy were restored from stable
-originals, and their full SHA-256 values matched. After restoration, all 941
-physical cache data files were dirty and had complete ranges. The source was
-bind-mounted over the unchanged configured `cache_dir`; the service startup
-guard requires that path to be a mount point. These checks establish local
-cache preservation, not remote upload completion.
+### Configured cache location
+
+The vault's `cache_dir` is authoritative for the native mount and installed
+Python helpers. One shared resolver validates a dedicated absolute path;
+installation and upgrade, runtime environments, status, disk accounting,
+locking, backup retention, and cleanup use it. The contained install's
+`cache` directory is a default, not a required runtime path. Portable backup
+bundles still store a copy under their own `cache/` directory and restoration
+chooses a destination cache before rebinding its identity.
+
+A path migration requires a normal unmount, private configuration backup,
+complete cache copy with checksum verification, a `cache_dir` edit, and the
+existing offline `degoo restore-cache` identity rebind. Pending writes must
+remain paired with their metadata. An external cache's unrelated files and
+mounts must be protected during cleanup; helpers must refuse unverifiable
+contents instead of deleting an arbitrary configured directory. An optional
+service condition can require the underlying volume to be mounted.
+
+The initial migration used a bind mount as a workaround for the helpers'
+fixed-path validation. Its SHA-256 comparison covered 1,886 files occupying
+258.013 GiB; two truncated dirty files were restored from stable originals,
+leaving all 941 data files complete and dirty. This is historical local
+preservation evidence, not remote upload completion. Operator steps for direct
+configured paths are in [USAGE.md](USAGE.md).
 
 ### Bash command completion
 

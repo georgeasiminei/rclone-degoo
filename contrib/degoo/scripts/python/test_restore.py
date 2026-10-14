@@ -159,6 +159,39 @@ class RestoreTest(unittest.TestCase):
         self.assertIn(self.folder_id, command)
         self.assertFalse((self.target / "install.json").exists())
 
+    def test_metadata_cache_restores_to_target_configured_path_and_ignores_old_cache_decoy(self) -> None:
+        self.add_cache_data()
+        metadata_dir = self.backup / "cache" / "metadata" / self.cache_name
+        metadata_dir.mkdir(parents=True, mode=0o700)
+        metadata_dir.chmod(0o700)
+        (self.backup / "cache" / "metadata").chmod(0o700)
+        metadata_entry = metadata_dir / ("b" * 64 + ".cache")
+        self.write_private(metadata_entry, b"generated encrypted metadata entry")
+        self.write_private(metadata_dir / ".lock", b"")
+
+        external_cache = self.base / "target cache"
+        external_cache.mkdir(mode=0o700)
+        external_cache.chmod(0o700)
+        target_vault = json.loads((self.target / "config/vault.json").read_bytes())
+        target_vault["cache_dir"] = str(external_cache)
+        self.write_private(
+            self.target / "config/vault.json",
+            (json.dumps(target_vault, sort_keys=True) + "\n").encode(),
+        )
+        decoy = self.target / "cache/legacy-decoy"
+        self.write_private(decoy, b"unrelated install cache")
+
+        backup = restore.inspect_backup(self.backup, self.target)
+        self.assertTrue(backup.cache_has_data)
+        self.assertEqual(backup.vault_settings["cache_dir"], str(external_cache))
+        with mock.patch.object(restore.subprocess, "run", return_value=mock.Mock(returncode=0)):
+            restore.restore_to_install(backup, self.target)
+
+        self.assertTrue((external_cache / "metadata" / self.cache_name / metadata_entry.name).is_file())
+        self.assertTrue((external_cache / "vfs" / self.cache_name / "pending data.bin").is_file())
+        self.assertEqual(decoy.read_bytes(), b"unrelated install cache")
+        self.assertEqual(json.loads((self.target / "config/vault.json").read_bytes())["cache_dir"], str(external_cache))
+
     def test_restore_rejects_an_active_source_cache_lock(self) -> None:
         self.add_cache_data()
         lock_path = self.backup / "cache" / f"{self.cache_name}.lock"

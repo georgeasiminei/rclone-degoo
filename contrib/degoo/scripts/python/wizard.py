@@ -506,7 +506,7 @@ def _recover_disconnected_mount(
 ) -> None:
     """Detach a confirmed disconnected mount only while the vault cache is idle."""
     try:
-        installer.check_directory(root / "cache", private=True)
+        installer.check_directory(installer.configured_cache_dir(root), private=True)
         lock_fd = cleanup._acquire_cache_lock(root, wait_seconds=0)
     except (cleanup.CleanupError, installer.InstallError, OSError):
         raise _mount_state_error(
