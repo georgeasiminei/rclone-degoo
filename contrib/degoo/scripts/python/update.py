@@ -573,31 +573,64 @@ def start_runtime(root: Path, state: dict[str, Any]) -> None:
         print("Restart complete; the vault mount is connected.", flush=True)
 
 
+def _managed_path_error(path: Path, root: Path, problem: str) -> UpdateError:
+    """Return a safe error naming a managed path and how to repair it."""
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError:
+        relative = "managed program path"
+    parts = PurePosixPath(relative).parts
+    if "__pycache__" in parts:
+        cache_path = PurePosixPath(*parts[:parts.index("__pycache__") + 1]).as_posix()
+        return UpdateError(
+            f"runtime Python bytecode cache at {cache_path} has {problem}; "
+            "remove that generated Python bytecode cache and retry degoo-rc update"
+        )
+    return UpdateError(
+        f"managed program path {relative} has {problem}; "
+        "restore that program path from a verified package and retry degoo-rc update"
+    )
+
+
 def check_managed_tree(path: Path, root: Path) -> None:
     """Reject unexpected links and special files before snapshotting program files."""
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode):
         if path != root / "tools/fusermount3":
-            raise UpdateError("unexpected symlink in program files")
-        uninstall._validate_helper_link(path, require_executable=False)
+            raise _managed_path_error(path, root, "an unexpected symbolic link")
+        try:
+            uninstall._validate_helper_link(path, require_executable=False)
+        except uninstall.CleanupError:
+            raise _managed_path_error(path, root, "an invalid FUSE helper link") from None
         return
-    if info.st_uid != os.getuid() or info.st_mode & 0o022 or info.st_mode & 0o6000:
-        raise UpdateError("program files have unsafe ownership or permissions")
+    if info.st_uid != os.getuid():
+        raise _managed_path_error(path, root, "ownership that does not match the current user")
+    if info.st_mode & 0o022:
+        raise _managed_path_error(path, root, "group- or world-writable permissions")
+    if info.st_mode & 0o6000:
+        raise _managed_path_error(path, root, "setuid or setgid permissions")
     if stat.S_ISDIR(info.st_mode):
         for child in path.iterdir():
             check_managed_tree(child, root)
     elif not stat.S_ISREG(info.st_mode):
-        raise UpdateError("unexpected special file in program files")
+        raise _managed_path_error(path, root, "an unexpected special file")
+
+
+def _check_managed_program(root: Path) -> list[str]:
+    """Check managed program paths before stopping the installed runtime."""
+    names = list(dict.fromkeys((*MANAGED_DIRECTORIES, *MANAGED_FILES)))
+    for name in names:
+        path = root / name
+        if os.path.lexists(path):
+            check_managed_tree(path, root)
+    return names
 
 
 def snapshot_program(root: Path, backup: Path) -> list[str]:
     """Keep only program files and installation identity for installation rollback."""
     if os.path.lexists(backup):
         raise UpdateError(f"an interrupted update backup remains at {backup}; resolve that conflict before updating")
-    names = list(dict.fromkeys((*MANAGED_DIRECTORIES, *MANAGED_FILES)))
-    for name in names:
-        if os.path.lexists(root / name):
-            check_managed_tree(root / name, root)
+    names = _check_managed_program(root)
     backup.mkdir(mode=0o700)
     try:
         for name in names:
@@ -723,6 +756,7 @@ def apply_update(root: Path, package: Path, identity: dict[str, Any], source: di
             raise UpdateError(f"an interrupted update backup remains at {backup}; resolve that conflict before updating")
         if installed_matches(root, identity):
             return False
+        _check_managed_program(root)
         layout = uninstall._validate_layout(root)
         manifest = layout["manifest"]
         state = runtime_state(root, manifest)
