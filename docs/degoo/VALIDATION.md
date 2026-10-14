@@ -1138,3 +1138,18 @@ detached the mount. This checks local batching, counters, retention, and
 shutdown behavior only. No authenticated Degoo request, production upload, or
 destructive customer-data test was part of this follow-up. Live provider upload
 recovery remains an acceptance gate.
+
+The clean build of source commit `e008796360b6b3dd1a68e17537946e150d956fde`
+was then installed on the existing production mount through the private
+maintenance endpoint, normal FUSE unmount, atomic binary/manifest replacement,
+and service restart. Configuration hashes, cache identity, all 941 data files,
+their sizes, and complete dirty ranges matched before and after installation:
+277,364,333,920 pending bytes remained available. The active chunk size stayed
+at 128 MiB and the cache continued using its migrated backing volume.
+
+The persisted provider deadline remained unchanged at 2026-10-14 17:06:17
+EEST. After restart, local statistics reported zero provider HTTP attempts;
+a bounded directory listing returned `EIO` promptly during the hold and the
+counter remained zero. A point-in-time socket inventory found no INET sockets.
+This confirms local restart, queue preservation, and cooldown enforcement;
+it does not validate successful batched uploads against Degoo after the hold.
