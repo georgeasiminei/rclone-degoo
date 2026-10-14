@@ -675,8 +675,6 @@ def _validate_configured_cache_dir(value: Any, root: Path) -> Path:
                 raise InstallError("the vault cache path could not be inspected safely") from None
             if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 raise InstallError("the vault cache path has an unsafe parent directory")
-            if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
-                raise InstallError("the vault cache parent is writable by other users")
         try:
             info = os.lstat(cache)
         except FileNotFoundError:

@@ -1208,7 +1208,7 @@ tests cover external pending-write retention, configuration backup, local
 restore, clean-cache deletion, and refusal of unknown, orphaned, mismatched,
 or legacy cache data during destructive cleanup.
 
-All 409 offline Python helper tests and the packaging self-check passed.
+All 410 offline Python helper tests and the packaging self-check passed.
 The credential-free full Go suite passed with serialized package execution
 and an isolated runtime cache. A first parallel run failed an S3 cached
 writeback test; its targeted rerun and the final full run passed. The complete
@@ -1221,3 +1221,10 @@ that it accepts a matching identity under an active lock without modifying
 files and rejects missing, mismatched, or wrong-folder identities. A local
 read-only check also succeeded against the existing mount while it held its
 cache lock; no provider request was involved.
+
+The direct-path migration exposed an overly strict ancestor-permission check:
+the shared volume was writable while the dedicated cache remained mode 0700.
+The resolver now follows the native mount's private-cache contract, validating
+the owned cache directory and rejecting symlink components without requiring
+the enclosing volume to be private. A regression covers a private cache under
+a writable shared volume and still rejects a non-private cache directory.

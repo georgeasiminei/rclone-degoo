@@ -632,6 +632,20 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(observed_cache.read_text(encoding="utf-8"), str(external_cache))
         self.assertFalse((self.root / "scripts/python/__pycache__").exists())
 
+    def test_private_cache_is_supported_on_a_shared_writable_volume(self) -> None:
+        volume = self.base / "shared-volume"
+        volume.mkdir(mode=0o777)
+        volume.chmod(0o777)
+        cache = volume / "private-cache"
+        cache.mkdir(mode=0o700)
+        vault = {"version": 1, "remote": f"{install.REMOTE_NAME}:",
+                 "password": "generated test password", "cache_dir": str(cache)}
+        parsed, _ = install.read_vault(json.dumps(vault).encode(), self.root, imported=False)
+        self.assertEqual(parsed["cache_dir"], str(cache))
+        cache.chmod(0o755)
+        with self.assertRaisesRegex(install.InstallError, "mode 0700"):
+            install.read_vault(json.dumps(vault).encode(), self.root, imported=False)
+
     def test_configured_cache_path_is_safe_private_and_does_not_create_it(self) -> None:
         self.assertEqual(install.configured_cache_dir(self.root), self.root / "cache")
         self.assertFalse(self.root.exists())
