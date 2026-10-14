@@ -52,6 +52,8 @@ const (
 	metadataLookupTimeout = 10 * time.Second
 	metadataRetryDelay    = 100 * time.Millisecond
 	metadataMaxAttempts   = 3
+	confirmationPollStart = 250 * time.Millisecond
+	confirmationPollMax   = 3 * time.Second
 	maxPacerSleep         = 30 * time.Second
 	downloadURLMaxAge     = 30 * time.Second
 	rootProofVersion      = 1
@@ -125,20 +127,25 @@ type Fs struct {
 
 	placeholderMu sync.RWMutex
 	placeholders  map[string]struct{}
-	writeMu       sync.Mutex
+	pathLocksMu   sync.Mutex
+	pathLocks     *pathLockManager
+	batchMu       sync.Mutex
+	uploadBatches *uploadBatchCoordinator
+	metadataCache *metadataCache
 }
 
 // Object describes a file stored in Degoo.
 type Object struct {
-	fs       *Fs
-	remote   string
-	id       string
-	parentID string
-	name     string
-	size     int64
-	modTime  time.Time
-	url      string
-	urlAt    time.Time
+	fs          *Fs
+	remote      string
+	id          string
+	parentID    string
+	name        string
+	size        int64
+	modTime     time.Time
+	createdTime time.Time
+	url         string
+	urlAt       time.Time
 }
 
 type rootValidationProof struct {
@@ -194,7 +201,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:          *opt,
 		api:          api.New(httpClient, authClient, opt.APIURL, opt.APIKey),
 		placeholders: make(map[string]struct{}),
+		pathLocks:    newPathLockManager(),
 	}
+	f.uploadBatches = newUploadBatchCoordinator(f)
 	if err := f.api.SetRateLimitFile(opt.AuthFile + ".rate-limit.json"); err != nil {
 		return nil, fmt.Errorf("degoo: load provider rate-limit state: %w", err)
 	}
@@ -325,6 +334,28 @@ func (f *Fs) saveRootValidationProof() {
 // RootFolderID returns the configured root ID for wrapper validation.
 func (f *Fs) RootFolderID() string { return f.opt.RootFolderID }
 
+// RequestStats returns a snapshot of API request counts without request data.
+func (f *Fs) RequestStats() api.RequestStats { return f.api.RequestStats() }
+
+func (f *Fs) acquirePathLocks(ctx context.Context, remotes ...string) (func(), error) {
+	f.pathLocksMu.Lock()
+	if f.pathLocks == nil {
+		f.pathLocks = newPathLockManager()
+	}
+	locks := f.pathLocks
+	f.pathLocksMu.Unlock()
+	return locks.acquireMany(ctx, remotes...)
+}
+
+func (f *Fs) uploadBatchCoordinator() *uploadBatchCoordinator {
+	f.batchMu.Lock()
+	defer f.batchMu.Unlock()
+	if f.uploadBatches == nil {
+		f.uploadBatches = newUploadBatchCoordinator(f)
+	}
+	return f.uploadBatches
+}
+
 func (f *Fs) sameVault(other *Fs) bool {
 	if other == nil || f.opt.RootFolderID != other.opt.RootFolderID || f.opt.APIKey != other.opt.APIKey || f.opt.APIURL != other.opt.APIURL || f.opt.RESTURL != other.opt.RESTURL {
 		return false
@@ -450,7 +481,7 @@ func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout tim
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var lastErr error
-	retryDelay := 250 * time.Millisecond
+	retryDelay := confirmationPollStart
 	for {
 		if lookupCtx.Err() != nil {
 			if ctx.Err() != nil {
@@ -462,10 +493,9 @@ func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout tim
 			return api.Item{}, fs.ErrorDirNotFound
 		}
 		items, err := f.api.ListDirFresh(lookupCtx, parentID)
-		delay := 250 * time.Millisecond
+		var retryErr error
 		if err == nil {
 			lastErr = nil
-			retryDelay = 250 * time.Millisecond
 			matches := make([]api.Item, 0, 1)
 			for _, item := range items {
 				if item.Name == name {
@@ -486,18 +516,9 @@ func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout tim
 				return api.Item{}, err
 			}
 			lastErr = err
-			delay = retryDelay
-			if retryDelay < maxPacerSleep {
-				retryDelay *= 2
-				if retryDelay > maxPacerSleep {
-					retryDelay = maxPacerSleep
-				}
-			}
+			retryErr = err
 		}
-
-		if retryAfter, ok := pacer.IsRetryAfter(err); ok && retryAfter > delay {
-			delay = retryAfter
-		}
+		delay := confirmationRetryDelay(retryDelay, retryErr)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -513,8 +534,31 @@ func (f *Fs) waitForItem(ctx context.Context, parentID, name string, timeout tim
 			}
 			return api.Item{}, fs.ErrorDirNotFound
 		case <-timer.C:
+			retryDelay = nextConfirmationPollDelay(retryDelay)
 		}
 	}
+}
+
+func confirmationRetryDelay(delay time.Duration, err error) time.Duration {
+	if retryAfter, ok := pacer.IsRetryAfter(err); ok && retryAfter > delay {
+		return retryAfter
+	}
+	return delay
+}
+
+func nextConfirmationPollDelay(delay time.Duration) time.Duration {
+	if delay < confirmationPollStart {
+		delay = confirmationPollStart
+	}
+	if delay >= confirmationPollMax/2 {
+		return confirmationPollMax
+	}
+	return delay * 2
+}
+
+func isRateLimitError(err error) bool {
+	var rateLimitErr *api.RateLimitError
+	return errors.As(err, &rateLimitErr)
 }
 
 func (f *Fs) waitForCreatedDirectory(ctx context.Context, parentID, name, placeholderID string, timeout time.Duration) (api.Item, error) {
@@ -989,8 +1033,16 @@ func validateLeaf(leaf string) error {
 	return nil
 }
 
-// DirCacheFlush resets the directory ID cache.
-func (f *Fs) DirCacheFlush() { f.dirCache.ResetRoot(); f.api.ClearMetadataCache() }
+// DirCacheFlush resets directory and persistent metadata caches.
+func (f *Fs) DirCacheFlush() {
+	f.dirCache.ResetRoot()
+	f.api.ClearMetadataCache()
+	if f.metadataCache != nil {
+		if err := f.metadataCache.Clear(); err != nil {
+			fs.Errorf(f, "degoo: clear persistent metadata cache: %v", err)
+		}
+	}
+}
 
 func (f *Fs) findDir(ctx context.Context, remote string, create bool) (string, error) {
 	if err := validateRemote(remote); err != nil {
@@ -1103,15 +1155,16 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 func newObject(f *Fs, remote string, item api.Item) *Object {
 	modTime := itemModTime(item)
 	return &Object{
-		fs:       f,
-		remote:   remote,
-		id:       item.ID,
-		parentID: item.ParentID,
-		name:     item.Name,
-		size:     item.Size,
-		modTime:  modTime,
-		url:      item.URL,
-		urlAt:    time.Now(),
+		fs:          f,
+		remote:      remote,
+		id:          item.ID,
+		parentID:    item.ParentID,
+		name:        item.Name,
+		size:        item.Size,
+		modTime:     modTime,
+		createdTime: item.CreationTime,
+		url:         item.URL,
+		urlAt:       time.Now(),
 	}
 }
 
@@ -1293,6 +1346,11 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if srcObj.remote == remote {
 		return f.NewObject(ctx, remote)
 	}
+	releasePaths, err := f.acquirePathLocks(ctx, srcObj.remote, remote)
+	if err != nil {
+		return nil, err
+	}
+	defer releasePaths()
 	parentPath, dstLeaf := dircache.SplitPath(remote)
 	dstParentID, err := f.findDir(ctx, parentPath, true)
 	if err != nil {
@@ -1336,6 +1394,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if dstRemote == srcRemote || strings.HasPrefix(dstRemote, srcRemote+"/") {
 		return errors.New("degoo: cannot move a directory into itself")
 	}
+	releasePaths, err := f.acquirePathLocks(ctx, srcRemote, dstRemote)
+	if err != nil {
+		return err
+	}
+	defer releasePaths()
 	srcID, srcParentID, srcLeaf, dstParentID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
@@ -1362,6 +1425,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 // Open opens the object, validating any requested byte range.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	return o.openCached(ctx, options...)
+}
+
+func (o *Object) openRemote(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	if err := validateRemote(o.remote); err != nil {
 		return nil, err
 	}
@@ -1468,6 +1535,11 @@ func (o *Object) Remove(ctx context.Context) error {
 	if o.parentID == "" || o.parentID == "0" {
 		return errors.New("degoo: refusing to delete an object without a verified parent")
 	}
+	releasePath, err := o.fs.acquirePathLocks(ctx, o.remote)
+	if err != nil {
+		return err
+	}
+	defer releasePath()
 	items, err := o.fs.listDir(ctx, o.parentID)
 	if err != nil {
 		return fmt.Errorf("degoo: inspect object before deletion: %w", err)
@@ -1592,9 +1664,8 @@ func (f *Fs) waitForIDsGoneInDirs(ctx context.Context, parentIDs, ids []string, 
 	}
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
 	var lastErr error
+	pollDelay := confirmationPollStart
 	for {
 		present := make(map[string]struct{})
 		var listingErr error
@@ -1603,6 +1674,9 @@ func (f *Fs) waitForIDsGoneInDirs(ctx context.Context, parentIDs, ids []string, 
 			if err != nil {
 				if isNotFoundError(err) {
 					continue
+				}
+				if isRateLimitError(err) || !api.Retryable(err) {
+					return err
 				}
 				listingErr = err
 				break
@@ -1617,15 +1691,20 @@ func (f *Fs) waitForIDsGoneInDirs(ctx context.Context, parentIDs, ids []string, 
 		if len(present) == 0 && listingErr == nil {
 			return nil
 		}
+		delay := confirmationRetryDelay(pollDelay, listingErr)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
 		case <-deadline.C:
+			timer.Stop()
 			if lastErr != nil {
 				return lastErr
 			}
 			return errors.New("deleted items remain visible")
-		case <-ticker.C:
+		case <-timer.C:
+			pollDelay = nextConfirmationPollDelay(pollDelay)
 		}
 	}
 }
@@ -1658,8 +1737,11 @@ func (f *Fs) uploadAndCommit(ctx context.Context, remote string, old *Object, in
 	if expectedSize < -1 {
 		return nil, fmt.Errorf("degoo: invalid upload size %d", expectedSize)
 	}
-	f.writeMu.Lock()
-	defer f.writeMu.Unlock()
+	releasePath, err := f.acquirePathLocks(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	defer releasePath()
 
 	parentPath, leaf := dircache.SplitPath(remote)
 	parentID, err := f.findDir(ctx, parentPath, true)
@@ -1723,7 +1805,9 @@ func (f *Fs) uploadAndCommit(ctx context.Context, remote string, old *Object, in
 		return nil, err
 	}
 	tempName += ".bin"
-	writeAuth, authErr := f.api.GetWriteAuth(ctx, parentID, tempName, stagedSize, providerChecksum)
+	writeAuth, authErr := f.uploadBatchCoordinator().getWriteAuth(ctx, parentID, api.UploadInfo{
+		Name: tempName, Checksum: providerChecksum, Size: stagedSize,
+	})
 	if authErr != nil && !errors.Is(authErr, api.ErrAlreadyExists) {
 		return nil, fmt.Errorf("degoo: get upload authorization: %w", authErr)
 	}
@@ -1754,7 +1838,9 @@ func (f *Fs) uploadAndCommit(ctx context.Context, remote string, old *Object, in
 		localDigest = digestReader.sum()
 	}
 	created := time.Now()
-	_, registerErr := f.api.Register(ctx, parentID, tempName, providerChecksum, stagedSize, created)
+	_, registerErr := f.uploadBatchCoordinator().register(ctx, api.RegistrationInfo{
+		ParentID: parentID, Name: tempName, Checksum: providerChecksum, Size: stagedSize, Created: created,
+	})
 	if registerErr != nil {
 		fs.Logf(f, "degoo: reconciling encrypted upload after unacknowledged registration (parent ID %q, %d bytes): %v", parentID, stagedSize, registerErr)
 	}
@@ -1855,6 +1941,9 @@ func (f *Fs) finishUpload(ctx context.Context, remote, leaf, parentID string, st
 	if err != nil {
 		return nil, fmt.Errorf("degoo: uploaded object verification failed; pending data retained: %w", err)
 	}
+	if err := f.confirmUploadTargetBeforePublish(ctx, parentID, leaf, old); err != nil {
+		return nil, err
+	}
 
 	var backupName string
 	if old != nil {
@@ -1892,16 +1981,40 @@ func (f *Fs) finishUpload(ctx context.Context, remote, leaf, parentID string, st
 	return published, nil
 }
 
+func (f *Fs) confirmUploadTargetBeforePublish(ctx context.Context, parentID, leaf string, old *Object) error {
+	current, isDir, _, err := f.lookupChildFresh(ctx, parentID, leaf)
+	if err != nil {
+		return fmt.Errorf("degoo: recheck target before publishing upload: %w", err)
+	}
+	if old == nil {
+		if current != nil {
+			if isDir {
+				return fs.ErrorIsDir
+			}
+			return errors.New("degoo: target appeared during upload; pending data retained")
+		}
+		return nil
+	}
+	if current == nil || isDir || current.ID != old.id || current.ParentID != old.parentID {
+		return errors.New("degoo: target changed during upload; prior object remains untouched and pending data retained")
+	}
+	return nil
+}
+
 func (f *Fs) waitForPublishedObject(ctx context.Context, remote, leaf, parentID string, staged api.Item, preRenameParentID string, size int64, timeout time.Duration) (*Object, error) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
 	var lastErr error
+	pollDelay := confirmationPollStart
 	for {
 		item, err := f.getItem(ctx, staged.ID)
+		var retryErr error
 		if err != nil {
+			if isRateLimitError(err) || (!api.Retryable(err) && !isNotFoundError(err)) {
+				return nil, err
+			}
 			lastErr = err
+			retryErr = err
 		} else if item.ID != staged.ID || item.Name != leaf || item.Size != size {
 			lastErr = fmt.Errorf("published metadata mismatch (id_match=%t name_match=%t parent_match=%t parent_empty=%t parent_is_zero=%t got_size=%d want_size=%d category=%d)",
 				item.ID == staged.ID, item.Name == leaf, item.ParentID == parentID, item.ParentID == "", item.ParentID == "0", item.Size, size, item.Category)
@@ -1918,7 +2031,11 @@ func (f *Fs) waitForPublishedObject(ctx context.Context, remote, leaf, parentID 
 			}
 			visible, isDir, _, listErr := f.lookupChildFresh(ctx, parentID, leaf)
 			if listErr != nil {
+				if isRateLimitError(listErr) || (!api.Retryable(listErr) && !isNotFoundError(listErr)) {
+					return nil, listErr
+				}
 				lastErr = listErr
+				retryErr = listErr
 				if overlayDiagnostic != "" {
 					lastErr = fmt.Errorf("%s; canonical listing: %w", overlayDiagnostic, listErr)
 				}
@@ -1931,15 +2048,20 @@ func (f *Fs) waitForPublishedObject(ctx context.Context, remote, leaf, parentID 
 				}
 			}
 		}
+		delay := confirmationRetryDelay(pollDelay, retryErr)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return nil, ctx.Err()
 		case <-deadline.C:
+			timer.Stop()
 			if lastErr != nil {
 				return nil, lastErr
 			}
 			return nil, errors.New("published object did not become visible")
-		case <-ticker.C:
+		case <-timer.C:
+			pollDelay = nextConfirmationPollDelay(pollDelay)
 		}
 	}
 }

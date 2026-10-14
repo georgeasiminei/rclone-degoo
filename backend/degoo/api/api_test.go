@@ -52,6 +52,12 @@ func newTestClient(server *httptest.Server, tokens TokenSource) *Client {
 	return New(server.Client(), tokens, server.URL, "test-api-key")
 }
 
+type testRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip testRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
 func decodeGraphQLRequest(t *testing.T, request *http.Request) map[string]any {
 	t.Helper()
 	var body map[string]any
@@ -364,29 +370,24 @@ func TestMutationAcknowledgements(t *testing.T) {
 	}
 }
 
-func TestRegisterRefreshesPureUnauthorizedErrorOnce(t *testing.T) {
+func TestRegisterDoesNotReplayUnauthorizedMutation(t *testing.T) {
 	tokens := &testTokens{initial: "expired", refreshed: "fresh"}
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		body := decodeGraphQLRequest(t, request)
-		variables := body["variables"].(map[string]any)
+		_ = decodeGraphQLRequest(t, request)
 		requests.Add(1)
-		if variables["Token"] == "expired" {
-			writeJSON(t, writer, map[string]any{"errors": []any{map[string]any{
-				"message": "Unauthorized", "errorType": "UnauthorizedException",
-			}}})
-			return
-		}
-		writeJSON(t, writer, map[string]any{"data": map[string]any{"setUploadFile3": "registered"}})
+		writeJSON(t, writer, map[string]any{"errors": []any{map[string]any{
+			"message": "Unauthorized", "errorType": "UnauthorizedException",
+		}}})
 	}))
 	defer server.Close()
 
 	got, err := newTestClient(server, tokens).Register(context.Background(), "parent", "file.bin", "checksum", 1, time.Now())
-	if err != nil || got != "registered" {
-		t.Fatalf("Register = %q, %v; want registered, nil", got, err)
+	if err == nil || got != "" {
+		t.Fatalf("Register = %q, %v; want an ambiguous mutation error", got, err)
 	}
-	if requests.Load() != 2 || tokens.refreshes.Load() != 1 {
-		t.Fatalf("requests/refreshes = %d/%d, want 2/1", requests.Load(), tokens.refreshes.Load())
+	if requests.Load() != 1 || tokens.refreshes.Load() != 0 {
+		t.Fatalf("requests/refreshes = %d/%d, want 1/0", requests.Load(), tokens.refreshes.Load())
 	}
 }
 
@@ -551,6 +552,373 @@ func TestListDirFreshBypassesAndInvalidatesCache(t *testing.T) {
 	if err != nil || cached[0].ID != "3" || requests.Load() != 3 {
 		t.Fatalf("cached ListDir = %#v, %v with %d requests; want item 3 and 3 requests", cached, err, requests.Load())
 	}
+}
+
+func TestListDirCoalescesConcurrentMisses(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-release
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{
+			"Items": []map[string]string{{"ID": "item", "Name": "file", "ParentID": "parent"}},
+		}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+
+	const waiters = 8
+	results := make(chan error, waiters)
+	for range waiters {
+		go func() {
+			items, err := client.ListDir(context.Background(), "parent")
+			if err == nil && (len(items) != 1 || items[0].ID != "item") {
+				err = fmt.Errorf("unexpected items: %#v", items)
+			}
+			results <- err
+		}()
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("ListDir request did not reach server")
+	}
+	waitForRequestStat(t, client, func(stats RequestStats) bool { return stats.MetadataCacheCoalesced == waiters-1 })
+	close(release)
+	for range waiters {
+		if err := <-results; err != nil {
+			t.Fatalf("ListDir: %v", err)
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("provider requests = %d, want 1", requests.Load())
+	}
+	stats := client.RequestStats()
+	if stats.MetadataCacheMisses != waiters || stats.MetadataCacheCoalesced != waiters-1 || stats.MetadataPages != 1 {
+		t.Fatalf("metadata stats = %+v, want %d misses, %d coalesced waiters, one page", stats, waiters, waiters-1)
+	}
+}
+
+func TestListDirWaiterCancellationDoesNotCancelSharedRequest(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		close(started)
+		<-release
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{"Items": []any{}}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := client.ListDir(firstCtx, "parent")
+		firstResult <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first ListDir request did not reach server")
+	}
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := client.ListDir(context.Background(), "parent")
+		secondResult <- err
+	}()
+	waitForRequestStat(t, client, func(stats RequestStats) bool { return stats.MetadataCacheCoalesced == 1 })
+	cancelFirst()
+	if err := <-firstResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first ListDir error = %v, want context.Canceled", err)
+	}
+	close(release)
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second ListDir: %v", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("provider requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestListDirCancelsSharedRequestWhenAllWaitersLeave(t *testing.T) {
+	started := make(chan struct{})
+	requestCanceled := make(chan struct{})
+	client := New(&http.Client{Transport: testRoundTripper(func(request *http.Request) (*http.Response, error) {
+		close(started)
+		<-request.Context().Done()
+		close(requestCanceled)
+		return nil, request.Context().Err()
+	})}, &testTokens{initial: "token"}, "https://api.invalid/graphql", "test-api-key")
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.ListDir(ctx, "parent")
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("ListDir request did not reach server")
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("ListDir error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("shared HTTP request was not canceled after its last waiter left")
+	}
+}
+
+func TestListDirFreshCoalescesAndInvalidatesOnlyItsParent(t *testing.T) {
+	type parentCounter struct {
+		count int
+	}
+	var mu sync.Mutex
+	counters := map[string]*parentCounter{}
+	freshStarted := make(chan struct{})
+	releaseFresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		variables := body["variables"].(map[string]any)
+		parentID := variables["ParentID"].(string)
+		mu.Lock()
+		counter := counters[parentID]
+		if counter == nil {
+			counter = &parentCounter{}
+			counters[parentID] = counter
+		}
+		counter.count++
+		count := counter.count
+		mu.Unlock()
+		if parentID == "a" && count == 2 {
+			close(freshStarted)
+			<-releaseFresh
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{
+			"Items": []map[string]string{{"ID": fmt.Sprintf("%s-%d", parentID, count), "Name": "file", "ParentID": parentID}},
+		}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+	for _, parentID := range []string{"a", "b"} {
+		if _, err := client.ListDir(context.Background(), parentID); err != nil {
+			t.Fatalf("prime %s: %v", parentID, err)
+		}
+	}
+
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			items, err := client.ListDirFresh(context.Background(), "a")
+			if err == nil && (len(items) != 1 || items[0].ID != "a-2") {
+				err = fmt.Errorf("unexpected fresh items: %#v", items)
+			}
+			results <- err
+		}()
+	}
+	select {
+	case <-freshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fresh listing did not reach server")
+	}
+	waitForRequestStat(t, client, func(stats RequestStats) bool { return stats.MetadataCacheCoalesced == 1 })
+	close(releaseFresh)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("ListDirFresh: %v", err)
+		}
+	}
+	items, err := client.ListDir(context.Background(), "b")
+	if err != nil || len(items) != 1 || items[0].ID != "b-1" {
+		t.Fatalf("ListDir b = %#v, %v; want cached b-1", items, err)
+	}
+	mu.Lock()
+	gotA, gotB := counters["a"].count, counters["b"].count
+	mu.Unlock()
+	if gotA != 2 || gotB != 1 {
+		t.Fatalf("parent listing requests = a:%d b:%d, want a:2 b:1", gotA, gotB)
+	}
+}
+
+func TestTrackedRenameInvalidatesOnlyItsParent(t *testing.T) {
+	var mu sync.Mutex
+	counts := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		switch body["operationName"] {
+		case "GetFileChildren5":
+			parentID := body["variables"].(map[string]any)["ParentID"].(string)
+			mu.Lock()
+			counts[parentID]++
+			mu.Unlock()
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{
+				"Items": []map[string]string{{"ID": "item-" + parentID, "Name": "file", "ParentID": parentID}},
+			}}})
+		case "SetRenameFile":
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"setRenameFile": true}})
+		default:
+			t.Errorf("unexpected operation %v", body["operationName"])
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+	for _, parentID := range []string{"a", "b"} {
+		if _, err := client.ListDir(context.Background(), parentID); err != nil {
+			t.Fatalf("prime %s: %v", parentID, err)
+		}
+	}
+	if err := client.Rename(context.Background(), "item-a", "renamed"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if _, err := client.ListDir(context.Background(), "a"); err != nil {
+		t.Fatalf("ListDir a after rename: %v", err)
+	}
+	if _, err := client.ListDir(context.Background(), "b"); err != nil {
+		t.Fatalf("ListDir b after rename: %v", err)
+	}
+	mu.Lock()
+	gotA, gotB := counts["a"], counts["b"]
+	mu.Unlock()
+	stats := client.RequestStats()
+	if gotA != 2 || gotB != 1 || stats.MetadataGlobalInvalidations != 0 {
+		t.Fatalf("listing counts a:%d b:%d, global invalidations %d; want 2/1/0", gotA, gotB, stats.MetadataGlobalInvalidations)
+	}
+}
+
+func TestStaleItemLookupCannotOverwriteMovedItemParent(t *testing.T) {
+	var mu sync.Mutex
+	listingCounts := map[string]int{}
+	var overlayRequests atomic.Int32
+	staleLookupStarted := make(chan struct{})
+	releaseStaleLookup := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		switch body["operationName"] {
+		case "GetOverlay4":
+			if overlayRequests.Add(1) == 2 {
+				close(staleLookupStarted)
+				<-releaseStaleLookup
+			}
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"getOverlay4": map[string]any{
+				"ID": "item", "Name": "file", "ParentID": "old", "Category": 1, "Size": "1", "URL": "https://storage.invalid/object",
+			}}})
+		case "GetFileChildren5":
+			parentID := body["variables"].(map[string]any)["ParentID"].(string)
+			mu.Lock()
+			listingCounts[parentID]++
+			mu.Unlock()
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{"Items": []any{}}}})
+		case "SetMoveFile":
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"setMoveFile": true}})
+		case "SetRenameFile":
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"setRenameFile": true}})
+		default:
+			t.Errorf("unexpected operation %v", body["operationName"])
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+	for _, parentID := range []string{"new", "unrelated"} {
+		if _, err := client.ListDir(context.Background(), parentID); err != nil {
+			t.Fatalf("prime %s: %v", parentID, err)
+		}
+	}
+	if _, err := client.GetItem(context.Background(), "item"); err != nil {
+		t.Fatalf("initial GetItem: %v", err)
+	}
+
+	staleLookup := make(chan error, 1)
+	go func() {
+		_, err := client.GetItem(context.Background(), "item")
+		staleLookup <- err
+	}()
+	select {
+	case <-staleLookupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second GetItem did not reach server")
+	}
+	if err := client.Move(context.Background(), "item", "new"); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if _, err := client.ListDir(context.Background(), "new"); err != nil {
+		t.Fatalf("ListDir new after Move: %v", err)
+	}
+	close(releaseStaleLookup)
+	if err := <-staleLookup; err != nil {
+		t.Fatalf("stale GetItem: %v", err)
+	}
+	if err := client.Rename(context.Background(), "item", "renamed"); err != nil {
+		t.Fatalf("Rename after Move: %v", err)
+	}
+	if _, err := client.ListDir(context.Background(), "new"); err != nil {
+		t.Fatalf("ListDir new after Rename: %v", err)
+	}
+	if _, err := client.ListDir(context.Background(), "unrelated"); err != nil {
+		t.Fatalf("ListDir unrelated after Rename: %v", err)
+	}
+	mu.Lock()
+	gotNew, gotUnrelated := listingCounts["new"], listingCounts["unrelated"]
+	mu.Unlock()
+	if gotNew != 3 || gotUnrelated != 1 {
+		t.Fatalf("listing counts new:%d unrelated:%d, want 3/1", gotNew, gotUnrelated)
+	}
+}
+
+func TestUploadDoesNotInvalidateDirectoryMetadata(t *testing.T) {
+	var listRequests, uploadRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.Header.Get("Content-Type"), "multipart/form-data") {
+			uploadRequests.Add(1)
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		body := decodeGraphQLRequest(t, request)
+		if body["operationName"] != "GetFileChildren5" {
+			t.Errorf("unexpected operation %v", body["operationName"])
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		listRequests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{"Items": []any{}}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+	if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+		t.Fatalf("initial ListDir: %v", err)
+	}
+	if err := client.Upload(context.Background(), AuthData{BaseURL: server.URL}, "file.bin", "checksum", 1, "application/octet-stream", strings.NewReader("x")); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+		t.Fatalf("ListDir after Upload: %v", err)
+	}
+	if listRequests.Load() != 1 || uploadRequests.Load() != 1 {
+		t.Fatalf("listing/upload requests = %d/%d, want 1/1", listRequests.Load(), uploadRequests.Load())
+	}
+}
+
+func waitForRequestStat(t *testing.T, client *Client, condition func(RequestStats) bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if condition(client.RequestStats()) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("request stats did not reach expected state: %+v", client.RequestStats())
 }
 
 func TestListDirDoesNotReturnCacheForCanceledContextOrCooldown(t *testing.T) {
@@ -765,6 +1133,170 @@ func TestGetWriteAuthReportsAlreadyExists(t *testing.T) {
 	_, err := newTestClient(server, &testTokens{initial: "token"}).GetWriteAuth(context.Background(), "parent", "file.txt", 12, "checksum")
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("GetWriteAuth error = %v, want ErrAlreadyExists", err)
+	}
+}
+
+func TestGetWriteAuthBatchReturnsOrderedPerItemResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		if body["operationName"] != "GetBucketWriteAuth4" {
+			t.Errorf("operationName = %v, want GetBucketWriteAuth4", body["operationName"])
+		}
+		variables := body["variables"].(map[string]any)
+		if variables["ParentID"] != "parent" {
+			t.Errorf("ParentID = %v, want parent", variables["ParentID"])
+		}
+		infos := variables["StorageUploadInfos"].([]any)
+		if len(infos) != 2 || infos[0].(map[string]any)["FileName"] != "first.bin" || infos[1].(map[string]any)["FileName"] != "second.bin" {
+			t.Errorf("StorageUploadInfos = %#v, want ordered two-item batch", infos)
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getBucketWriteAuth4": []any{
+			map[string]any{"AuthData": map[string]any{"BaseURL": "https://storage.invalid", "KeyPrefix": "first/"}},
+			map[string]any{"Error": "File already exists"},
+		}}})
+	}))
+	defer server.Close()
+
+	results, err := newTestClient(server, &testTokens{initial: "token"}).GetWriteAuthBatch(context.Background(), "parent", []UploadInfo{
+		{Name: "first.bin", Size: 10, Checksum: "first-checksum"},
+		{Name: "second.bin", Size: 20, Checksum: "second-checksum"},
+	})
+	if err != nil {
+		t.Fatalf("GetWriteAuthBatch: %v", err)
+	}
+	if len(results) != 2 || results[0].AuthData.KeyPrefix != "first/" || results[0].Err != nil {
+		t.Fatalf("first result = %+v; want first authorization", results[0])
+	}
+	if !errors.Is(results[1].Err, ErrAlreadyExists) {
+		t.Fatalf("second result error = %v, want ErrAlreadyExists", results[1].Err)
+	}
+}
+
+func TestGetWriteAuthBatchRequiresOneResultPerInput(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getBucketWriteAuth4": []any{
+			map[string]any{"AuthData": map[string]any{"BaseURL": "https://storage.invalid"}},
+		}}})
+	}))
+	defer server.Close()
+
+	_, err := newTestClient(server, &testTokens{initial: "token"}).GetWriteAuthBatch(context.Background(), "parent", []UploadInfo{
+		{Name: "first.bin", Size: 10, Checksum: "first"},
+		{Name: "second.bin", Size: 20, Checksum: "second"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "returned 1 authorizations for 2 uploads") {
+		t.Fatalf("GetWriteAuthBatch error = %v, want response-cardinality error", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want one", requests.Load())
+	}
+}
+
+func TestGetWriteAuthBatchRejectsOversizedBatchWithoutRequest(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getBucketWriteAuth4": []any{}}})
+	}))
+	defer server.Close()
+
+	infos := make([]UploadInfo, maxWriteAuthBatch+1)
+	if _, err := newTestClient(server, &testTokens{initial: "token"}).GetWriteAuthBatch(context.Background(), "parent", infos); err == nil {
+		t.Fatal("GetWriteAuthBatch unexpectedly accepted an oversized batch")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("oversized batch sent %d requests, want zero", requests.Load())
+	}
+}
+
+func TestRegisterBatchSendsOneMutationWithAllRecords(t *testing.T) {
+	created := time.UnixMilli(1700000000123)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		body := decodeGraphQLRequest(t, request)
+		if body["operationName"] != "SetUploadFile3" {
+			t.Errorf("operationName = %v, want SetUploadFile3", body["operationName"])
+		}
+		variables := body["variables"].(map[string]any)
+		infos := variables["FileInfos"].([]any)
+		if len(infos) != 2 {
+			t.Errorf("FileInfos length = %d, want 2", len(infos))
+		}
+		first := infos[0].(map[string]any)
+		second := infos[1].(map[string]any)
+		if first["ParentID"] != "parent-a" || first["Name"] != "a.bin" || first["Size"] != "10" || first["Checksum"] != "a-checksum" || first["CreationTime"] != "1700000000123" {
+			t.Errorf("first FileInfo = %#v", first)
+		}
+		if second["ParentID"] != "parent-b" || second["Name"] != "b.bin" || second["Size"] != "20" || second["Checksum"] != "b-checksum" {
+			t.Errorf("second FileInfo = %#v", second)
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"setUploadFile3": true}})
+	}))
+	defer server.Close()
+
+	result, err := newTestClient(server, &testTokens{initial: "token"}).RegisterBatch(context.Background(), []RegistrationInfo{
+		{ParentID: "parent-a", Name: "a.bin", Size: 10, Checksum: "a-checksum", Created: created},
+		{ParentID: "parent-b", Name: "b.bin", Size: 20, Checksum: "b-checksum", Created: created},
+	})
+	if err != nil || result != "" {
+		t.Fatalf("RegisterBatch = %q, %v; want empty success acknowledgement", result, err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("RegisterBatch sent %d requests, want one", requests.Load())
+	}
+}
+
+func TestRegisterBatchRejectsOversizedBatchWithoutRequest(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"setUploadFile3": true}})
+	}))
+	defer server.Close()
+
+	infos := make([]RegistrationInfo, maxRegisterBatch+1)
+	if _, err := newTestClient(server, &testTokens{initial: "token"}).RegisterBatch(context.Background(), infos); err == nil {
+		t.Fatal("RegisterBatch unexpectedly accepted an oversized batch")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("oversized batch sent %d requests, want zero", requests.Load())
+	}
+}
+
+func TestRequestStatsCountSafeOperationNamesAndClassifyWriteAuth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		switch body["operationName"] {
+		case "GetOverlay4":
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"getOverlay4": map[string]any{"ID": "17", "Name": "file", "ParentID": "parent", "Category": 1, "Size": "1", "URL": "https://storage.invalid/object"}}})
+		case "GetBucketWriteAuth4":
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"getBucketWriteAuth4": []any{map[string]any{"AuthData": map[string]any{"BaseURL": "https://storage.invalid"}}}}})
+		default:
+			t.Errorf("unexpected operation %v", body["operationName"])
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+	if _, err := client.GetItem(context.Background(), "17"); err != nil {
+		t.Fatalf("GetItem: %v", err)
+	}
+	if _, err := client.GetWriteAuth(context.Background(), "parent", "file", 1, "checksum"); err != nil {
+		t.Fatalf("GetWriteAuth: %v", err)
+	}
+	stats := client.RequestStats()
+	if stats.HTTPRequests != 2 || stats.ReadHTTPRequests != 1 || stats.WriteHTTPRequests != 1 {
+		t.Fatalf("HTTP request totals = %+v, want 2 total (1 read, 1 write)", stats)
+	}
+	if stats.RequestsByOperation["GetOverlay4"] != 1 || stats.RequestsByOperation["GetBucketWriteAuth4"] != 1 {
+		t.Fatalf("operation totals = %#v", stats.RequestsByOperation)
+	}
+	stats.RequestsByOperation["GetOverlay4"] = 100
+	if client.RequestStats().RequestsByOperation["GetOverlay4"] != 1 {
+		t.Fatal("mutating stats snapshot changed client counters")
 	}
 }
 

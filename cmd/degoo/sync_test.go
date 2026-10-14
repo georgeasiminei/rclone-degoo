@@ -45,14 +45,14 @@ func newSyncTestVFS(t *testing.T, remote fs.Fs, fullCache bool) *vfs.VFS {
 	return mountedVFS
 }
 
-func newSyncTestEndpoint(t *testing.T, mountedVFS *vfs.VFS, flushRaw func()) (*syncEndpoint, string) {
+func newSyncTestEndpoint(t *testing.T, mountedVFS *vfs.VFS, flushRaw func(), stats ...func() any) (*syncEndpoint, string) {
 	t.Helper()
 	tempDir := t.TempDir()
 	require.NoError(t, os.Chmod(tempDir, 0700))
 	parent := filepath.Join(tempDir, "private")
 	require.NoError(t, os.Mkdir(parent, 0700))
 	socketPath := filepath.Join(parent, "vfs-sync.sock")
-	endpoint, err := startSyncEndpoint(socketPath, mountedVFS, flushRaw)
+	endpoint, err := startSyncEndpoint(socketPath, mountedVFS, flushRaw, stats...)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, endpoint.Close()) })
 	return endpoint, socketPath

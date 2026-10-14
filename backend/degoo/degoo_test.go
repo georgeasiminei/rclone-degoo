@@ -50,8 +50,23 @@ type mockDegoo struct {
 	applyFalseRegisterAck        bool
 	registrationVisibilityLag    time.Duration
 	registerCalls                int
+	registerRequestCalls         int
+	authorizationRequestCalls    int
+	authorizationRows            int
+	failWriteAuthName            string
+	failFirstWriteAuth           bool
+	authMappingErrors            int
+	authRequestSeen              chan int
+	authRequestRelease           chan struct{}
+	authRequestCanceled          chan struct{}
+	blockUpload                  bool
+	uploadStarted                chan struct{}
+	uploadRelease                chan struct{}
 	blockListing                 bool
 	blockListingPage2            bool
+	injectTargetOnDownload       bool
+	injectedTargetName           string
+	injectedTargetContent        []byte
 	listPage2Started             chan struct{}
 	listNextToken                string
 	blockGetItem                 bool
@@ -133,6 +148,30 @@ func (mock *mockDegoo) upload(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 	mock.mu.Lock()
+	blockUpload := mock.blockUpload
+	started, release := mock.uploadStarted, mock.uploadRelease
+	mock.mu.Unlock()
+	if blockUpload {
+		if started != nil {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+		}
+		select {
+		case <-request.Context().Done():
+			return
+		case <-release:
+		}
+	}
+	if got, want := request.FormValue("auth-name"), header.Filename; got != want {
+		mock.mu.Lock()
+		mock.authMappingErrors++
+		mock.mu.Unlock()
+		http.Error(writer, "authorization row did not match upload", http.StatusBadRequest)
+		return
+	}
+	mock.mu.Lock()
 	if mock.corruptUpload && len(content) != 0 {
 		content[0] ^= 0xff
 	}
@@ -153,6 +192,13 @@ func (mock *mockDegoo) download(writer http.ResponseWriter, request *http.Reques
 	}
 	item, ok := mock.items[id]
 	content := append([]byte(nil), item.content...)
+	if ok && mock.injectTargetOnDownload {
+		mock.injectTargetOnDownload = false
+		mock.items["external-target"] = mockItem{
+			id: "external-target", name: mock.injectedTargetName, parentID: item.parentID,
+			category: 6, size: int64(len(mock.injectedTargetContent)), content: append([]byte(nil), mock.injectedTargetContent...),
+		}
+	}
 	mock.mu.Unlock()
 	if !ok {
 		http.NotFound(writer, request)
@@ -240,17 +286,51 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 		}
 		data = map[string]any{"getFileChildren5": map[string]any{"Items": items, "NextToken": responseNextToken}}
 	case "GetBucketWriteAuth4":
-		data = map[string]any{"getBucketWriteAuth4": []any{map[string]any{"AuthData": map[string]any{
-			"PolicyBase64": "policy", "Signature": "signature", "BaseURL": "http://" + request.Host + "/gcs",
-			"KeyPrefix": "", "AccessKey": map[string]string{"Key": "key", "Value": "value"},
-		}}}}
+		infos, _ := input.Variables["StorageUploadInfos"].([]any)
+		mock.authorizationRequestCalls++
+		mock.authorizationRows += len(infos)
+		if mock.authRequestSeen != nil {
+			select {
+			case mock.authRequestSeen <- len(infos):
+			default:
+			}
+		}
+		if mock.authRequestRelease != nil {
+			select {
+			case <-request.Context().Done():
+				if mock.authRequestCanceled != nil {
+					select {
+					case mock.authRequestCanceled <- struct{}{}:
+					default:
+					}
+				}
+				return
+			case <-mock.authRequestRelease:
+			}
+		}
+		results := make([]map[string]any, 0, len(infos))
+		for i, rawInfo := range infos {
+			info, _ := rawInfo.(map[string]any)
+			name, _ := info["FileName"].(string)
+			if name == mock.failWriteAuthName || (mock.failFirstWriteAuth && i == 0) {
+				results = append(results, map[string]any{"Error": "simulated authorization rejection"})
+				continue
+			}
+			results = append(results, map[string]any{"AuthData": map[string]any{
+				"PolicyBase64": "policy", "Signature": "signature", "BaseURL": "http://" + request.Host + "/gcs",
+				"KeyPrefix": "", "AccessKey": map[string]string{"Key": "key", "Value": "value"},
+				"AdditionalBody": []map[string]string{{"Key": "auth-name", "Value": name}},
+			}})
+		}
+		data = map[string]any{"getBucketWriteAuth4": results}
 	case "SetUploadFile3":
-		fileInfos := input.Variables["FileInfos"].([]any)
-		info := fileInfos[0].(map[string]any)
-		name, _ := info["Name"].(string)
-		parentID, _ := info["ParentID"].(string)
-		checksum, _ := info["Checksum"].(string)
-		if checksum != "" && mock.failRegister {
+		fileInfos, _ := input.Variables["FileInfos"].([]any)
+		mock.registerRequestCalls++
+		if len(fileInfos) == 0 {
+			writeTestJSON(writer, map[string]any{"errors": []any{map[string]string{"message": "no file infos"}}})
+			return
+		}
+		if checksum, _ := fileInfos[0].(map[string]any)["Checksum"].(string); checksum != "" && mock.failRegister {
 			if mock.registerSeen != nil {
 				select {
 				case mock.registerSeen <- struct{}{}:
@@ -260,44 +340,50 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 			writeTestJSON(writer, map[string]any{"errors": []any{map[string]string{"message": "simulated registration rejection"}}})
 			return
 		}
-		if checksum != "" && mock.falseRegisterAcknowledgement && !mock.applyFalseRegisterAck {
-			mock.registerCalls++
+		if checksum, _ := fileInfos[0].(map[string]any)["Checksum"].(string); checksum != "" && mock.falseRegisterAcknowledgement && !mock.applyFalseRegisterAck {
+			mock.registerCalls += len(fileInfos)
 			data = map[string]any{"setUploadFile3": false}
 			break
 		}
-		mock.nextID++
-		id := fmt.Sprintf("item-%d", mock.nextID)
-		size, _ := strconv.ParseInt(fmt.Sprint(info["Size"]), 10, 64)
-		createdMS, _ := strconv.ParseInt(fmt.Sprint(info["CreationTime"]), 10, 64)
-		category := mock.initialPlaceholderCategory
-		if strings.HasPrefix(name, directoryMarkerPrefix) {
-			category = 6
-		}
-		item := mockItem{id: id, name: name, parentID: parentID, category: category, size: size, created: time.UnixMilli(createdMS)}
-		if checksum != "" {
-			mock.registerCalls++
-			item.size += mock.registeredSizeDelta
-			item.content = append([]byte(nil), mock.uploads[name]...)
-			item.visibleAfter = time.Now().Add(mock.registrationVisibilityLag)
-		} else if mock.promoteOnMarker && strings.HasPrefix(name, directoryMarkerPrefix) {
-			placeholder, ok := mock.items[parentID]
-			if ok {
-				placeholder.category = 0
-				mock.items[parentID] = placeholder
-				mock.nextID++
-				promotedID := fmt.Sprintf("promoted-%d", mock.nextID)
-				mock.items[promotedID] = mockItem{
-					id: promotedID, name: placeholder.name, parentID: placeholder.parentID, category: 2,
+		for _, rawInfo := range fileInfos {
+			info, _ := rawInfo.(map[string]any)
+			name, _ := info["Name"].(string)
+			parentID, _ := info["ParentID"].(string)
+			checksum, _ := info["Checksum"].(string)
+			mock.nextID++
+			id := fmt.Sprintf("item-%d", mock.nextID)
+			size, _ := strconv.ParseInt(fmt.Sprint(info["Size"]), 10, 64)
+			createdMS, _ := strconv.ParseInt(fmt.Sprint(info["CreationTime"]), 10, 64)
+			category := mock.initialPlaceholderCategory
+			if strings.HasPrefix(name, directoryMarkerPrefix) {
+				category = 6
+			}
+			item := mockItem{id: id, name: name, parentID: parentID, category: category, size: size, created: time.UnixMilli(createdMS)}
+			if checksum != "" {
+				mock.registerCalls++
+				item.size += mock.registeredSizeDelta
+				item.content = append([]byte(nil), mock.uploads[name]...)
+				item.visibleAfter = time.Now().Add(mock.registrationVisibilityLag)
+			} else if mock.promoteOnMarker && strings.HasPrefix(name, directoryMarkerPrefix) {
+				placeholder, ok := mock.items[parentID]
+				if ok {
+					placeholder.category = 0
+					mock.items[parentID] = placeholder
+					mock.nextID++
+					promotedID := fmt.Sprintf("promoted-%d", mock.nextID)
+					mock.items[promotedID] = mockItem{
+						id: promotedID, name: placeholder.name, parentID: placeholder.parentID, category: 2,
+					}
+					item.parentID = promotedID
 				}
-				item.parentID = promotedID
+			}
+			mock.items[id] = item
+			if checksum == "" && mock.failInitialMkdirAck && !strings.HasPrefix(name, directoryMarkerPrefix) {
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 		}
-		mock.items[id] = item
-		if checksum == "" && mock.failInitialMkdirAck && !strings.HasPrefix(name, directoryMarkerPrefix) {
-			writer.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if checksum == "" {
+		if _, checksum := fileInfos[0].(map[string]any)["Checksum"].(string); !checksum {
 			data = map[string]any{"setUploadFile3": true}
 		} else if mock.falseRegisterAcknowledgement {
 			data = map[string]any{"setUploadFile3": false}
@@ -949,7 +1035,7 @@ func TestOpenRefreshesExpiredOrRejectedListedURL(t *testing.T) {
 	}
 }
 
-func TestUploadPublicationUsesVerifiedItemWithoutParentListing(t *testing.T) {
+func TestUploadPublicationRechecksTargetBeforePublish(t *testing.T) {
 	mock := newMockDegoo()
 	f, server := newTestFs(t, mock)
 	defer server.Close()
@@ -964,8 +1050,8 @@ func TestUploadPublicationUsesVerifiedItemWithoutParentListing(t *testing.T) {
 	}
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
-	if got := mock.listCalls - initialListCalls; got != 2 {
-		t.Fatalf("parent listing requests = %d, want cached Put lookup and fresh registration visibility only", got)
+	if got := mock.listCalls - initialListCalls; got != 3 {
+		t.Fatalf("parent listing requests = %d, want cached Put lookup, fresh registration visibility, and fresh pre-publication target check", got)
 	}
 	if got := mock.getItemCalls - initialGetItemCalls; got != 2 {
 		t.Fatalf("targeted metadata requests = %d, want upload verification and publication confirmation", got)
@@ -988,6 +1074,47 @@ func TestWaitForItemBacksOffRetryableListingErrors(t *testing.T) {
 	defer mock.mu.Unlock()
 	if got := mock.listCalls - initialListCalls; got != 3 {
 		t.Fatalf("retryable listing requests = %d, want 3 with increasing backoff", got)
+	}
+}
+
+func TestWaitForIDsGoneBacksOffWhileItemRemainsVisible(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["target"] = mockItem{id: "target", name: "cipher", parentID: "vault", category: 6}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	mock.mu.Lock()
+	initialListCalls := mock.listCalls
+	mock.mu.Unlock()
+
+	err := f.waitForIDsGone(context.Background(), "vault", []string{"target"}, 1500*time.Millisecond)
+	if err == nil {
+		t.Fatal("waitForIDsGone succeeded while the item remained visible")
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if got := mock.listCalls - initialListCalls; got != 3 {
+		t.Fatalf("confirmation listing requests = %d, want 3 with 250/500/1000ms backoff", got)
+	}
+}
+
+func TestWaitForPublishedObjectBacksOffUntilMetadataMatches(t *testing.T) {
+	mock := newMockDegoo()
+	mock.items["staged"] = mockItem{id: "staged", name: temporaryPrefix + "pending", parentID: "vault", category: 6, size: 4}
+	f, server := newTestFs(t, mock)
+	defer server.Close()
+	mock.mu.Lock()
+	initialGetItemCalls := mock.getItemCalls
+	mock.mu.Unlock()
+
+	staged := api.Item{ID: "staged", Name: temporaryPrefix + "pending", ParentID: "vault", Size: 4}
+	_, err := f.waitForPublishedObject(context.Background(), "cipher", "cipher", "vault", staged, "vault", 4, 1500*time.Millisecond)
+	if err == nil {
+		t.Fatal("waitForPublishedObject succeeded while the pending name remained visible")
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if got := mock.getItemCalls - initialGetItemCalls; got != 3 {
+		t.Fatalf("published metadata requests = %d, want 3 with 250/500/1000ms backoff", got)
 	}
 }
 

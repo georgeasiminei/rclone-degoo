@@ -141,31 +141,79 @@ records the same observed page ceiling and reuses folder listings to satisfy
 item lookups. These are implementation observations, not current Degoo
 guarantees.
 
+### Request reduction and local cache behavior (2026-10-14)
+
 The backend stores a typed rate-limit deadline beside the private auth file
 and fast-fails API calls while that deadline is active; an expired deadline no
 longer blocks requests. On Linux, clients coordinate through a private
 sidecar lock and re-read the deadline before token retrieval and HTTP calls.
 Concurrent deadlines merge by keeping the latest expiry, so a shorter response
 cannot reduce an existing cooldown. Lock waits are bounded and context-aware.
-Metadata lookups use a shared ten-second total bound across pagination and
-retries, honor caller cancellation, and stop retrying when Degoo supplies
-`Retry-After`. Background VFS writeback schedules a pending upload at the later
-of its normal retry time and the provider deadline, rather than sleeping in
-the request path. Download URLs are reused for 30 seconds. Upload publication first
-checks the targeted item metadata and skips a redundant canonical directory
-listing only when the returned item matches the expected ID, name, parent,
-size, and file category. If publication cannot be confirmed, the pending local
-write remains available for VFS retry.
+Backend metadata lookups use a shared ten-second total bound across pagination
+and retries, honor caller cancellation, and stop retrying when Degoo supplies
+`Retry-After`. The API's shared directory-listing request has a separate
+30-second ceiling; an enclosing backend deadline can end it sooner. Background
+VFS writeback schedules a pending upload at the later of its normal retry time
+and the provider deadline, rather than sleeping in the request path. Download
+URLs are reused for 30 seconds. Upload publication first checks the targeted
+item metadata and skips a redundant canonical directory listing only when the
+returned item matches the expected ID, name, parent, size, and file category.
+If publication cannot be confirmed, the pending local write remains available
+for VFS retry.
 
-`GetFileChildren5` also uses a bounded snapshot cache with a five-second
-lifetime and at most 32 parent entries. Mutations and explicit directory-cache
-flushes clear the snapshots; a generation check prevents an in-flight listing
-from repopulating a cleared cache. Follow-up checks passed for cross-process
-cooldown-state merging, bounded metadata calls, and pending-write retry
-scheduling. The final full Go suite passed after a small error-path fix. A
-rebuilt localhost FUSE smoke test confirmed fail-fast listing behavior and
-pending-write retention under a persisted cooldown. A production mount later
-returned `EIO` for `ls` in 2.9 ms during the recorded cooldown. A point-in-time
-process socket inventory showed no INET sockets, but that is not packet-level
-proof across the cooldown. These checks do not establish live Degoo upload
-recovery; see [VALIDATION.md](VALIDATION.md).
+`GetFileChildren5` uses a five-second in-memory snapshot cache with at most 32
+parent entries. A concurrent miss for one parent and cache generation shares
+one paginated request; each waiter can cancel independently, while the shared
+request retains the leader's context values and is bounded by the 30-second API
+ceiling. `ListDirFresh` bypasses cached responses and cache storage, invalidates
+only its parent, and can share a concurrent fresh request for that same parent
+and generation. Known mutations invalidate the known parent or parents before
+and after the attempt. A bounded item-to-parent hint table is learned from
+listings and lookups; if the affected parent is unknown, invalidation clears
+the in-memory cache conservatively. A mutation epoch prevents an older
+in-flight lookup from replacing a newer parent hint after a move. Explicit
+directory-cache flush clears all listing snapshots and parent hints. These
+mechanisms reduce duplicate work and avoid unrelated parent invalidations when
+the affected parents are known; they do not establish or change Degoo's
+unpublished request quota.
+The signed object-storage byte upload alone does not change folder metadata
+and does not invalidate directory snapshots; metadata registration does.
+
+The implementation also batches upload authorization requests for up to 30
+files in one parent and registration mutations for up to 100 files, including
+files in different parents. Authorization responses must contain exactly one
+result per input; per-file rejections remain attached to that file. A
+150-millisecond collection window gives concurrent file uploads a chance to
+share requests; each shared operation is bounded to 30 seconds and one caller's
+cancellation does not cancel the others. The registration mutation is not
+automatically replayed because its outcome can be ambiguous. These batch sizes
+follow array-valued public web-client request shapes and local fixtures; they
+are not a provider-published limit or live guarantee. A local `degoo stats`
+command reads aggregate counters through
+the mount's private Unix socket. The counters include HTTP attempts by fixed
+operation name and listing and cache activity, without request data or
+identifiers, and the command makes no Degoo request.
+
+The native encrypted vault also has a persistent cache for small raw provider
+objects. It stores only ciphertext objects up to 256 KiB under the configured
+cache's metadata area, with a 30-minute TTL, 64 MiB encoded and 8,192-entry
+bounds, and
+version keys derived from the object ID, size, modification time, and creation
+time. A SHA-256 check and exact-size check reject damaged or stale entries.
+Range opens can use a cached full object; upload readback verification bypasses
+the cache. The cache index is refreshed on a one-minute sweep rather than
+scanning all files on each small-object access. Unsafe cache paths fail closed,
+while cache write failures do not turn a successful remote read into a
+failure. Clearing the directory cache also clears this persistent cache. The
+cache avoids repeat small-object downloads; it does not cache listing responses
+or reduce GraphQL listing calls.
+
+The request-reduction and small-object-cache changes passed the credential-free
+full Go suite, scoped race, vet, and lint checks, plus a localhost FUSE fixture,
+as recorded in [VALIDATION.md](VALIDATION.md). This is offline evidence and
+must not be read as additional live-provider evidence. The earlier
+localhost-cooldown smoke-test results remain limited to the scope recorded
+there. A production mount later returned `EIO` for `ls` in 2.9 ms during the
+recorded cooldown. A point-in-time process socket inventory showed no INET
+sockets, but that is not packet-level proof across the cooldown. None of these
+checks establishes live Degoo upload recovery.

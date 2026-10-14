@@ -1107,3 +1107,49 @@ cache was removed. Root storage recovered approximately 258 GiB and now has
 service remained active and unchanged. Its status showed 941 queued and
 retrying uploads, zero uploading, and 277,364,333,920 pending bytes. This is
 local queue status, not proof of remote completion.
+
+## Request reduction, batching, and encrypted small-object cache — 2026-10-14
+
+The new API, backend, persistent-cache, and command tests cover the in-memory
+listing cache bounds and expiry; same-parent coalescing; independent waiter
+cancellation; fresh-list bypass and coalescing; scoped invalidation and stale
+parent-hint protection; authorization response cardinality and per-item
+errors; mixed-parent registration batching; safe aggregate request counters;
+and persistent-cache versioning, integrity checks, bounds, unsafe paths, and
+clear behavior. The generated encrypted chunk-stack regression changes its
+configured chunk size from 1 KiB to 8 KiB and reads both the complete object
+and a range crossing the old chunk boundary.
+
+Scoped API/backend/cache unit tests and race tests passed. The credential-free
+repository-wide `go test ./...` passed. The final
+`go test -race ./cmd/degoo -count=1`,
+`go vet ./backend/degoo/... ./cmd/degoo/...`, and
+`golangci-lint run ./backend/degoo/... ./cmd/degoo/...` also passed. A first
+command race run used a Unix-socket test path longer than the platform limit;
+rerunning with a shorter temporary directory passed.
+All four updated Markdown documents passed `markdownlint-cli2` and
+`git diff --check`.
+
+A native Linux FUSE test against a localhost fixture passed without contacting
+Degoo. Two generated pending files shared one write-authorization request;
+polling the local stats endpoint caused no fixture API request during its
+cooldown; a denied authorization left both writes pending; and normal unmount
+detached the mount. This checks local batching, counters, retention, and
+shutdown behavior only. No authenticated Degoo request, production upload, or
+destructive customer-data test was part of this follow-up. Live provider upload
+recovery remains an acceptance gate.
+
+The clean build of source commit `e008796360b6b3dd1a68e17537946e150d956fde`
+was then installed on the existing production mount through the private
+maintenance endpoint, normal FUSE unmount, atomic binary/manifest replacement,
+and service restart. Configuration hashes, cache identity, all 941 data files,
+their sizes, and complete dirty ranges matched before and after installation:
+277,364,333,920 pending bytes remained available. The active chunk size stayed
+at 128 MiB and the cache continued using its migrated backing volume.
+
+The persisted provider deadline remained unchanged at 2026-10-14 17:06:17
+EEST. After restart, local statistics reported zero provider HTTP attempts;
+a bounded directory listing returned `EIO` promptly during the hold and the
+counter remained zero. A point-in-time socket inventory found no INET sockets.
+This confirms local restart, queue preservation, and cooldown enforcement;
+it does not validate successful batched uploads against Degoo after the hold.
