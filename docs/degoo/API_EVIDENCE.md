@@ -164,5 +164,8 @@ from repopulating a cleared cache. Follow-up checks passed for cross-process
 cooldown-state merging, bounded metadata calls, and pending-write retry
 scheduling. The final full Go suite passed after a small error-path fix. A
 rebuilt localhost FUSE smoke test confirmed fail-fast listing behavior and
-pending-write retention under a persisted cooldown. These checks do not
-establish live Degoo upload recovery; see [VALIDATION.md](VALIDATION.md).
+pending-write retention under a persisted cooldown. A production mount later
+returned `EIO` for `ls` in 2.9 ms during the recorded cooldown. A point-in-time
+process socket inventory showed no INET sockets, but that is not packet-level
+proof across the cooldown. These checks do not establish live Degoo upload
+recovery; see [VALIDATION.md](VALIDATION.md).

@@ -1069,7 +1069,41 @@ The captured live `GetFileChildren5` 429 requested a retry after
 stopped. The follow-up validation made no live upload-recovery claim. Live
 provider upload recovery with the current code remains unverified.
 
-The external-cache copy has completed, but its whole-cache checksum comparison
-is still running. The checked portion has found no mismatches so far. Do not
-consider the migration complete until the full comparison and bind-mount
-verification finish.
+### Production cooldown and external-cache migration — 2026-10-14
+
+The captured `GetFileChildren5` response requested retry after `2026-10-14
+17:06:16 EEST`; the persisted deadline was conservatively rounded to `17:06:17
+EEST`. While the production mount was under that hold, native `ls` returned
+`EIO` in 0.0029 seconds. One process-level INET-socket inventory showed zero
+sockets, but this snapshot is not packet-level proof that no request was sent
+over the entire cooldown. Startup logs contained 941 retry messages scheduling
+the next attempts about 16 hours 49 minutes later. These messages describe
+local scheduling, not requests reaching Degoo.
+
+The prior mount became stuck and required exceptional recovery. The mount
+process was paused and the cache filesystem was flushed; there were no active
+writer file descriptors, and the remaining cached-data descriptors were read-
+only. The stalled FUSE connection was aborted, then normal unmount and service
+stop completed. This was a one-time recovery after confirming there were no
+active writers, not a routine cache-migration step. Live Degoo upload recovery
+after the recorded deadline remains unverified and is still an acceptance
+gate.
+
+The external cache migration is complete. SHA-256 comparison confirmed all
+1,886 cache files, totaling 258.013 GiB, matched source and destination before
+repair. Two dirty files truncated by `ENOSPC` during the original copy into
+the mounted vault were restored from stable originals; their complete SHA-256
+values matched. After repair, all 941 physical cache data files were marked
+dirty and had complete ranges. The cache was bind-mounted from
+`/data.tr/degoo-cache` onto the unchanged recorded `cache_dir`, preserving
+cache identity and pending writes. The source directory is mode `0700`; the
+empty underlying target is mode `0500`, and the user-service drop-in uses
+`ConditionPathIsMountPoint` on the saved cache path. The external filesystem
+must be mounted before the service starts.
+
+After full copy verification, restoration, and bind-mount checks, the old local
+cache was removed. Root storage recovered approximately 258 GiB and now has
+264 GiB available (41% used); the external data volume has 142 GiB available. The
+service remained active and unchanged. Its status showed 941 queued and
+retrying uploads, zero uploading, and 277,364,333,920 pending bytes. This is
+local queue status, not proof of remote completion.

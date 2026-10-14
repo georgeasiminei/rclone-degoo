@@ -13,17 +13,19 @@ fresh-cache readback, and CDN range reads. An expired-token refresh initially
 returned HTTP 401; authentication was later renewed and read-only provider
 queries confirmed the intended folder. The local vault binding was corrected
 after confirming the prior cache held no identity or cached file data. These
-events do not establish reliable automatic renewal, and final mounted health
-verification is still pending. Larger live files and the provider object-size
-limit remain acceptance gates; see
+events do not establish reliable automatic renewal. The production mount
+remained active during the recorded cooldown and failed listing operations
+promptly; live upload recovery after the deadline remains unverified. Larger
+live files and the provider object-size limit remain acceptance gates; see
 [VALIDATION.md](VALIDATION.md) for the tested scope.
 
 Follow-up fixes for cross-process cooldown-state merging and bounded metadata
 calls passed scoped checks and a rebuilt localhost FUSE smoke test. The final
 full Go suite passed after a small error-path fix. Live Degoo upload recovery
 with the current code remains unverified.
-The external cache copy is complete, but its full checksum comparison and
-bind-mount verification are still pending; see [VALIDATION.md](VALIDATION.md).
+The external cache migration is complete: its copy was SHA-256 verified and
+bind-mounted over the unchanged recorded cache path. Startup is guarded so the
+service only runs when that path is a mount point; see [VALIDATION.md](VALIDATION.md).
 
 The contained installer and maintenance commands use one `degoo-rc` entrypoint.
 Start it from a source checkout with `./contrib/degoo/degoo-rc install`,
@@ -356,9 +358,10 @@ vault JSON is authoritative if it was set elsewhere.
 
 1. Stop the user service or unmount the foreground mount normally, then verify
    the mount is gone and no process holds the cache. Do not copy a live cache.
-2. Create an owner-private directory on the mounted external filesystem, such
-   as `/data.tr/degoo-cache`, and copy the complete recorded cache into it
-   while preserving file ownership and permissions.
+2. Mount the external filesystem before starting the service. Create an
+   owner-private directory (mode `0700`) such as `/data.tr/degoo-cache`, and
+   copy the complete recorded cache into it while preserving ownership and
+   permissions.
 3. With the mount still stopped, compare checksums for all files under the old
    and copied cache, checking file contents rather than only names, sizes, or
    timestamps. Keep the old directory as a rollback copy until the new bind
@@ -368,23 +371,37 @@ vault JSON is authoritative if it was set elsewhere.
    configuration:
 
    ```text
-   /data.tr/degoo-cache  /home/USERNAME/.local/share/rclone-degoo/cache  none  bind  0  0
+   /data.tr/degoo-cache  /absolute/path/from-vault-cache_dir  none  bind  0  0
    ```
 
-   `fstab` does not expand `$HOME`; substitute the account's absolute home
-   directory and the configured cache path. Do not add `nofail`: the mount
-   should not start with an empty underlying cache if the external volume is
-   unavailable.
-5. Mount the bind entry, confirm it targets the external filesystem and is
-   still private to the owner, then start the service or mount. Keep the
-   original vault configuration and cache identity unchanged.
+   `fstab` does not expand `$HOME`; replace the placeholder with the exact
+   absolute `cache_dir` recorded in the vault configuration. The underlying
+   target directory must be empty and mode `0500` while it is unbound. Do not
+   add `nofail`: the mount should not start with an empty underlying cache if
+   the external volume is unavailable.
+5. Add a user-service drop-in with a mount-point condition for the same exact
+   cache path:
+
+   ```ini
+   [Unit]
+   ConditionPathIsMountPoint=/absolute/path/from-vault-cache_dir
+   ```
+
+   Replace the placeholder with the saved absolute `cache_dir`, then reload
+   the user manager. Mount the bind entry, confirm it targets the external
+   filesystem and is still private to the owner, then start the service or
+   mount. Keep the original vault configuration and cache identity unchanged.
 
 The ordinary startup helper continues to use the saved cache path. A bind
 mount moves the backing storage without rebinding the vault identity. The
-local copy preserves pending writes; it does not send them to Degoo. The
-current copy is complete, but its final whole-cache checksum comparison and
-bind-mount verification remain pending; do not treat the migration as complete
-until both finish.
+completed copy was SHA-256 verified across 1,886 files totaling 258.013 GiB.
+Two dirty files truncated by an out-of-space copy were restored from stable
+originals and verified by full SHA-256. All 941 physical cache data files had
+complete ranges and remained dirty after restoration. The bind mount uses the
+same recorded cache path, preserving cache identity and pending local writes;
+it does not send them to Degoo. The old local copy was removed after the copy,
+restoration, and bind verification completed. Root storage recovered about
+258 GiB; see [VALIDATION.md](VALIDATION.md) for the runtime status.
 
 ## Mounted throughput benchmark
 

@@ -7,12 +7,11 @@ cooldown-state merging and bounded metadata calls passed scoped unit, race,
 vet, and lint checks; Windows API/auth cross-compilation also passed. The final
 full Go suite passed after a small error-path fix. A rebuilt localhost FUSE
 smoke test confirmed fail-fast behavior and pending-write retention under
-cooldown. Live provider upload
-recovery with the current code remains unverified. The
-external cache copy is complete, but checksum comparison is still running;
-the migration is not yet verified. A 2 MiB logical file was previously
-published and verified after remounting with a fresh cache, including a CDN
-range read and matching full SHA-256.
+cooldown. The external cache migration is complete and checksum-verified; its
+bind mount preserves the recorded cache path and identity. Live Degoo upload
+recovery with the current code remains unverified. A 2 MiB logical file was
+previously published and verified after remounting with a fresh cache,
+including a CDN range read and matching full SHA-256.
 Root-level empty-file, overwrite, truncate, and rename readbacks passed after a
 fresh-cache remount. Nested creation, readback, rename, and deletion also
 passed, followed by an empty fresh-cache remount. An expired-token refresh
@@ -73,11 +72,14 @@ the external directory at that same recorded path and add the bind entry to
 `/etc/fstab`. Keeping the recorded path preserves the cache identity and lets
 the existing runtime helpers keep using their configured location. Use an
 owner-private destination such as `/data.tr/degoo-cache`; see
-[USAGE.md](USAGE.md) for the operator steps. This local storage move does not
-complete pending uploads or validate remote state.
-The current copy's checksum comparison is still running, but its checked
-portion has found no mismatches. Migration is not complete until the full
-comparison and bind-mount verification finish.
+[USAGE.md](USAGE.md) for the operator steps. The completed migration was
+verified by comparing SHA-256 for 1,886 cache files occupying 258.013 GiB.
+Two dirty files truncated by an out-of-space copy were restored from stable
+originals, and their full SHA-256 values matched. After restoration, all 941
+physical cache data files were dirty and had complete ranges. The source was
+bind-mounted over the unchanged configured `cache_dir`; the service startup
+guard requires that path to be a mount point. These checks establish local
+cache preservation, not remote upload completion.
 
 ### Bash command completion
 
