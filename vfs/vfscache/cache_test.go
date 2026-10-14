@@ -14,6 +14,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/lib/diskusage"
+	"github.com/rclone/rclone/lib/ranges"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
@@ -817,6 +818,55 @@ func TestCacheStats(t *testing.T) {
 	assert.Equal(t, 0, out["files"])
 	assert.Equal(t, 0, out["uploadsInProgress"])
 	assert.Equal(t, 0, out["uploadsQueued"])
+}
+
+func TestCacheStatsUsage(t *testing.T) {
+	_, c := newTestCache(t)
+	// Sparse ranges, rather than the logical file length, consume cache quota.
+	for _, test := range []struct {
+		name  string
+		size  int64
+		dirty bool
+		opens int
+		grace bool
+	}{
+		{"evictable", 10, false, 0, false},
+		{"dirty", 20, true, 0, false},
+		{"open dirty", 30, true, 1, false},
+		{"open clean", 40, false, 1, false},
+		{"grace", 50, false, 0, true},
+	} {
+		item := c.Item(test.name)
+		item.mu.Lock()
+		item.info.Size = 1000
+		item.info.Rs = ranges.Ranges{{Pos: 100, Size: test.size}}
+		item.info.Dirty = test.dirty
+		item.opens = test.opens
+		if test.grace {
+			item.graceTimer = &time.Timer{}
+		}
+		item.mu.Unlock()
+	}
+	out := c.Stats()
+	assert.Equal(t, int64(150), out["bytesUsed"])
+	assert.Equal(t, int64(50), out["bytesDirty"])
+	assert.Equal(t, int64(100), out["bytesClean"])
+	assert.Equal(t, int64(10), out["bytesEvictable"])
+	assert.Equal(t, int64(90), out["bytesPinned"])
+	assert.Equal(t, 2, out["filesDirty"])
+	assert.Equal(t, 3, out["filesClean"])
+	assert.Equal(t, 1, out["filesEvictable"])
+	assert.Equal(t, 2, out["filesPinned"])
+	// Stats reflects writes between cleaner passes and never evicts entries.
+	assert.Equal(t, 5, out["files"])
+	assert.Zero(t, c.used)
+	for _, item := range c.item {
+		item.mu.Lock()
+		item.graceTimer = nil
+		item.opens = 0
+		item.info.Dirty = false
+		item.mu.Unlock()
+	}
 }
 
 func TestCacheQueue(t *testing.T) {

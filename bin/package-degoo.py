@@ -38,6 +38,7 @@ PYTHON_HELPERS = (
     "backup_config.py",
     "sync.py",
     "status.py",
+    "stats.py",
     "benchmark.py",
     "update.py",
     "update_preflight.py",
@@ -55,7 +56,7 @@ SHELL_LAUNCHERS = (
     "scripts/install.sh", "scripts/uninstall.sh", "scripts/trash.sh",
 )
 CLI_COMMANDS = (
-    "install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "mount", "stop", "status", "update",
+    "install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "mount", "stop", "status", "stats", "update",
     "location", "folders", "service", "info", "logs", "trash", "empty-trash", "completion",
 )
 PACKAGE_ENTRIES = (

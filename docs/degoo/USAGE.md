@@ -44,7 +44,7 @@ checkout and the extracted archive use `degoo-rc` as their sole installer and
 maintenance entrypoint. Examples here use `degoo-rc`.
 
 The command set is `install`, `update`, `uninstall`, `backup-config`, `login`, `setup`,
-`mount`, `stop`, `status`, `benchmark`, `sync`, `location`, `folders`,
+`mount`, `stop`, `status`, `stats`, `benchmark`, `sync`, `location`, `folders`,
 `service`, `info`, `logs`, `trash`, `empty-trash`, and `completion`.
 Service actions are `enable`, `disable`, `start`, `stop`, `restart`, and `status`.
 Existing command options remain available. `trash` lists account trash; `empty-trash`
@@ -415,8 +415,47 @@ once per minute. If a cache path is unsafe, the mount fails closed. Cache
 write errors do not fail a successful remote read. `DirCacheFlush` clears both
 the in-memory listings and the persistent small-object cache.
 
-To inspect request and cache activity for a running mount, use its private
-statistics socket:
+To inspect a running mount without contacting Degoo:
+
+```sh
+degoo-rc stats
+degoo-rc stats --watch
+degoo-rc stats --watch --interval 5
+degoo-rc stats --json
+```
+
+The report shows a cache bar, cached bytes and files, dirty bytes awaiting
+writeback, clean bytes eligible for eviction, and clean bytes pinned by open
+handles or their grace period. Dirty bytes include open writes that are not
+yet in the upload queue. Sizes use binary units such as MiB and GiB; JSON keeps
+exact bytes. Cache use measures stored VFS byte ranges, excluding filesystem
+allocation overhead, metadata, and the separate encrypted small-object cache.
+The configured cache size is a soft target and can be exceeded by pending or
+open files. Evictable means eligible for quota-driven cleanup; this command
+does not remove cache files or wait for their age limit.
+
+It also shows queued/uploading/retrying file counts, recent upload and download
+traffic, cumulative encrypted payload bytes, HTTP attempts by operation,
+listing-cache activity, small-object cache hit/miss/fill/eviction counters,
+cache-filesystem free space, mount uptime, and Go runtime memory statistics.
+These counters reset when the mount restarts. Transfer rates use a recent
+five-second window and return to zero when idle. Upload bytes count payload
+read into HTTP requests, including failed attempts and retries; download bytes
+include ordinary encrypted object and verification reads. Multipart framing and
+wire acknowledgements are excluded. These rates describe observed traffic,
+not confirmed file publication or a network speed test.
+
+Both snapshot and watch modes use only the private local mount socket and
+local runtime state. They make no Degoo or storage requests, perform no login
+or token renewal, and do not refresh remote directory listings. A separate
+watch process does not count toward Degoo's request quota. Normal mount
+activity can continue making requests while statistics are displayed.
+Use Ctrl+C to stop watching. `--json` and `--watch` are separate modes.
+Older running mounts need an updated binary and a normal restart before the
+new runtime metrics become available; preserve pending cache data.
+
+For manually managed mounts, the native JSON command accepts an explicit
+private statistics socket:
 
 ```sh
 "$HOME/.local/share/rclone-degoo/bin/rclone" degoo stats \
@@ -424,13 +463,8 @@ statistics socket:
 ```
 
 Use the executable and socket installed for your mount if they are elsewhere.
-This is an `rclone degoo` command; the `degoo-rc` Python wrapper does not yet
-provide a `stats` subcommand.
-The command reads aggregate counters locally and does not contact Degoo. It
-reports HTTP attempts by operation, listing cache hits/misses/coalescing, and
-small-object cache hits/misses/fills/evictions. It does not show IDs, names,
-URLs, request bodies, or credentials. Live upload recovery with the current
-code has not yet been tested against Degoo.
+Statistics do not show IDs, names, URLs, request bodies, or credentials. Live
+upload recovery with the current code has not yet been tested against Degoo.
 
 The cache contains plaintext VFS data, including pending writes. The
 `cache_dir` in the private vault JSON is authoritative for the mount and its

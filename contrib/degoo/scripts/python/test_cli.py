@@ -76,10 +76,24 @@ class CLITest(unittest.TestCase):
         self.assertIn("--parent-id", self.run_cli("setup", "help").stdout)
         self.assertIn("--follow", self.run_cli("logs", "help").stdout)
         self.assertIn("account-authentication summary", self.run_cli("logs", "help").stdout)
+        stats_help = self.run_cli("stats", "help")
+        self.assertIn("--json", stats_help.stdout)
+        self.assertIn("--watch", stats_help.stdout)
+        self.assertIn("no requests to Degoo", stats_help.stdout)
         result = self.run_cli("misspelled")
         self.assertEqual(result.returncode, 2)
         self.assertIn("degoo-rc help", result.stderr)
         self.assertEqual(self.run_cli("stop", "unexpected").returncode, 2)
+
+    def test_stats_dispatches_to_the_python_command(self):
+        module = mock.Mock()
+        module.main.return_value = 0
+        with (
+            mock.patch.object(cli, "root_directory", return_value=self.root),
+            mock.patch.object(cli.importlib, "import_module", return_value=module),
+        ):
+            self.assertEqual(cli.main(["stats", "--json"]), 0)
+        module.main.assert_called_once_with(["--root", str(self.root), "--json"])
 
     def test_installed_mount_setup_uses_its_source_after_home_changes(self):
         self.install()

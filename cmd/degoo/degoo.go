@@ -822,8 +822,14 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 	rfs.Logf(nil, "degoo: vault mounted (folder ID %q, mountpoint %q)", folderID, mountpoint)
 	var syncEndpoint *syncEndpoint
 	if syncSocket != "" {
-		syncEndpoint, err = startSyncEndpoint(syncSocket, mnt.VFS, mountDF.DirCacheFlush, func() any {
-			return map[string]any{"api": mountDF.RequestStats(), "metadata_cache": mountDF.MetadataCacheStats()}
+		started := time.Now()
+		syncEndpoint, err = startSyncEndpoint(syncSocket, mnt.VFS, mountDF.DirCacheFlush, func(ctx context.Context) (any, error) {
+			runtime, err := collectRuntimeStats(ctx, mnt.VFS, started)
+			if err != nil {
+				return nil, err
+			}
+			runtime["transfer"] = mountDF.TransferStats()
+			return map[string]any{"api": mountDF.RequestStats(), "metadata_cache": mountDF.MetadataCacheStats(), "runtime": runtime}, nil
 		})
 		if err != nil {
 			unmountErr := mnt.Unmount()

@@ -704,14 +704,14 @@ def format_report(report: dict[str, Any]) -> str:
     if not pending["available"]:
         lines.append("Pending local uploads: unavailable.")
     else:
-        lines.append(f"Pending local uploads: {pending['files']} files, {pending['bytes']} bytes.")
+        lines.append(f"Pending local uploads: {pending['files']} files, {local_info._format_bytes(pending['bytes'])}.")
     lines.append(report["cloud_note"])
     live = report["live_uploads"]
     if live is not None:
         lines.append(f"Live uploads: {live['queued']} queued, {live['uploading']} uploading, {live['retrying']} retrying after failure.")
     for record in report["files"]:
         size = record.get("size_bytes")
-        size_text = f", {size} bytes" if type(size) is int else ""
+        size_text = f", {local_info._format_bytes(size)}" if type(size) is int else ""
         lines.append(
             f"File {record['path']}: {record['state']}{size_text} ({record['detail']})"
         )

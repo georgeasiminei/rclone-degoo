@@ -223,7 +223,7 @@ def _format_bytes(value: int) -> str:
         if amount < 1024 or unit == units[-1]:
             if unit == "B":
                 return f"{int(amount)} {unit}"
-            return f"{amount:.1f} {unit}"
+            return f"{amount:.2f} {unit}"
         amount /= 1024
     return f"{value} B"
 

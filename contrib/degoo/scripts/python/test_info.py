@@ -109,6 +109,15 @@ class InfoTest(unittest.TestCase):
             report = info.report(self.root, self.manifest)
         self.assertNotIn("private-token-data", report)
 
+    def test_format_bytes_uses_binary_units_with_two_decimal_precision(self) -> None:
+        for size, expected in (
+            (0, "0 B"),
+            (12, "12 B"),
+            (315751960537, "294.07 GiB"),
+        ):
+            with self.subTest(size=size):
+                self.assertEqual(info._format_bytes(size), expected)
+
     def test_auth_status_uses_expiry_hint_without_showing_tokens(self) -> None:
         auth_path = self.root / "config/auth.json"
         self.write_private(auth_path, {"token": self.jwt(2_000_000_000), "refresh_token": "do-not-show"})
@@ -254,6 +263,7 @@ class InfoTest(unittest.TestCase):
         self.assertIn("log in before cloud operations", info.authentication_status(self.root / "config/auth.json"))
 
     def test_report_uses_cached_location_and_never_prints_secrets(self) -> None:
+        self.status_script("Pending local uploads: 632 files, 315751960537 bytes\n")
         with mock.patch.object(info, "service_status", return_value="enabled; active"), mock.patch.object(
             info, "mounted_state", return_value="mounted"
         ), mock.patch.object(info, "linger_status", return_value="enabled"):
@@ -262,7 +272,8 @@ class InfoTest(unittest.TestCase):
         self.assertIn("enabled; active", report)
         self.assertIn("60G", report)
         self.assertIn("1Gi", report)
-        self.assertIn("3 files", report)
+        self.assertIn("632 files", report)
+        self.assertIn("Pending uploads: 632 files, 294.07 GiB", report)
         self.assertIn("Approximate cache allocation", report)
         self.assertIn("CLI overrides on a running mount are not confirmed", report)
         for secret in ("vault-secret", "salt-secret", "opaque-access-secret", "refresh-secret"):

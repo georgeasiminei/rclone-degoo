@@ -116,7 +116,7 @@ class StatusTest(unittest.TestCase):
         self.assertTrue(output.splitlines()[0].startswith("AUTHENTICATION ERROR:"))
         self.assertLess(output.index("AUTHENTICATION ERROR:"), output.index("MOUNT ERROR:"))
         self.assertIn("these files are local only", output)
-        self.assertIn("Pending local uploads: 0 files, 0 bytes", output)
+        self.assertIn("Pending local uploads: 0 files, 0 B.", output)
         self.assertIn("does not verify cloud contents, completeness, or integrity", output)
 
     def test_failed_configured_service_is_a_health_error(self) -> None:
@@ -152,6 +152,27 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(status.pending_uploads(self.root), (7, 2048))
         self.write_binary("Pending local uploads: 7 files, 2048 bytes\n" + "x" * (status.MAX_STATUS_OUTPUT + 10))
         self.assertIsNone(status.pending_uploads(self.root))
+
+    def test_text_report_formats_pending_and_cached_file_sizes(self) -> None:
+        report = {
+            "health_errors": [],
+            "mount": "mounted",
+            "service": "enabled; active",
+            "pending": {"available": True, "files": 632, "bytes": 315751960537},
+            "cloud_note": "Pending counts are local only.",
+            "live_uploads": None,
+            "files": [
+                {"path": "large.bin", "state": "pending", "size_bytes": 315751960537, "detail": "cached"},
+                {"path": "small.bin", "state": "pending", "size_bytes": 12, "detail": "cached"},
+            ],
+            "files_truncated": False,
+        }
+
+        output = status.format_report(report)
+
+        self.assertIn("Pending local uploads: 632 files, 294.07 GiB.", output)
+        self.assertIn("File large.bin: pending, 294.07 GiB (cached)", output)
+        self.assertIn("File small.bin: pending, 12 B (cached)", output)
 
     def test_unmounted_mount_file_is_local_only(self) -> None:
         local_file = self.root / "mount" / "notes.txt"
@@ -323,7 +344,9 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(code, 0, stderr.getvalue())
         result = json.loads(stdout.getvalue())
         self.assertEqual(result["pending"]["files"], 1)
+        self.assertEqual(result["pending"]["bytes"], 5)
         self.assertEqual(result["files"][0]["state"], "pending")
+        self.assertEqual(result["files"][0]["size_bytes"], 12)
 
 
 if __name__ == "__main__":

@@ -412,6 +412,16 @@ pending-upload status. Keep the cache until pending uploads reach zero. A
 locally saved file may still await remote upload; pending changes and their
 matching vault configuration are both needed to resume work after recovery.
 
+Use `degoo-rc stats` for human-readable cache bars, dirty/clean/evictable sizes,
+queued/uploading/retrying counts, recent upload/download rates, API and cache
+counters, and local process/disk metrics. `degoo-rc stats --watch` refreshes
+every two seconds; `--interval 5` changes the period. Use `--json` separately
+for exact byte values. Snapshot and watch modes make no new requests to Degoo
+or storage: they read counters and state over the private local mount socket.
+Traffic counters include encrypted payload retries and verification downloads;
+they do not prove logical-file publication. Update and normally restart an
+older running mount to enable the new runtime metrics, preserving its cache.
+
 `degoo-rc status` reports authentication errors first and returns nonzero when
 health checks fail. It accepts an optional file or directory path and supports
 `--json`. Per-file states are `pending`, `uploading`, `uploaded`, and `unknown`.
@@ -420,7 +430,8 @@ generic VFS mounts default it off. `uploaded` means VFS knows the current
 version has a remote representation after writeback, not that status performed
 a new remote integrity check. Files created under an unmounted mountpoint are
 reported as local-only and are never queued for upload. The private status
-socket returns aggregate queued, uploading, and retrying counts only.
+endpoint returns aggregate queued, uploading, and retrying counts only;
+the statistics endpoint adds aggregate performance counters without filenames.
 
 ## Uninstall
 

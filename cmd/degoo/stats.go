@@ -10,18 +10,59 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 
+	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/vfs"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 )
 
 const maxRequestStatsBytes = 64 * 1024
 
+// collectRuntimeStats inspects local VFS state without listing remote directories
+// or opening remote objects. Cached ranges exclude filesystem allocation overhead.
+func collectRuntimeStats(ctx context.Context, mounted *vfs.VFS, started time.Time) (map[string]any, error) {
+	stats := mounted.Stats()
+	disk, ok := stats["diskCache"].(rc.Params)
+	if !ok {
+		return nil, errors.New("VFS disk cache statistics unavailable")
+	}
+	cache := make(map[string]any)
+	for source, target := range map[string]string{
+		"bytesUsed": "bytes_used", "bytesDirty": "bytes_dirty", "bytesClean": "bytes_clean",
+		"bytesEvictable": "bytes_evictable", "bytesPinned": "bytes_pinned", "files": "files",
+		"filesDirty": "files_dirty", "filesClean": "files_clean", "filesEvictable": "files_evictable", "filesPinned": "files_pinned",
+		"maxBytes": "max_bytes", "minFreeBytes": "min_free_bytes", "outOfSpace": "out_of_space",
+		"diskTotalBytes": "disk_total_bytes", "diskFreeBytes": "disk_free_bytes",
+		"maxAgeSeconds": "max_age_seconds", "pollIntervalSeconds": "poll_interval_seconds",
+		"erroredFiles": "errored_files",
+	} {
+		if value, found := disk[source]; found {
+			cache[target] = value
+		}
+	}
+	queue, err := queueStatus(ctx, mounted)
+	if err != nil {
+		return nil, err
+	}
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	return map[string]any{
+		"cache":   cache,
+		"uploads": queue,
+		"process": map[string]any{
+			"uptime_seconds": time.Since(started).Seconds(), "goroutines": runtime.NumGoroutine(),
+			"heap_alloc_bytes": memory.HeapAlloc, "heap_sys_bytes": memory.HeapSys, "sys_bytes": memory.Sys,
+		},
+	}, nil
+}
+
 func addStatsCommand(root *cobra.Command) {
 	var socket string
 	command := &cobra.Command{
-		Use: "stats", Short: "Show request and metadata-cache counters from a running vault mount.",
+		Use: "stats", Short: "Show local cache, transfer, and request counters from a running vault mount.",
 		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			stats, err := readRequestStats(command.Context(), socket)

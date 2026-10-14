@@ -48,10 +48,10 @@ type syncEndpoint struct {
 	socketIno    uint64
 	refreshMu    sync.Mutex
 	updates      *updateControl
-	requestStats func() any
+	requestStats func(context.Context) (any, error)
 }
 
-func startSyncEndpoint(socketPath string, mountedVFS *vfs.VFS, flushRaw func(), stats ...func() any) (*syncEndpoint, error) {
+func startSyncEndpoint(socketPath string, mountedVFS *vfs.VFS, flushRaw func(), stats ...func(context.Context) (any, error)) (*syncEndpoint, error) {
 	if mountedVFS == nil || flushRaw == nil {
 		return nil, errors.New("invalid sync endpoint configuration")
 	}
@@ -172,7 +172,12 @@ func (handler *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeSyncError(w, http.StatusServiceUnavailable, "request statistics unavailable")
 			return
 		}
-		writeSyncJSON(w, http.StatusOK, handler.endpoint.requestStats())
+		stats, err := handler.endpoint.requestStats(r.Context())
+		if err != nil {
+			writeSyncError(w, http.StatusInternalServerError, "mount statistics unavailable")
+			return
+		}
+		writeSyncJSON(w, http.StatusOK, stats)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/update/") {

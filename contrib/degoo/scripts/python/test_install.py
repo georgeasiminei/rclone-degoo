@@ -258,6 +258,7 @@ class InstallTest(unittest.TestCase):
         self.assertIn("$ROOT/tools:/usr/bin:/bin", mount_wrapper)
         self.assertTrue((self.root / "scripts/python/install.py").is_file())
         self.assertTrue((self.root / "scripts/python/cli.py").is_file())
+        self.assertTrue((self.root / "scripts/python/stats.py").is_file())
         self.assertTrue((self.root / "scripts/install.sh").is_file())
         self.assertTrue((self.root / "scripts/trash.sh").is_file())
         self.assertEqual(os.readlink(self.home / ".local/bin/degoo-rc"), str(self.root / "degoo-rc"))
@@ -266,6 +267,15 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.root / "install.py").exists())
         self.assertEqual(list(self.root.glob("*.sh")), [])
         self.assertIn("scripts/python/login.py", (self.root / "scripts/login.sh").read_text())
+        stats_help = subprocess.run(
+            [str(self.root / "degoo-rc"), "stats", "help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(stats_help.returncode, 0, stats_help.stderr)
+        self.assertIn("--watch", stats_help.stdout)
+        self.assertIn("makes no requests to Degoo", stats_help.stdout)
         for wrapper in (self.root / "scripts").glob("*.sh"):
             result = subprocess.run(["/bin/sh", "-n", str(wrapper)], check=False, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, f"{wrapper.name}: {result.stderr}")

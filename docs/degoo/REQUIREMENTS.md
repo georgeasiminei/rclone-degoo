@@ -106,11 +106,27 @@ These points are the binding product requirements recorded from the user.
 - `degoo-rc status` reports authentication failures before mount, service, and
   pending-upload health. An unhealthy report returns a nonzero exit status;
   `--json` provides machine-readable output. Per-file status is available for
-  a selected file or directory. The private mount socket reports aggregate
-  queued, uploading, and retrying counts only.
+  a selected file or directory. The private mount status endpoint reports
+  aggregate queued, uploading, and retrying counts only; the statistics
+  endpoint adds aggregate performance counters without filenames.
 - Runtime status and Degoo diagnostics use the private `status.log` and
   `diagnostics.log` files. Command failures are kept concise, without Cobra
   usage blocks, and displayed log lines redact recognized credentials.
+
+### Local performance statistics
+
+- Provide `degoo-rc stats` with human-readable sizes and cache bars, an optional
+  live display, and exact byte counters in JSON output.
+- Show cache use, dirty bytes still awaiting writeback, and clean bytes eligible
+  for eviction. Distinguish clean bytes pinned by open handles or their grace
+  period from evictable bytes.
+- Report recent remote transfer throughput, upload queue counts, API request
+  counters, cache activity, and available local process and disk metrics.
+- Reading statistics, including repeated live refreshes, must make no new
+  requests to Degoo or object storage and must not renew authentication. Use
+  counters collected during ordinary mount work and local runtime state.
+- Show pending-upload sizes in human-readable units in ordinary status and
+  information reports; preserve exact byte values in machine-readable output.
 
 ### Mounted benchmarks
 

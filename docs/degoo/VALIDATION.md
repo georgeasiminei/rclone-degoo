@@ -8,6 +8,41 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Local performance statistics — 2026-10-14
+
+`degoo-rc stats` reads aggregate counters from the private mount socket and
+supports cache bars, human-readable sizes, JSON, and live local refreshes.
+The VFS snapshot separates dirty, clean, evictable, and open/grace-period
+pinned cached ranges. Existing upload/download bodies collect recent rates
+and cumulative encrypted payload bytes, including retries and verification
+reads. Request and metadata-cache counters, local disk space, uptime, and
+runtime memory are also displayed. Ordinary `status` and `info` show binary
+units in text reports; `status --json` retains exact byte values.
+
+Validation passed:
+
+- The full credential-free Go suite with the freshly built binary on `PATH`
+  and `RCLONE_CONFIG=/notfound` (186 packages passed), plus all 424 Python
+  helper tests, including 29 focused statistics/CLI/completion checks.
+- Focused Go tests for Degoo commands, backend/API/auth, VFS and its cache,
+  downloaders, and writeback queue. A cache regression first reproduced stale
+  usage and missing classifications, then passed with sparse-range accounting.
+- A local socket regression reads statistics repeatedly while a wrapped
+  filesystem refuses remote metadata calls; no such calls occur and pending
+  writes remain available. Error replies do not expose internal details.
+- Upload HTTP fixtures verify payload-only accounting on successful and failed
+  attempts, in-flight counts, rolling-rate expiry, concurrent snapshots, and
+  received-body download accounting. No Degoo service is contacted.
+- Race detection for `cmd/degoo`, `backend/degoo/api`, and `vfs/vfscache`;
+  scoped golangci-lint; a fresh Go build; package self-check and a real archive
+  build; scoped Markdown lint and `git diff --check`.
+- Both opt-in localhost FUSE tests (`TestVaultNativeMount` and
+  `TestVaultUploadStatusNativeMount`) passed with generated encrypted data.
+
+These checks did not change the installed service or vault and did not make
+Degoo requests. Existing running mounts require a normal restart with the new
+binary before they expose runtime statistics; retain pending cache data.
+
 ## Bash command completion — 2026-10-13
 
 `degoo-rc completion bash` generates completion for command names, help topics,
