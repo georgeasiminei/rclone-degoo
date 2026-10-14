@@ -1019,3 +1019,91 @@ and preserving vault/cache bytes without startup when final login fails.
 These changes affect Python helpers and documentation only. No live cloud
 benchmark or fresh installation over the user's vault was run. The upload
 state is a local VFS observation, not an independent remote integrity check.
+
+## API cooldown, listing cache, and writeback retry validation — 2026-10-14
+
+The follow-up source changes passed the final validation available for this
+run:
+
+- Build passed. Degoo auth, API, backend, command, and writeback unit tests,
+  scoped race tests, `go vet`, and scoped lint passed with no issues.
+- The final credential-free `go test ./...` passed after a small
+  rate-limit-persistence error-path fix. The command used the freshly built
+  rclone first on `PATH` and private XFS-backed temporary directories for both
+  `TMPDIR` and `GOTMPDIR`.
+- The first full-suite attempt used the host-installed rclone and default
+  tmpfs-backed temporary directories. The host binary lacked a command used
+  by tests, tmpfs did not support required xattrs, and a non-private
+  socket-parent path failed the command's safety check. These were environment
+  setup failures; the corrected final run passed.
+- Windows API/auth cross-compilation passed. This verifies compilation only;
+  the non-Unix fallback does not provide the Linux cross-process `flock`
+  behavior.
+- API tests cover the five-second `GetFileChildren5` snapshot, 32-parent
+  bound, expiry, explicit and mutation invalidation, and generation protection
+  against stale in-flight results. Cooldown tests cover preinitialized clients
+  re-reading the sidecar, keeping the longest concurrent deadline when a
+  shorter 429 races with it, rejecting unsafe or symlink lock files, avoiding
+  a token refresh after an in-flight 401 arrives during another process's
+  cooldown, and returning the longest deadline when persistence fails.
+- Metadata lookup tests verify a ten-second total deadline across all listing
+  pages and retries, and that caller cancellation remains effective. A
+  paginated fixture blocks its second page and confirms both pages share the
+  same lookup deadline.
+- Writeback tests verify that wrapped `Retry-After` deadlines schedule pending
+  writes in the VFS queue, prevent an early retry, and preserve ordinary
+  backoff behavior after an expired deadline.
+
+A rebuilt native Linux FUSE smoke test against a localhost HTTP fixture passed.
+A matching root-validation proof allowed the mount to initialize while a
+persisted cooldown was active, with zero HTTP requests sent during the hold. A
+generated 47-byte dirty write remained pending. Native `ls` received `EIO` in
+about 3 ms instead of hanging or reporting an empty remote. After the short
+fixture cooldown expired, reading the generated data returned the expected
+bytes. Rejected upload authorization preserved the pending write, and normal
+unmount completed. This verifies local fail-fast and retention behavior; it
+does not exercise Degoo's live service.
+
+The captured live `GetFileChildren5` 429 requested a retry after
+`2026-10-14 17:06:16 EEST`; the already-running mount retried until it was
+stopped. The follow-up validation made no live upload-recovery claim. Live
+provider upload recovery with the current code remains unverified.
+
+### Production cooldown and external-cache migration — 2026-10-14
+
+The captured `GetFileChildren5` response requested retry after `2026-10-14
+17:06:16 EEST`; the persisted deadline was conservatively rounded to `17:06:17
+EEST`. While the production mount was under that hold, native `ls` returned
+`EIO` in 0.0029 seconds. One process-level INET-socket inventory showed zero
+sockets, but this snapshot is not packet-level proof that no request was sent
+over the entire cooldown. Startup logs contained 941 retry messages scheduling
+the next attempts about 16 hours 49 minutes later. These messages describe
+local scheduling, not requests reaching Degoo.
+
+The prior mount became stuck and required exceptional recovery. The mount
+process was paused and the cache filesystem was flushed; there were no active
+writer file descriptors, and the remaining cached-data descriptors were read-
+only. The stalled FUSE connection was aborted, then normal unmount and service
+stop completed. This was a one-time recovery after confirming there were no
+active writers, not a routine cache-migration step. Live Degoo upload recovery
+after the recorded deadline remains unverified and is still an acceptance
+gate.
+
+The external cache migration is complete. SHA-256 comparison confirmed all
+1,886 cache files, totaling 258.013 GiB, matched source and destination before
+repair. Two dirty files truncated by `ENOSPC` during the original copy into
+the mounted vault were restored from stable originals; their complete SHA-256
+values matched. After repair, all 941 physical cache data files were marked
+dirty and had complete ranges. The cache was bind-mounted from
+`/data.tr/degoo-cache` onto the unchanged recorded `cache_dir`, preserving
+cache identity and pending writes. The source directory is mode `0700`; the
+empty underlying target is mode `0500`, and the user-service drop-in uses
+`ConditionPathIsMountPoint` on the saved cache path. The external filesystem
+must be mounted before the service starts.
+
+After full copy verification, restoration, and bind-mount checks, the old local
+cache was removed. Root storage recovered approximately 258 GiB and now has
+264 GiB available (41% used); the external data volume has 142 GiB available. The
+service remained active and unchanged. Its status showed 941 queued and
+retrying uploads, zero uploading, and 277,364,333,920 pending bytes. This is
+local queue status, not proof of remote completion.

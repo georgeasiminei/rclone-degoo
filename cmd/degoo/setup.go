@@ -44,7 +44,11 @@ func setupAPI(ctx context.Context, m configmap.Getter) (*api.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return api.New(client, tokens, get("api_url"), get("api_key")), nil
+	apiClient := api.New(client, tokens, get("api_url"), get("api_key"))
+	if err := apiClient.SetRateLimitFile(get("auth_file") + ".rate-limit.json"); err != nil {
+		return nil, fmt.Errorf("degoo: load provider rate-limit state: %w", err)
+	}
+	return apiClient, nil
 }
 
 func withCredentialsFile(m configmap.Getter, filename string) configmap.Getter {

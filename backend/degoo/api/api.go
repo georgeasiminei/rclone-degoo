@@ -2,6 +2,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -9,10 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +31,13 @@ import (
 
 const maxLimit = 1000
 const maxRetryAfter = 5 * time.Minute
+const defaultRateLimitCooldown = time.Minute
+const rateLimitLockTimeout = 5 * time.Second
+const metadataCacheTTL = 5 * time.Second
+const metadataCacheMaxEntries = 32
+
+const unixToInternalSeconds = 62135596800
+const maxUnixTimeSeconds = int64(math.MaxInt64) - unixToInternalSeconds
 
 // ErrAlreadyExists indicates that Degoo already has the requested content.
 var ErrAlreadyExists = errors.New("degoo content already exists")
@@ -153,7 +164,64 @@ type Client struct {
 	gql    *rest.Client
 	tokens TokenSource
 
-	refreshMu sync.Mutex
+	refreshMu          sync.Mutex
+	rateLimitMu        sync.Mutex
+	rateLimitFile      string
+	rateLimitTill      time.Time
+	metadataMu         sync.Mutex
+	metadataGeneration uint64
+	metadataCache      map[string]metadataCacheEntry
+}
+
+type metadataCacheEntry struct {
+	items     []Item
+	expires   time.Time
+	createdAt time.Time
+}
+
+type rateLimitFileState struct {
+	Version   int   `json:"version"`
+	UntilUnix int64 `json:"until_unix"`
+}
+
+// RateLimitError reports that Degoo has asked the client to stop making
+// requests until Until. It unwraps to the sanitized API error when available.
+type RateLimitError struct {
+	Until      time.Time
+	operation  string
+	err        error
+	persistErr error
+}
+
+// Error returns a sanitized rate-limit deadline without exposing response data.
+func (err *RateLimitError) Error() string {
+	if err == nil {
+		return "degoo API rate limit is active"
+	}
+	message := "degoo API rate limit is active until " + err.Until.UTC().Format(time.RFC3339)
+	if err.operation != "" {
+		message += " (operation " + err.operation + ")"
+	}
+	if err.persistErr != nil {
+		message += "; local cooldown could not be persisted"
+	}
+	return message
+}
+
+// Unwrap returns the sanitized API error that started the cooldown.
+func (err *RateLimitError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.err
+}
+
+// RetryAfter returns the time when the rate limit expires.
+func (err *RateLimitError) RetryAfter() time.Time {
+	if err == nil {
+		return time.Time{}
+	}
+	return err.Until
 }
 
 // New creates a Degoo API client. A nil HTTP client uses http.DefaultClient.
@@ -166,6 +234,268 @@ func New(httpClient *http.Client, tokens TokenSource, graphqlURL, apiKey string)
 		gql:    rest.NewClient(httpClient).SetRoot(graphqlURL).SetHeader("Content-Type", "application/json").SetHeader("x-api-key", apiKey).SetErrorHandler(safeHTTPError),
 		tokens: tokens,
 	}
+}
+
+// SetRateLimitFile loads and persists the provider cooldown in an owner-private
+// sidecar. A missing file is accepted; malformed or unsafe files are rejected.
+func (c *Client) SetRateLimitFile(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("degoo rate limit file path is required")
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve Degoo rate limit sidecar path: %w", err)
+	}
+	lockCtx, cancel := context.WithTimeout(context.Background(), rateLimitLockTimeout)
+	defer cancel()
+	err = auth.WithPrivateFileLock(lockCtx, absolute, func() error {
+		savedUntil, err := readRateLimitFile(absolute)
+		if err != nil {
+			return fmt.Errorf("could not read private Degoo rate limit sidecar: %w", err)
+		}
+
+		c.rateLimitMu.Lock()
+		defer c.rateLimitMu.Unlock()
+		if c.rateLimitFile != "" && c.rateLimitFile != absolute {
+			return errors.New("degoo rate limit sidecar is already configured")
+		}
+		previousPath := c.rateLimitFile
+		c.rateLimitFile = absolute
+		if err := c.mergeRateLimitFileLocked(savedUntil); err != nil {
+			c.rateLimitFile = previousPath
+			return fmt.Errorf("could not persist private Degoo rate limit sidecar: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("coordinate private Degoo rate limit sidecar: %w", err)
+	}
+	return nil
+}
+
+func readRateLimitFile(path string) (time.Time, error) {
+	data, err := auth.ReadPrivateFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	until, err := decodeRateLimitFile(data)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("degoo rate limit sidecar is invalid: %w", err)
+	}
+	return until, nil
+}
+
+func decodeRateLimitFile(data []byte) (time.Time, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var state rateLimitFileState
+	if err := decoder.Decode(&state); err != nil {
+		return time.Time{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return time.Time{}, errors.New("unexpected trailing data")
+	}
+	if state.Version != 1 || state.UntilUnix <= 0 || state.UntilUnix > maxUnixTimeSeconds {
+		return time.Time{}, errors.New("unsupported version or invalid deadline")
+	}
+	return time.Unix(state.UntilUnix, 0).UTC(), nil
+}
+
+// mergeRateLimitFileLocked keeps the in-memory and persisted deadlines monotonic.
+// The caller holds both the sidecar file lock and rateLimitMu.
+func (c *Client) mergeRateLimitFileLocked(savedUntil time.Time) error {
+	if savedUntil.After(c.rateLimitTill) {
+		c.rateLimitTill = savedUntil
+	}
+	if c.rateLimitFile == "" || c.rateLimitTill.IsZero() || !time.Now().Before(c.rateLimitTill) || !c.rateLimitTill.After(savedUntil) {
+		return nil
+	}
+	untilUnix := c.rateLimitTill.UTC().Unix()
+	if c.rateLimitTill.Nanosecond() != 0 && untilUnix < maxUnixTimeSeconds {
+		untilUnix++
+	}
+	if untilUnix > maxUnixTimeSeconds {
+		untilUnix = maxUnixTimeSeconds
+	}
+	data, err := json.Marshal(rateLimitFileState{Version: 1, UntilUnix: untilUnix})
+	if err != nil {
+		return errors.New("could not encode Degoo rate limit sidecar")
+	}
+	return auth.WritePrivateFile(c.rateLimitFile, append(data, '\n'))
+}
+
+func (c *Client) checkRateLimit(ctx context.Context, operation string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.rateLimitMu.Lock()
+	path := c.rateLimitFile
+	until := c.rateLimitTill
+	c.rateLimitMu.Unlock()
+	var persistErr error
+	if path != "" {
+		lockCtx, cancel := context.WithTimeout(ctx, rateLimitLockTimeout)
+		defer cancel()
+		err := auth.WithPrivateFileLock(lockCtx, path, func() error {
+			savedUntil, err := readRateLimitFile(path)
+			if err != nil {
+				return fmt.Errorf("could not read private Degoo rate limit sidecar: %w", err)
+			}
+			c.rateLimitMu.Lock()
+			defer c.rateLimitMu.Unlock()
+			if err := c.mergeRateLimitFileLocked(savedUntil); err != nil {
+				persistErr = fmt.Errorf("could not persist private Degoo rate limit sidecar: %w", err)
+			}
+			until = c.rateLimitTill
+			return nil
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			c.rateLimitMu.Lock()
+			if c.rateLimitTill.After(until) {
+				until = c.rateLimitTill
+			}
+			c.rateLimitMu.Unlock()
+			if !until.IsZero() && time.Now().Before(until) {
+				return &RateLimitError{Until: until, operation: operation, persistErr: err}
+			}
+			return fmt.Errorf("coordinate private Degoo rate limit sidecar: %w", err)
+		}
+	}
+	if until.IsZero() || !time.Now().Before(until) {
+		if persistErr != nil {
+			return persistErr
+		}
+		return nil
+	}
+	return &RateLimitError{Until: until, operation: operation, persistErr: persistErr}
+}
+
+// ClearMetadataCache discards cached directory listings and invalidates
+// results from listing requests that were already in flight.
+func (c *Client) ClearMetadataCache() {
+	c.metadataMu.Lock()
+	c.metadataGeneration++
+	c.metadataCache = nil
+	c.metadataMu.Unlock()
+}
+
+func cloneItems(items []Item) []Item {
+	copyItems := make([]Item, len(items))
+	copy(copyItems, items)
+	return copyItems
+}
+
+func (c *Client) cachedListDir(parentID string, generation uint64) ([]Item, bool) {
+	c.metadataMu.Lock()
+	defer c.metadataMu.Unlock()
+	if generation != c.metadataGeneration {
+		return nil, false
+	}
+	now := time.Now()
+	for key, entry := range c.metadataCache {
+		if !now.Before(entry.expires) {
+			delete(c.metadataCache, key)
+		}
+	}
+	entry, ok := c.metadataCache[parentID]
+	if !ok || !now.Before(entry.expires) {
+		return nil, false
+	}
+	return cloneItems(entry.items), true
+}
+
+func (c *Client) cacheListDir(parentID string, items []Item, generation uint64) {
+	c.metadataMu.Lock()
+	defer c.metadataMu.Unlock()
+	if generation != c.metadataGeneration {
+		return
+	}
+	now := time.Now()
+	if c.metadataCache == nil {
+		c.metadataCache = make(map[string]metadataCacheEntry)
+	}
+	for key, entry := range c.metadataCache {
+		if !now.Before(entry.expires) {
+			delete(c.metadataCache, key)
+		}
+	}
+	if _, exists := c.metadataCache[parentID]; !exists && len(c.metadataCache) >= metadataCacheMaxEntries {
+		oldestKey := ""
+		var oldestTime time.Time
+		haveOldest := false
+		for key, entry := range c.metadataCache {
+			if !haveOldest || entry.createdAt.Before(oldestTime) {
+				oldestKey = key
+				oldestTime = entry.createdAt
+				haveOldest = true
+			}
+		}
+		if haveOldest {
+			delete(c.metadataCache, oldestKey)
+		}
+	}
+	c.metadataCache[parentID] = metadataCacheEntry{
+		items:     cloneItems(items),
+		expires:   now.Add(metadataCacheTTL),
+		createdAt: now,
+	}
+}
+
+func (c *Client) rateLimited(operation string, resp *http.Response, cause error) error {
+	now := time.Now().UTC()
+	var until time.Time
+	var ok bool
+	if resp != nil {
+		until, ok = retryAfterUntil(resp.Header.Get("Retry-After"), now)
+	}
+	if !ok {
+		until = now.Add(defaultRateLimitCooldown)
+	}
+
+	c.rateLimitMu.Lock()
+	previous := c.rateLimitTill
+	if until.After(c.rateLimitTill) {
+		c.rateLimitTill = until
+	}
+	path := c.rateLimitFile
+	c.rateLimitMu.Unlock()
+	var persistErr error
+	if path != "" {
+		lockCtx, cancel := context.WithTimeout(context.Background(), rateLimitLockTimeout)
+		persistErr = auth.WithPrivateFileLock(lockCtx, path, func() error {
+			savedUntil, err := readRateLimitFile(path)
+			if err != nil {
+				return fmt.Errorf("could not read private Degoo rate limit sidecar: %w", err)
+			}
+			c.rateLimitMu.Lock()
+			defer c.rateLimitMu.Unlock()
+			if until.After(c.rateLimitTill) {
+				c.rateLimitTill = until
+			}
+			if savedUntil.After(c.rateLimitTill) {
+				c.rateLimitTill = savedUntil
+			}
+			if err := c.mergeRateLimitFileLocked(savedUntil); err != nil {
+				return fmt.Errorf("could not persist private Degoo rate limit sidecar: %w", err)
+			}
+			until = c.rateLimitTill
+			return nil
+		})
+		cancel()
+	}
+	c.rateLimitMu.Lock()
+	until = c.rateLimitTill
+	c.rateLimitMu.Unlock()
+	if until.After(previous) {
+		fs.Logf(nil, "degoo API rate limited operation=%s retry_utc=%s", operation, until.UTC().Format(time.RFC3339))
+	}
+	return &RateLimitError{Until: until, operation: operation, err: cause, persistErr: persistErr}
 }
 
 func safeHTTPError(resp *http.Response) error {
@@ -427,6 +757,10 @@ type graphQLEnvelope struct {
 // HTTPStatus returns the HTTP status attached to an API error, or zero when
 // the error did not come from an HTTP response.
 func HTTPStatus(err error) int {
+	var rateLimitErr *RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		return http.StatusTooManyRequests
+	}
 	var apiErr *Error
 	if errors.As(err, &apiErr) {
 		return apiErr.statusCode
@@ -437,6 +771,10 @@ func HTTPStatus(err error) int {
 // Retryable reports whether an API or transport error may succeed if retried.
 func Retryable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var rateLimitErr *RateLimitError
+	if errors.As(err, &rateLimitErr) {
 		return false
 	}
 	var apiErr *Error
@@ -538,6 +876,50 @@ func retryAfter(header string) time.Duration {
 	return min(d, maxRetryAfter)
 }
 
+func retryAfterUntil(header string, now time.Time) (time.Time, bool) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return time.Time{}, false
+	}
+	if decimalHeader(header) {
+		seconds, err := strconv.ParseUint(header, 10, 64)
+		if err != nil {
+			return maxRepresentableTime(), true
+		}
+		if seconds == 0 {
+			return time.Time{}, false
+		}
+		return addSecondsSaturated(now, seconds), true
+	}
+	when, err := http.ParseTime(header)
+	if err != nil || !when.After(now) {
+		return time.Time{}, false
+	}
+	return when.UTC(), true
+}
+
+func decimalHeader(header string) bool {
+	for _, char := range header {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return header != ""
+}
+
+func addSecondsSaturated(now time.Time, seconds uint64) time.Time {
+	now = now.UTC()
+	base := now.Unix()
+	if base < 0 || base >= maxUnixTimeSeconds || seconds > uint64(maxUnixTimeSeconds-base) {
+		return maxRepresentableTime()
+	}
+	return time.Unix(base+int64(seconds), int64(now.Nanosecond())).UTC()
+}
+
+func maxRepresentableTime() time.Time {
+	return time.Unix(maxUnixTimeSeconds, 999999999).UTC()
+}
+
 func withRetryAfter(err error, resp *http.Response, mutation bool) error {
 	if mutation || resp == nil || !Retryable(err) {
 		return err
@@ -599,12 +981,22 @@ func canRefreshGraphQL(mutation bool, data json.RawMessage, errs []graphQLError)
 }
 
 func (c *Client) graphql(ctx context.Context, operation, query string, variables map[string]any, result any, mutation bool) error {
+	if mutation {
+		c.ClearMetadataCache()
+		defer c.ClearMetadataCache()
+	}
+	if err := c.checkRateLimit(ctx, operation); err != nil {
+		return err
+	}
 	token, err := c.tokenForRequest(ctx)
 	if err != nil {
 		return &Error{operation: operation, message: "cannot obtain access token", err: err}
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
+		if err := c.checkRateLimit(ctx, operation); err != nil {
+			return err
+		}
 		vars := make(map[string]any, len(variables)+1)
 		for key, value := range variables {
 			vars[key] = value
@@ -622,7 +1014,13 @@ func (c *Client) graphql(ctx context.Context, operation, query string, variables
 		}
 		if callErr != nil {
 			apiErr := &Error{operation: operation, statusCode: status, message: "HTTP request failed", err: callErr}
+			if status == http.StatusTooManyRequests {
+				return c.rateLimited(operation, resp, apiErr)
+			}
 			if attempt == 0 && isUnauthorized(status, nil) {
+				if err := c.checkRateLimit(ctx, operation); err != nil {
+					return err
+				}
 				token, err = c.refreshToken(ctx, token)
 				if err != nil {
 					return &Error{operation: operation, message: "cannot refresh access token", err: err}
@@ -639,6 +1037,9 @@ func (c *Client) graphql(ctx context.Context, operation, query string, variables
 			}
 			apiErr := &Error{operation: operation, message: "GraphQL request failed", graphQLErrors: gqlErrors}
 			if attempt == 0 && canRefreshGraphQL(mutation, envelope.Data, gqlErrors) {
+				if err := c.checkRateLimit(ctx, operation); err != nil {
+					return err
+				}
 				token, err = c.refreshToken(ctx, token)
 				if err != nil {
 					return &Error{operation: operation, message: "cannot refresh access token", err: err}
@@ -658,9 +1059,39 @@ func (c *Client) graphql(ctx context.Context, operation, query string, variables
 	return &Error{operation: operation, message: "access token remained unauthorized after refresh"}
 }
 
-// ListDir returns every item under parentID, requesting at most 1,000 items
-// per page. It rejects repeated item IDs and repeated pagination cursors.
+// ListDir returns a short-lived cached directory snapshot when available and
+// otherwise loads every item under parentID, requesting at most 1,000 items per
+// page. It rejects repeated item IDs and repeated pagination cursors.
 func (c *Client) ListDir(ctx context.Context, parentID string) ([]Item, error) {
+	if err := c.checkRateLimit(ctx, "GetFileChildren5"); err != nil {
+		return nil, err
+	}
+	c.metadataMu.Lock()
+	generation := c.metadataGeneration
+	c.metadataMu.Unlock()
+	if items, ok := c.cachedListDir(parentID, generation); ok {
+		return items, nil
+	}
+	items, err := c.listDirUncached(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	c.cacheListDir(parentID, items, generation)
+	return items, nil
+}
+
+// ListDirFresh loads every item under parentID without reading or storing a
+// cached snapshot. It clears existing and in-flight snapshots around the read.
+func (c *Client) ListDirFresh(ctx context.Context, parentID string) ([]Item, error) {
+	if err := c.checkRateLimit(ctx, "GetFileChildren5"); err != nil {
+		return nil, err
+	}
+	c.ClearMetadataCache()
+	defer c.ClearMetadataCache()
+	return c.listDirUncached(ctx, parentID)
+}
+
+func (c *Client) listDirUncached(ctx context.Context, parentID string) ([]Item, error) {
 	items := make([]Item, 0)
 	seenIDs := make(map[string]struct{})
 	seenTokens := make(map[string]struct{})
@@ -820,6 +1251,11 @@ func (c *Client) Upload(ctx context.Context, auth AuthData, name, checksum strin
 	if err := validateUploadBaseURL(auth.BaseURL); err != nil {
 		return err
 	}
+	c.ClearMetadataCache()
+	defer c.ClearMetadataCache()
+	if err := c.checkRateLimit(ctx, "GCS upload"); err != nil {
+		return err
+	}
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
@@ -860,14 +1296,22 @@ func (c *Client) Upload(ctx context.Context, auth AuthData, name, checksum strin
 		if resp != nil {
 			status = resp.StatusCode
 		}
-		return &Error{operation: "GCS upload", statusCode: status, message: "storage request failed", err: err}
+		apiErr := &Error{operation: "GCS upload", statusCode: status, message: "storage request failed", err: err}
+		if status == http.StatusTooManyRequests {
+			return c.rateLimited("GCS upload", resp, apiErr)
+		}
+		return apiErr
 	}
 	if resp == nil || (resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent) {
 		status := 0
 		if resp != nil {
 			status = resp.StatusCode
 		}
-		return &Error{operation: "GCS upload", statusCode: status, message: fmt.Sprintf("unexpected HTTP status %d", status)}
+		apiErr := &Error{operation: "GCS upload", statusCode: status, message: fmt.Sprintf("unexpected HTTP status %d", status)}
+		if status == http.StatusTooManyRequests {
+			return c.rateLimited("GCS upload", resp, apiErr)
+		}
+		return apiErr
 	}
 	return nil
 }
@@ -1017,6 +1461,9 @@ func (c *Client) Download(ctx context.Context, downloadURL, rangeHeader string) 
 			return nil, fmt.Errorf("invalid requested range %q", rangeHeader)
 		}
 	}
+	if err := c.checkRateLimit(ctx, "download"); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return nil, &Error{operation: "download", message: "invalid download request", err: err}
@@ -1031,13 +1478,21 @@ func (c *Client) Download(ctx context.Context, downloadURL, rangeHeader string) 
 	if rangeHeader == "" {
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
-			return nil, &Error{operation: "download", statusCode: resp.StatusCode, message: fmt.Sprintf("unexpected HTTP status %d for full download", resp.StatusCode)}
+			apiErr := &Error{operation: "download", statusCode: resp.StatusCode, message: fmt.Sprintf("unexpected HTTP status %d for full download", resp.StatusCode)}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				return nil, c.rateLimited("download", resp, apiErr)
+			}
+			return nil, apiErr
 		}
 		return resp, nil
 	}
 	if resp.StatusCode != http.StatusPartialContent {
 		_ = resp.Body.Close()
-		return nil, &Error{operation: "download", statusCode: resp.StatusCode, message: fmt.Sprintf("unexpected HTTP status %d for range request", resp.StatusCode)}
+		apiErr := &Error{operation: "download", statusCode: resp.StatusCode, message: fmt.Sprintf("unexpected HTTP status %d for range request", resp.StatusCode)}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, c.rateLimited("download", resp, apiErr)
+		}
+		return nil, apiErr
 	}
 	if err := rest.CheckContentRange(resp, []fs.OpenOption{rangeOption}, -1); err != nil {
 		_ = resp.Body.Close()

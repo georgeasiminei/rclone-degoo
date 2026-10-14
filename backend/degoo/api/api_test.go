@@ -12,8 +12,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,9 +29,11 @@ type testTokens struct {
 	initial   string
 	refreshed string
 	refreshes atomic.Int32
+	calls     atomic.Int32
 }
 
 func (tokens *testTokens) Token(context.Context) (string, error) {
+	tokens.calls.Add(1)
 	if tokens.refreshes.Load() != 0 && tokens.refreshed != "" {
 		return tokens.refreshed, nil
 	}
@@ -441,6 +445,317 @@ func TestListDirRejectsDuplicateIDsAcrossPages(t *testing.T) {
 	}
 }
 
+func TestListDirUsesShortLivedDefensiveCache(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{
+			"Items": []map[string]string{{"ID": "item", "Name": "original"}},
+		}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+
+	first, err := client.ListDir(context.Background(), "parent")
+	if err != nil {
+		t.Fatalf("first ListDir: %v", err)
+	}
+	first[0].Name = "caller mutation"
+	second, err := client.ListDir(context.Background(), "parent")
+	if err != nil {
+		t.Fatalf("second ListDir: %v", err)
+	}
+	if second[0].Name != "original" {
+		t.Fatalf("cached item after caller changed prior result = %q, want original", second[0].Name)
+	}
+	second[0].Name = "second caller mutation"
+	third, err := client.ListDir(context.Background(), "parent")
+	if err != nil {
+		t.Fatalf("third ListDir: %v", err)
+	}
+	if third[0].Name != "original" || requests.Load() != 1 {
+		t.Fatalf("third result/request count = %q/%d, want original/1", third[0].Name, requests.Load())
+	}
+
+	client.metadataMu.Lock()
+	entry, ok := client.metadataCache["parent"]
+	client.metadataMu.Unlock()
+	if !ok {
+		t.Fatal("successful ListDir did not populate metadata cache")
+	}
+	remaining := time.Until(entry.expires)
+	if remaining <= 0 || remaining > metadataCacheTTL {
+		t.Fatalf("cache lifetime remaining = %v, want (0, %v]", remaining, metadataCacheTTL)
+	}
+}
+
+func TestListDirCacheExpiryAndExplicitClear(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		page := requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{
+			"Items": []map[string]string{{"ID": strconv.Itoa(int(page)), "Name": "item"}},
+		}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+
+	if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+		t.Fatalf("initial ListDir: %v", err)
+	}
+	client.metadataMu.Lock()
+	entry := client.metadataCache["parent"]
+	entry.expires = time.Now().Add(-time.Second)
+	client.metadataCache["parent"] = entry
+	client.metadataMu.Unlock()
+	if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+		t.Fatalf("ListDir after expiry: %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests after expiry = %d, want 2", got)
+	}
+
+	client.ClearMetadataCache()
+	if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+		t.Fatalf("ListDir after explicit clear: %v", err)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("requests after explicit clear = %d, want 3", got)
+	}
+}
+
+func TestListDirFreshBypassesAndInvalidatesCache(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		page := requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{
+			"Items": []map[string]string{{"ID": strconv.Itoa(int(page)), "Name": "item"}},
+		}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+
+	initial, err := client.ListDir(context.Background(), "parent")
+	if err != nil || initial[0].ID != "1" {
+		t.Fatalf("initial ListDir = %#v, %v; want item 1", initial, err)
+	}
+	fresh, err := client.ListDirFresh(context.Background(), "parent")
+	if err != nil || fresh[0].ID != "2" {
+		t.Fatalf("ListDirFresh = %#v, %v; want item 2", fresh, err)
+	}
+	current, err := client.ListDir(context.Background(), "parent")
+	if err != nil || current[0].ID != "3" {
+		t.Fatalf("ListDir after fresh read = %#v, %v; want item 3", current, err)
+	}
+	cached, err := client.ListDir(context.Background(), "parent")
+	if err != nil || cached[0].ID != "3" || requests.Load() != 3 {
+		t.Fatalf("cached ListDir = %#v, %v with %d requests; want item 3 and 3 requests", cached, err, requests.Load())
+	}
+}
+
+func TestListDirDoesNotReturnCacheForCanceledContextOrCooldown(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{"Items": []any{}}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+	if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+		t.Fatalf("initial ListDir: %v", err)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.ListDir(canceled, "parent"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ListDir with canceled context = %v, want context.Canceled", err)
+	}
+	client.rateLimitMu.Lock()
+	client.rateLimitTill = time.Now().Add(time.Minute)
+	client.rateLimitMu.Unlock()
+	var rateLimitErr *RateLimitError
+	if _, err := client.ListDir(context.Background(), "parent"); !errors.As(err, &rateLimitErr) {
+		t.Fatalf("ListDir during cooldown = %v, want RateLimitError", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("cached calls made %d provider requests, want only initial request", got)
+	}
+}
+
+func TestListDirCacheHasBoundedEntries(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{"Items": []any{}}}})
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+	for index := 0; index < metadataCacheMaxEntries+3; index++ {
+		if _, err := client.ListDir(context.Background(), fmt.Sprintf("parent-%d", index)); err != nil {
+			t.Fatalf("ListDir(%d): %v", index, err)
+		}
+	}
+	client.metadataMu.Lock()
+	got := len(client.metadataCache)
+	client.metadataMu.Unlock()
+	if got > metadataCacheMaxEntries {
+		t.Fatalf("metadata cache entries = %d, want at most %d", got, metadataCacheMaxEntries)
+	}
+	if requests.Load() != metadataCacheMaxEntries+3 {
+		t.Fatalf("provider requests = %d, want %d", requests.Load(), metadataCacheMaxEntries+3)
+	}
+}
+
+func TestListDirMutationInvalidatesCacheOnSuccessAndError(t *testing.T) {
+	mutations := []struct {
+		name      string
+		operation string
+		invoke    func(*Client) error
+	}{
+		{
+			name:      "rename",
+			operation: "SetRenameFile",
+			invoke: func(client *Client) error {
+				return client.Rename(context.Background(), "item", "renamed")
+			},
+		},
+		{
+			name:      "register",
+			operation: "SetUploadFile3",
+			invoke: func(client *Client) error {
+				_, err := client.Register(context.Background(), "parent", "file.bin", "checksum", 1, time.Now())
+				return err
+			},
+		},
+		{
+			name:      "delete",
+			operation: "SetDeleteFile5",
+			invoke: func(client *Client) error {
+				return client.Delete(context.Background(), "item", false)
+			},
+		},
+	}
+	for _, mutation := range mutations {
+		for _, fail := range []bool{false, true} {
+			name := "success"
+			if fail {
+				name = "error"
+			}
+			t.Run(mutation.name+"/"+name, func(t *testing.T) {
+				var listRequests atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+					body := decodeGraphQLRequest(t, request)
+					switch body["operationName"] {
+					case "GetFileChildren5":
+						listRequests.Add(1)
+						writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{"Items": []any{}}}})
+					case mutation.operation:
+						if fail {
+							writer.WriteHeader(http.StatusInternalServerError)
+							return
+						}
+						field := map[string]string{"SetRenameFile": "setRenameFile", "SetUploadFile3": "setUploadFile3", "SetDeleteFile5": "setDeleteFile5"}[mutation.operation]
+						writeJSON(t, writer, map[string]any{"data": map[string]any{field: true}})
+					default:
+						t.Errorf("unexpected operation %v", body["operationName"])
+						writer.WriteHeader(http.StatusBadRequest)
+					}
+				}))
+				defer server.Close()
+				client := newTestClient(server, &testTokens{initial: "token"})
+				if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+					t.Fatalf("prime ListDir cache: %v", err)
+				}
+				if got := mutation.invoke(client); (got != nil) != fail {
+					t.Fatalf("mutation error = %v, want error=%t", got, fail)
+				}
+				if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+					t.Fatalf("ListDir after mutation: %v", err)
+				}
+				if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+					t.Fatalf("repeated ListDir during mutation visibility window: %v", err)
+				}
+				if got := listRequests.Load(); got != 2 {
+					t.Fatalf("ListDir provider requests = %d, want 2 after mutation invalidation", got)
+				}
+			})
+		}
+	}
+}
+
+func TestListDirMutationInvalidatesInflightSnapshots(t *testing.T) {
+	firstListStarted := make(chan struct{})
+	finishFirstList := make(chan struct{})
+	mutationStarted := make(chan struct{})
+	finishMutation := make(chan struct{})
+	var listRequests atomic.Int32
+	var once sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := decodeGraphQLRequest(t, request)
+		switch body["operationName"] {
+		case "GetFileChildren5":
+			page := listRequests.Add(1)
+			if page == 1 {
+				close(firstListStarted)
+				<-finishFirstList
+			}
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"getFileChildren5": map[string]any{
+				"Items": []map[string]string{{"ID": fmt.Sprintf("item-%d", page), "Name": "item"}},
+			}}})
+		case "SetRenameFile":
+			once.Do(func() { close(mutationStarted) })
+			<-finishMutation
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"setRenameFile": true}})
+		default:
+			t.Errorf("unexpected operation %v", body["operationName"])
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(server, &testTokens{initial: "token"})
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := client.ListDir(context.Background(), "parent")
+		firstResult <- err
+	}()
+	select {
+	case <-firstListStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first ListDir did not reach server")
+	}
+	mutationResult := make(chan error, 1)
+	go func() { mutationResult <- client.Rename(context.Background(), "item", "renamed") }()
+	select {
+	case <-mutationStarted:
+	case <-time.After(time.Second):
+		close(finishFirstList)
+		t.Fatal("rename did not reach server")
+	}
+
+	if _, err := client.ListDir(context.Background(), "parent"); err != nil {
+		close(finishMutation)
+		close(finishFirstList)
+		t.Fatalf("ListDir during mutation: %v", err)
+	}
+	close(finishMutation)
+	if err := <-mutationResult; err != nil {
+		close(finishFirstList)
+		t.Fatalf("Rename: %v", err)
+	}
+	close(finishFirstList)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("in-flight ListDir: %v", err)
+	}
+	items, err := client.ListDir(context.Background(), "parent")
+	if err != nil {
+		t.Fatalf("ListDir after in-flight response: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "item-3" || listRequests.Load() != 3 {
+		t.Fatalf("post-mutation ListDir = %#v with %d requests, want item-3 and 3 requests", items, listRequests.Load())
+	}
+}
+
 func TestGetWriteAuthReportsAlreadyExists(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(t, writer, map[string]any{"data": map[string]any{"getBucketWriteAuth4": []any{map[string]any{"Error": "File already exists"}}}})
@@ -554,6 +869,543 @@ func TestHTTPErrorDoesNotExposeBodyAndCarriesBoundedRetryAfter(t *testing.T) {
 	delay, ok := pacer.IsRetryAfter(err)
 	if !ok || delay != maxRetryAfter {
 		t.Fatalf("Retry-After = %v, %t; want bounded delay %v", delay, ok, maxRetryAfter)
+	}
+}
+
+func TestHTTP503HonorsShortRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Retry-After", "2")
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	_, err := newTestClient(server, &testTokens{initial: "token"}).ListDir(context.Background(), "parent")
+	if HTTPStatus(err) != http.StatusServiceUnavailable || !Retryable(err) {
+		t.Fatalf("status/retryable = %d/%t, want 503/true", HTTPStatus(err), Retryable(err))
+	}
+	delay, ok := pacer.IsRetryAfter(err)
+	if !ok || delay != 2*time.Second {
+		t.Fatalf("Retry-After = %v, %t; want 2s", delay, ok)
+	}
+}
+
+func TestHTTP429HonorsLongRetryAfterAndBlocksBeforeToken(t *testing.T) {
+	tokens := &testTokens{initial: "token"}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Retry-After", "65043")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server, tokens)
+	before := time.Now()
+	_, err := client.ListDir(context.Background(), "parent")
+	if err == nil {
+		t.Fatal("ListDir unexpectedly succeeded")
+	}
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) {
+		t.Fatalf("error = %T %v, want *RateLimitError", err, err)
+	}
+	if got := rateErr.Until.Sub(before); got < 65042*time.Second || got > 65044*time.Second {
+		t.Fatalf("rate limit until = %s, duration from request start %s; want about 65043s", rateErr.Until, got)
+	}
+	if HTTPStatus(err) != http.StatusTooManyRequests || Retryable(err) {
+		t.Fatalf("status/retryable = %d/%t, want 429/false", HTTPStatus(err), Retryable(err))
+	}
+	if _, ok := pacer.IsRetryAfter(err); ok {
+		t.Fatal("429 returned a shared-pacer retry delay")
+	}
+	if requests.Load() != 1 || tokens.calls.Load() != 1 {
+		t.Fatalf("requests/token calls = %d/%d, want 1/1", requests.Load(), tokens.calls.Load())
+	}
+
+	firstUntil := rateErr.Until
+	const concurrentCalls = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, concurrentCalls)
+	for range concurrentCalls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := client.ListDir(context.Background(), "parent")
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		var blockedErr *RateLimitError
+		if !errors.As(err, &blockedErr) || !blockedErr.Until.Equal(firstUntil) {
+			t.Errorf("concurrent call error = %T %v, want rate limit until %s", err, err, firstUntil)
+		}
+	}
+	if requests.Load() != 1 || tokens.calls.Load() != 1 {
+		t.Fatalf("concurrent blocked calls made provider/auth activity: requests/token calls = %d/%d", requests.Load(), tokens.calls.Load())
+	}
+}
+
+func TestRateLimitCooldownPersistsAndReloads(t *testing.T) {
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rateLimitFile := filepath.Join(privateDir, "auth.json.rate-limit.json")
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Retry-After", "65043")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	firstTokens := &testTokens{initial: "token"}
+	first := newTestClient(server, firstTokens)
+	if err := first.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("SetRateLimitFile: %v", err)
+	}
+	_, err := first.ListDir(context.Background(), "parent")
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) {
+		t.Fatalf("ListDir error = %T %v, want *RateLimitError", err, err)
+	}
+	data, err := os.ReadFile(rateLimitFile)
+	if err != nil {
+		t.Fatalf("read cooldown sidecar: %v", err)
+	}
+	var saved struct {
+		Version   int   `json:"version"`
+		UntilUnix int64 `json:"until_unix"`
+	}
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("decode cooldown sidecar: %v", err)
+	}
+	if saved.Version != 1 || saved.UntilUnix < rateErr.Until.Unix() {
+		t.Fatalf("saved cooldown = %+v, error deadline = %s", saved, rateErr.Until)
+	}
+	info, err := os.Stat(rateLimitFile)
+	if err != nil {
+		t.Fatalf("stat cooldown sidecar: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("sidecar mode = %v, want 0600", info.Mode().Perm())
+	}
+
+	secondTokens := &testTokens{initial: "token"}
+	second := newTestClient(server, secondTokens)
+	if err := second.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("reload SetRateLimitFile: %v", err)
+	}
+	_, err = second.ListDir(context.Background(), "parent")
+	if !errors.As(err, &rateErr) || rateErr.Until.Unix() != saved.UntilUnix {
+		t.Fatalf("reloaded call error = %T %v; want persisted deadline %d", err, err, saved.UntilUnix)
+	}
+	if requests.Load() != 1 || secondTokens.calls.Load() != 0 {
+		t.Fatalf("reloaded cooldown made provider/auth activity: requests/token calls = %d/%d", requests.Load(), secondTokens.calls.Load())
+	}
+}
+
+func TestSharedRateLimitSidecarBlocksInitializedClient(t *testing.T) {
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rateLimitFile := filepath.Join(privateDir, "auth.json.rate-limit.json")
+	var firstRequests atomic.Int32
+	firstServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		firstRequests.Add(1)
+		writer.Header().Set("Retry-After", "65043")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer firstServer.Close()
+
+	firstTokens := &testTokens{initial: "token"}
+	first := newTestClient(firstServer, firstTokens)
+	if err := first.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("first SetRateLimitFile: %v", err)
+	}
+	secondTokens := &testTokens{initial: "token"}
+	var secondRequests atomic.Int32
+	secondServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		secondRequests.Add(1)
+		writer.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(writer, `{"data":{"getFileChildren5":{"Items":[],"NextToken":""}}}`)
+	}))
+	defer secondServer.Close()
+	second := newTestClient(secondServer, secondTokens)
+	if err := second.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("second SetRateLimitFile: %v", err)
+	}
+
+	_, err := first.ListDir(context.Background(), "parent")
+	var firstRateErr *RateLimitError
+	if !errors.As(err, &firstRateErr) {
+		t.Fatalf("first ListDir error = %T %v, want *RateLimitError", err, err)
+	}
+	_, err = second.ListDir(context.Background(), "parent")
+	var secondRateErr *RateLimitError
+	if !errors.As(err, &secondRateErr) || secondRateErr.Until.Before(firstRateErr.Until) {
+		t.Fatalf("second ListDir error = %T %v; want shared deadline %s", err, err, firstRateErr.Until)
+	}
+	if firstRequests.Load() != 1 || secondRequests.Load() != 0 || firstTokens.calls.Load() != 1 || secondTokens.calls.Load() != 0 {
+		t.Fatalf("requests/token calls = %d/%d / %d/%d; second client must fail before auth or HTTP", firstRequests.Load(), firstTokens.calls.Load(), secondRequests.Load(), secondTokens.calls.Load())
+	}
+}
+
+func TestGraphQLAuthRefreshRechecksSharedRateLimit(t *testing.T) {
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rateLimitFile := filepath.Join(privateDir, "auth.json.rate-limit.json")
+	cooldownServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Retry-After", "65043")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer cooldownServer.Close()
+	cooldownClient := newTestClient(cooldownServer, &testTokens{initial: "token"})
+	if err := cooldownClient.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("cooldown client SetRateLimitFile: %v", err)
+	}
+
+	requestStarted := make(chan struct{})
+	allowUnauthorized := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseResponse := func() { releaseOnce.Do(func() { close(allowUnauthorized) }) }
+	var waitingRequests atomic.Int32
+	waitingServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		waitingRequests.Add(1)
+		close(requestStarted)
+		<-allowUnauthorized
+		writer.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer waitingServer.Close()
+	defer releaseResponse()
+	waitingTokens := &testTokens{initial: "expired", refreshed: "new-token"}
+	waitingClient := newTestClient(waitingServer, waitingTokens)
+	if err := waitingClient.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("waiting client SetRateLimitFile: %v", err)
+	}
+
+	waitingErr := make(chan error, 1)
+	go func() {
+		_, err := waitingClient.ListDir(context.Background(), "parent")
+		waitingErr <- err
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiting client did not start its request")
+	}
+	if _, err := cooldownClient.ListDir(context.Background(), "parent"); err == nil {
+		t.Fatal("cooldown client unexpectedly succeeded")
+	}
+	releaseResponse()
+	select {
+	case err := <-waitingErr:
+		var rateErr *RateLimitError
+		if !errors.As(err, &rateErr) {
+			t.Fatalf("waiting ListDir error = %T %v, want shared RateLimitError", err, err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiting client did not stop after its unauthorized response")
+	}
+	if waitingRequests.Load() != 1 || waitingTokens.calls.Load() != 1 || waitingTokens.refreshes.Load() != 0 {
+		t.Fatalf("waiting client activity = requests %d, Token calls %d, refreshes %d; want one initial request and no refresh", waitingRequests.Load(), waitingTokens.calls.Load(), waitingTokens.refreshes.Load())
+	}
+}
+
+func TestConcurrentClientsCannotShortenSharedRateLimit(t *testing.T) {
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rateLimitFile := filepath.Join(privateDir, "auth.json.rate-limit.json")
+
+	firstServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Retry-After", "65043")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer firstServer.Close()
+	first := newTestClient(firstServer, &testTokens{initial: "token"})
+	if err := first.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("first SetRateLimitFile: %v", err)
+	}
+
+	requestStarted := make(chan struct{})
+	allowResponse := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseResponse := func() { releaseOnce.Do(func() { close(allowResponse) }) }
+	secondServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		close(requestStarted)
+		<-allowResponse
+		writer.Header().Set("Retry-After", "60")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer secondServer.Close()
+	defer releaseResponse()
+	second := newTestClient(secondServer, &testTokens{initial: "token"})
+	if err := second.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("second SetRateLimitFile: %v", err)
+	}
+
+	secondErr := make(chan error, 1)
+	go func() {
+		_, err := second.ListDir(context.Background(), "parent")
+		secondErr <- err
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second client did not start its request")
+	}
+	_, err := first.ListDir(context.Background(), "parent")
+	var firstRateErr *RateLimitError
+	if !errors.As(err, &firstRateErr) {
+		t.Fatalf("first ListDir error = %T %v, want *RateLimitError", err, err)
+	}
+	releaseResponse()
+	select {
+	case err := <-secondErr:
+		var secondRateErr *RateLimitError
+		if !errors.As(err, &secondRateErr) {
+			t.Fatalf("second ListDir error = %T %v, want *RateLimitError", err, err)
+		}
+		if secondRateErr.Until.Before(firstRateErr.Until) {
+			t.Fatalf("second deadline = %s, want shared maximum %s", secondRateErr.Until, firstRateErr.Until)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second client did not finish its request")
+	}
+
+	data, err := os.ReadFile(rateLimitFile)
+	if err != nil {
+		t.Fatalf("read shared cooldown sidecar: %v", err)
+	}
+	savedUntil, err := decodeRateLimitFile(data)
+	if err != nil {
+		t.Fatalf("decode shared cooldown sidecar: %v", err)
+	}
+	if savedUntil.Before(firstRateErr.Until) {
+		t.Fatalf("persisted deadline = %s, want at least %s", savedUntil, firstRateErr.Until)
+	}
+}
+
+func TestRateLimitSidecarLockIsPrivateAndRejectsSymlink(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux", "darwin", "freebsd", "netbsd", "openbsd", "dragonfly", "solaris":
+	default:
+		t.Skip("the platform lock implementation is not available on this OS")
+	}
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rateLimitFile := filepath.Join(privateDir, "auth.json.rate-limit.json")
+	if err := New(nil, nil, "", "").SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("SetRateLimitFile: %v", err)
+	}
+	lockInfo, err := os.Lstat(rateLimitFile + ".lock")
+	if err != nil {
+		t.Fatalf("stat sidecar lock: %v", err)
+	}
+	if !lockInfo.Mode().IsRegular() || lockInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("sidecar lock mode = %v, want regular 0600", lockInfo.Mode())
+	}
+
+	otherPath := filepath.Join(privateDir, "other.rate-limit.json")
+	target := filepath.Join(privateDir, "target")
+	if err := auth.WritePrivateFile(target, []byte("private")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, otherPath+".lock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(nil, nil, "", "").SetRateLimitFile(otherPath); err == nil {
+		t.Fatal("SetRateLimitFile unexpectedly accepted a symlink lock")
+	}
+}
+
+func TestRateLimitPersistenceFailureKeepsLongestDeadline(t *testing.T) {
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rateLimitFile := filepath.Join(privateDir, "auth.json.rate-limit.json")
+	client := New(nil, nil, "", "")
+	longUntil := time.Now().Add(65043 * time.Second)
+	client.rateLimitMu.Lock()
+	client.rateLimitTill = longUntil
+	client.rateLimitMu.Unlock()
+	if err := client.SetRateLimitFile(rateLimitFile); err != nil {
+		t.Fatalf("SetRateLimitFile: %v", err)
+	}
+	if err := os.Chmod(rateLimitFile+".lock", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	response := &http.Response{Header: make(http.Header)}
+	response.Header.Set("Retry-After", "60")
+
+	err := client.rateLimited("GetFileChildren5", response, errors.New("provider rejected request"))
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) {
+		t.Fatalf("error = %T %v, want *RateLimitError", err, err)
+	}
+	if !rateErr.Until.Equal(longUntil) || !rateErr.RetryAfter().Equal(longUntil) {
+		t.Fatalf("returned deadline = %s, RetryAfter=%s; want existing maximum %s", rateErr.Until, rateErr.RetryAfter(), longUntil)
+	}
+	if rateErr.persistErr == nil || !strings.Contains(err.Error(), "local cooldown could not be persisted") {
+		t.Fatalf("persistence error not surfaced safely: %v", err)
+	}
+	if HTTPStatus(err) != http.StatusTooManyRequests || Retryable(err) {
+		t.Fatalf("status/retryable = %d/%t, want 429/false", HTTPStatus(err), Retryable(err))
+	}
+}
+
+func TestRateLimitCooldownWithoutRetryAfterUsesDefault(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server, &testTokens{initial: "token"})
+	before := time.Now()
+	_, err := client.ListDir(context.Background(), "parent")
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) {
+		t.Fatalf("ListDir error = %T %v, want *RateLimitError", err, err)
+	}
+	if got := rateErr.Until.Sub(before); got < defaultRateLimitCooldown-time.Second || got > defaultRateLimitCooldown+time.Second {
+		t.Fatalf("default cooldown = %s, want about %s", got, defaultRateLimitCooldown)
+	}
+	_, _ = client.ListDir(context.Background(), "parent")
+	if requests.Load() != 1 {
+		t.Fatalf("repeated request count = %d, want 1", requests.Load())
+	}
+}
+
+func TestRateLimitCooldownCancellationSkipsAuth(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Retry-After", "60")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	tokens := &testTokens{initial: "token"}
+	client := newTestClient(server, tokens)
+	_, _ = client.ListDir(context.Background(), "parent")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.ListDir(ctx, "parent")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled call error = %v, want context.Canceled", err)
+	}
+	if requests.Load() != 1 || tokens.calls.Load() != 1 {
+		t.Fatalf("canceled call made provider/auth activity: requests/token calls = %d/%d", requests.Load(), tokens.calls.Load())
+	}
+}
+
+func TestSetRateLimitFileRejectsInvalidPrivateFiles(t *testing.T) {
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("unsupported version", func(t *testing.T) {
+		file := filepath.Join(privateDir, "invalid.json")
+		if err := os.WriteFile(file, []byte(`{"version":2,"until_unix":123}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := New(nil, nil, "", "").SetRateLimitFile(file); err == nil {
+			t.Fatal("SetRateLimitFile unexpectedly accepted invalid state")
+		}
+	})
+	t.Run("unsafe permissions", func(t *testing.T) {
+		file := filepath.Join(privateDir, "public.json")
+		if err := os.WriteFile(file, []byte(`{"version":1,"until_unix":123}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(file, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := New(nil, nil, "", "").SetRateLimitFile(file); err == nil {
+			t.Fatal("SetRateLimitFile unexpectedly accepted public state")
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		target := filepath.Join(privateDir, "target.json")
+		if err := os.WriteFile(target, []byte(`{"version":1,"until_unix":123}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(privateDir, "link.json")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := New(nil, nil, "", "").SetRateLimitFile(link); err == nil {
+			t.Fatal("SetRateLimitFile unexpectedly followed a symlink")
+		}
+	})
+}
+
+func TestRetryAfterUntilParsesDatesAndSaturatesOverflow(t *testing.T) {
+	now := time.Date(2026, time.October, 13, 20, 2, 13, 0, time.UTC)
+	want := now.Add(65043 * time.Second)
+	got, ok := retryAfterUntil(want.Format(http.TimeFormat), now)
+	if !ok || !got.Equal(want) {
+		t.Fatalf("date Retry-After = %s, %t; want %s", got, ok, want)
+	}
+
+	got, ok = retryAfterUntil(strings.Repeat("9", 256), now)
+	if !ok || !got.After(time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)) {
+		t.Fatalf("overflow Retry-After = %s, %t; want saturated future deadline", got, ok)
+	}
+}
+
+func TestGCSUpload429PersistsCooldown(t *testing.T) {
+	privateDir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Retry-After", "60")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	tokens := &testTokens{initial: "token"}
+	client := newTestClient(server, tokens)
+	if err := client.SetRateLimitFile(filepath.Join(privateDir, "auth.json.rate-limit.json")); err != nil {
+		t.Fatal(err)
+	}
+	err := client.Upload(context.Background(), AuthData{BaseURL: server.URL}, "file.txt", "checksum", 4, "text/plain", strings.NewReader("data"))
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) || HTTPStatus(err) != http.StatusTooManyRequests {
+		t.Fatalf("Upload error = %T %v, want rate limit with HTTP 429", err, err)
+	}
+	_, _ = client.ListDir(context.Background(), "parent")
+	if requests.Load() != 1 || tokens.calls.Load() != 0 {
+		t.Fatalf("upload cooldown made provider/auth activity: requests/token calls = %d/%d", requests.Load(), tokens.calls.Load())
+	}
+}
+
+func TestMutation429DoesNotReplay(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Retry-After", "60")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	_, err := newTestClient(server, &testTokens{initial: "token"}).Register(context.Background(), "parent", "file.txt", "checksum", 4, time.Now())
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) || Retryable(err) || requests.Load() != 1 {
+		t.Fatalf("Register error = %T %v, retryable=%t, requests=%d; want one nonretryable 429", err, err, Retryable(err), requests.Load())
 	}
 }
 

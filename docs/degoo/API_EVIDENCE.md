@@ -82,3 +82,90 @@ that reconciliation uses one byte transfer and one registration request.
 They also cover an unconfirmed negative acknowledgement and cancellation of
 blocked or throttled listing requests. These fixtures are failure simulations,
 not claims about live provider rejection semantics.
+
+## Rate limits and public web-client evidence (2026-10-13)
+
+No public Degoo documentation reviewed for this change states a numeric
+GraphQL/API request quota. The official [features](https://degoo.com/features),
+[terms](https://degoo.com/terms), and [help site](https://help.degoo.com/)
+pages reviewed do not publish one. This is a search result, not evidence that
+no private or account-specific limit exists.
+
+A live `GetFileChildren5` request returned HTTP 429 with
+`Retry-After: 65043` at `2026-10-13 23:02:13 EEST`, which yields a requested
+retry time of `2026-10-14 17:06:16 EEST`. The operation and response header are
+recorded without account identifiers, item names, or paths. This confirms a
+server-directed cooldown for that request; it does not identify whether the
+scope is an account, endpoint, IP address, or broader service limit. No
+additional authenticated request or quota/evasion probe was made as part of
+this research. The already-running mount continued its automatic retries until
+it was stopped at about `2026-10-13 23:21 EEST`.
+
+The public web application redirects `cloud.degoo.com` to `app.degoo.com`.
+Its unauthenticated public JavaScript bundles fetched on 2026-10-13 include
+[the GraphQL client and operation service](https://app.degoo.com/4373-es2015.b7400e92aaedad458a8d.js),
+[folder pagination](https://app.degoo.com/8314-es2015.c3cd367dfb34fc02dfc3.js),
+[upload scheduling](https://app.degoo.com/1108-es2015.d04fa11b4f48d926cbe1.js),
+and [file download handling](https://app.degoo.com/8954-es2015.f1adb5d544601252d903.js)
+([additional viewer handling](https://app.degoo.com/9196-es2015.c92c99ac88d53ff15c32.js)).
+These are public build artifacts; hashed filenames can change when Degoo
+deploys a new web client.
+
+In those bundles, the file manager requests folder pages of 50 items and loads
+additional pages on demand. Each cache miss for `GetFileChildren5`,
+`GetOverlay4`, `GetBucketWriteAuth4`, or `SetUploadFile3` is constructed as a
+separate GraphQL POST. The client has an optional local result-cache argument,
+used by two unrelated feed queries, but not by those four operations. The
+GraphQL client code contains no visible `Retry-After` handling; it delegates
+the HTTP call to an imported fetch helper (whose retry behavior was not
+independently established here). The UI's folder/page state therefore offers
+evidence for demand-driven listing, not a published request quota or proof of
+provider-side batching.
+
+The web client batches uploads differently: it collects upload authorization
+inputs and registration file records into array-valued GraphQL operations.
+That can reduce upload round trips, but does not establish that listing calls
+can be combined or that replaying a registration batch is safe. The download
+viewer separately maps HTTP 429 from a content URL to a “daily limit reached”
+message. That is direct content-download handling, distinct from the observed
+GraphQL listing 429; it does not establish that both responses share a quota
+or explain the listing cooldown.
+
+Two pinned community implementations provide additional, non-provider
+reference evidence: [cligoo at
+444ae9c54690a0e77d0ba148cc9921477b75cdff](https://github.com/georgeasiminei/cligoo/tree/444ae9c54690a0e77d0ba148cc9921477b75cdff)
+uses `GetFileChildren5` pages up to 1,000 and has no request-result cache in
+its API client; [Degoo at
+3b646f54681dbd7290ea41a0f4499ea348a4cc43](https://github.com/bernd-wechner/Degoo/tree/3b646f54681dbd7290ea41a0f4499ea348a4cc43)
+records the same observed page ceiling and reuses folder listings to satisfy
+item lookups. These are implementation observations, not current Degoo
+guarantees.
+
+The backend stores a typed rate-limit deadline beside the private auth file
+and fast-fails API calls while that deadline is active; an expired deadline no
+longer blocks requests. On Linux, clients coordinate through a private
+sidecar lock and re-read the deadline before token retrieval and HTTP calls.
+Concurrent deadlines merge by keeping the latest expiry, so a shorter response
+cannot reduce an existing cooldown. Lock waits are bounded and context-aware.
+Metadata lookups use a shared ten-second total bound across pagination and
+retries, honor caller cancellation, and stop retrying when Degoo supplies
+`Retry-After`. Background VFS writeback schedules a pending upload at the later
+of its normal retry time and the provider deadline, rather than sleeping in
+the request path. Download URLs are reused for 30 seconds. Upload publication first
+checks the targeted item metadata and skips a redundant canonical directory
+listing only when the returned item matches the expected ID, name, parent,
+size, and file category. If publication cannot be confirmed, the pending local
+write remains available for VFS retry.
+
+`GetFileChildren5` also uses a bounded snapshot cache with a five-second
+lifetime and at most 32 parent entries. Mutations and explicit directory-cache
+flushes clear the snapshots; a generation check prevents an in-flight listing
+from repopulating a cleared cache. Follow-up checks passed for cross-process
+cooldown-state merging, bounded metadata calls, and pending-write retry
+scheduling. The final full Go suite passed after a small error-path fix. A
+rebuilt localhost FUSE smoke test confirmed fail-fast listing behavior and
+pending-write retention under a persisted cooldown. A production mount later
+returned `EIO` for `ls` in 2.9 ms during the recorded cooldown. A point-in-time
+process socket inventory showed no INET sockets, but that is not packet-level
+proof across the cooldown. These checks do not establish live Degoo upload
+recovery; see [VALIDATION.md](VALIDATION.md).
