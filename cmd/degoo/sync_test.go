@@ -45,7 +45,7 @@ func newSyncTestVFS(t *testing.T, remote fs.Fs, fullCache bool) *vfs.VFS {
 	return mountedVFS
 }
 
-func newSyncTestEndpoint(t *testing.T, mountedVFS *vfs.VFS, flushRaw func(), stats ...func() any) (*syncEndpoint, string) {
+func newSyncTestEndpoint(t *testing.T, mountedVFS *vfs.VFS, flushRaw func(), stats ...func(context.Context) (any, error)) (*syncEndpoint, string) {
 	t.Helper()
 	tempDir := t.TempDir()
 	require.NoError(t, os.Chmod(tempDir, 0700))

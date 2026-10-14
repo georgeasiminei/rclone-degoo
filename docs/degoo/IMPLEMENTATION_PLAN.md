@@ -34,6 +34,31 @@ run for that follow-up. See [VALIDATION.md](VALIDATION.md).
 
 ## Implementation decisions and validation plan
 
+### Local performance statistics (2026-10-14)
+
+`degoo-rc stats` reads the running mount's private `/stats` endpoint. It offers
+a human-readable cache bar, an optional live display, and JSON with exact byte
+counters. Reading statistics never triggers Degoo API or storage requests,
+token renewal, directory refresh, cache eviction, or upload verification.
+Ordinary mount activity continues independently.
+
+The generic VFS cache snapshot sums stored ranges instead of relying on the
+last cleaner pass. It separates dirty bytes from clean bytes, then separates
+clean bytes into quota-evictable and open/grace-period pinned bytes using the
+same eligibility conditions as removal. It reports configured cache targets
+and local filesystem space without scanning the cache tree. The snapshot is
+per item; concurrent I/O can change the cache while it is collected.
+
+The Degoo client counts encrypted payload bytes consumed by existing upload
+HTTP bodies and read from existing download response bodies. Bounded time
+buckets retain approximately five seconds of traffic for recent rates.
+Retries count again, and verification downloads count as received traffic.
+These counters measure payload passing through the HTTP client, not wire
+acknowledgements or completed logical-file publication. Existing API request
+and metadata-cache counters remain available alongside queue and process
+statistics. Pending sizes in ordinary `info` and `status` output use binary
+units while JSON retains exact byte counts.
+
 ### Provider cooldown and external cache placement (2026-10-13)
 
 The public-source review found no published numeric GraphQL request quota. A

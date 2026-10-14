@@ -183,6 +183,9 @@ type Client struct {
 
 	statsMu sync.Mutex
 	stats   RequestStats
+
+	uploadTransfer   transferWindow
+	downloadTransfer transferWindow
 }
 
 type metadataCacheEntry struct {
@@ -564,6 +567,20 @@ func (c *Client) RequestStats() RequestStats {
 		stats.RequestsByOperation[operation] = count
 	}
 	return stats
+}
+
+// TransferStats returns recent transfer rates and cumulative storage payload bytes.
+func (c *Client) TransferStats() TransferStats {
+	uploadBytes, uploadRate, activeUploads := c.uploadTransfer.snapshot()
+	downloadBytes, downloadRate, activeDownloads := c.downloadTransfer.snapshot()
+	return TransferStats{
+		UploadBytes:            uploadBytes,
+		UploadBytesPerSecond:   uploadRate,
+		ActiveUploads:          activeUploads,
+		DownloadBytes:          downloadBytes,
+		DownloadBytesPerSecond: downloadRate,
+		ActiveDownloads:        activeDownloads,
+	}
 }
 
 func cloneItems(items []Item) []Item {
@@ -1745,6 +1762,9 @@ func (c *Client) Upload(ctx context.Context, auth AuthData, name, checksum strin
 
 	contentLength := size
 	storage := rest.NewClient(c.http).SetErrorHandler(safeHTTPError)
+	reader = &transferReader{reader: reader, stats: &c.uploadTransfer}
+	finishUpload := c.uploadTransfer.begin()
+	defer finishUpload()
 	c.recordHTTPRequest("GCS upload", true)
 	resp, err := storage.CallJSON(ctx, &rest.Opts{
 		Method:               http.MethodPost,
@@ -2004,6 +2024,7 @@ func (c *Client) Download(ctx context.Context, downloadURL, rangeHeader string) 
 			}
 			return nil, apiErr
 		}
+		c.trackDownloadResponse(resp)
 		return resp, nil
 	}
 	if resp.StatusCode != http.StatusPartialContent {
@@ -2018,5 +2039,14 @@ func (c *Client) Download(ctx context.Context, downloadURL, rangeHeader string) 
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("invalid ranged download response: %w", err)
 	}
+	c.trackDownloadResponse(resp)
 	return resp, nil
+}
+
+func (c *Client) trackDownloadResponse(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	finish := c.downloadTransfer.begin()
+	resp.Body = &transferReadCloser{reader: resp.Body, stats: &c.downloadTransfer, finish: finish}
 }

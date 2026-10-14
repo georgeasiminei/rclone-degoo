@@ -152,7 +152,9 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 	return c, nil
 }
 
-// Stats returns info about the Cache
+// Stats returns cache counters and cached-range sizes. Clean bytes are split
+// into evictable bytes and bytes pinned by open handles or their grace period.
+// The snapshot does not evict data; concurrent I/O may change individual items.
 func (c *Cache) Stats() (out rc.Params) {
 	out = make(rc.Params)
 	// read only - no locking needed to read these
@@ -165,12 +167,54 @@ func (c *Cache) Stats() (out rc.Params) {
 	out["uploadsQueued"] = uploadsQueued
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	out["files"] = len(c.item)
 	out["erroredFiles"] = len(c.errItems)
-	out["bytesUsed"] = c.used
 	out["outOfSpace"] = c.outOfSpace
+	items := make([]*Item, 0, len(c.item))
+	for _, item := range c.item {
+		items = append(items, item)
+	}
+	c.mu.Unlock()
+
+	var dirty, clean, evictable, pinned int64
+	var filesDirty, filesClean, filesEvictable, filesPinned int
+	for _, item := range items {
+		item.mu.Lock()
+		size := item.info.Rs.Size()
+		switch {
+		case item.info.Dirty:
+			dirty += size
+			filesDirty++
+		case item.opens != 0 || item.graceTimer != nil:
+			clean += size
+			pinned += size
+			filesClean++
+			filesPinned++
+		default:
+			clean += size
+			evictable += size
+			filesClean++
+			filesEvictable++
+		}
+		item.mu.Unlock()
+	}
+	out["bytesUsed"] = dirty + clean
+	out["bytesDirty"] = dirty
+	out["bytesClean"] = clean
+	out["bytesEvictable"] = evictable
+	out["bytesPinned"] = pinned
+	out["filesDirty"] = filesDirty
+	out["filesClean"] = filesClean
+	out["filesEvictable"] = filesEvictable
+	out["filesPinned"] = filesPinned
+	out["maxBytes"] = int64(c.opt.CacheMaxSize)
+	out["minFreeBytes"] = max(0, int64(c.opt.CacheMinFreeSpace))
+	out["maxAgeSeconds"] = max(0, time.Duration(c.opt.CacheMaxAge).Seconds())
+	out["pollIntervalSeconds"] = max(0, time.Duration(c.opt.CachePollInterval).Seconds())
+	if usage, err := diskusage.New(c.root); err == nil {
+		out["diskTotalBytes"] = usage.Total
+		out["diskFreeBytes"] = usage.Available
+	}
 
 	return out
 }

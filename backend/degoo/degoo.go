@@ -337,6 +337,9 @@ func (f *Fs) RootFolderID() string { return f.opt.RootFolderID }
 // RequestStats returns a snapshot of API request counts without request data.
 func (f *Fs) RequestStats() api.RequestStats { return f.api.RequestStats() }
 
+// TransferStats returns local storage transfer counters and recent rates.
+func (f *Fs) TransferStats() api.TransferStats { return f.api.TransferStats() }
+
 func (f *Fs) acquirePathLocks(ctx context.Context, remotes ...string) (func(), error) {
 	f.pathLocksMu.Lock()
 	if f.pathLocks == nil {

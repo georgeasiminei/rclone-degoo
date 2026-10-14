@@ -240,6 +240,15 @@ tokens or vault settings. Long-term unattended renewal remains unverified.
 vault and its ancestors; it may refresh authentication but does not download
 file data or calculate remote size.
 
+`degoo-rc stats` shows a cache bar, dirty and clean/evictable sizes, upload
+queue counts, recent transfer rates, request/cache counters, and local disk
+and process metrics. `--watch` refreshes every two seconds (`--interval 5`
+changes that period); `--json` returns exact counters. Both modes read local
+state only and make no new requests to Degoo. Transfer rates count encrypted
+HTTP payload traffic, including retries and verification downloads, rather
+than confirmed file publication. An older running mount needs an updated
+binary and a normal restart for these metrics; retain its pending cache.
+
 Use `degoo-rc status` for authentication-first health and upload status. An
 unhealthy result exits nonzero; `--json` returns machine-readable output. Pass
 a file path to report its current upload state:
@@ -449,7 +458,7 @@ untouched. Empty shared directories under the user systemd config path may remai
 
 Use `degoo-rc help` to list commands. Run `degoo-rc COMMAND help` for that
 command's options and examples. The interface includes `install`, `uninstall`,
-`login`, `setup`, `mount`, `mount-setup`, `stop`, `status`, `update`,
+`login`, `setup`, `mount`, `mount-setup`, `stop`, `status`, `stats`, `update`,
 `location`, `folders`, `service`, `info`, `logs`, `trash`, and `empty-trash`. Run
 `mount-setup` explicitly with `sudo` to install the helper for an immutable
 `/mnt/degoo`; it does not mount the vault or start its service. `service`
