@@ -266,6 +266,10 @@ The user-requested client update lifecycle (2026-10-13) is:
   and verify the full archive against the metadata and workflow provenance.
   Missing metadata from older runs permits a visible full-archive fallback;
   present but invalid metadata must fail closed.
+- Hash each package and installation using that version's own managed-file
+  inventory. Adding or removing a helper must not make the updater reject a
+  valid release or misidentify the installed payload. Keep checksum, binary,
+  source-provenance, and full-payload validation in place.
 - Report update phases and elapsed time during long operations, repeating the
   elapsed-time message every ten seconds without estimated percentages.
 - Before changing an active mount, refuse an update launched from inside that

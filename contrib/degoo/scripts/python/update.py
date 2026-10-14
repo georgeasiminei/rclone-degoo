@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import fcntl
 import hashlib
@@ -45,6 +46,7 @@ UPDATE_CONTROL_TIMEOUT = 5.0
 UPDATE_RESPONSE_LIMIT = 4096
 UPDATE_PREPARE_TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 UPDATE_PREPARATION_LEASE_SECONDS = 120
+MAX_INSTALLER_SOURCE_BYTES = 1024 * 1024
 MANAGED_DIRECTORIES = ("bin", "scripts", "tools", "immutable-mount")
 MANAGED_FILES = ("degoo-rc", "install.json", "rclone-degoo.service",
                  *installer.COMPATIBILITY_SHELL_FILES, *installer.SOURCE_FILES)
@@ -84,6 +86,177 @@ def sha256_file(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+PAYLOAD_INVENTORIES = ("SOURCE_FILES", "SOURCE_SHELL_FILES", "IMMUTABLE_MOUNT_FILES")
+
+
+def _parse_payload_inventory(source: bytes) -> tuple[Path, ...]:
+    """Read the literal payload inventory declared by one installer source."""
+    try:
+        module = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError):
+        raise UpdateError("the package installer has an invalid payload inventory") from None
+
+    declarations: dict[str, tuple[str, ...]] = {}
+    for statement in module.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        names = [target.id for target in statement.targets if isinstance(target, ast.Name)]
+        for inventory_name in PAYLOAD_INVENTORIES:
+            if inventory_name not in names:
+                continue
+            if len(names) != 1 or names[0] != inventory_name or inventory_name in declarations:
+                raise UpdateError("the package installer has an invalid payload inventory")
+            value = statement.value
+            if not isinstance(value, (ast.Tuple, ast.List)):
+                raise UpdateError("the package installer has an invalid payload inventory")
+            filenames: list[str] = []
+            for item in value.elts:
+                if not isinstance(item, ast.Constant) or type(item.value) is not str:
+                    raise UpdateError("the package installer has an invalid payload inventory")
+                filename = item.value
+                try:
+                    encoded = filename.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise UpdateError("the package installer has an invalid payload inventory") from None
+                if (not filename or filename in {".", ".."} or len(encoded) > 255
+                        or "/" in filename or "\\" in filename
+                        or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+                        or PurePosixPath(filename).parts != (filename,)
+                        or filename in filenames):
+                    raise UpdateError("the package installer has an invalid payload inventory")
+                filenames.append(filename)
+            declarations[inventory_name] = tuple(filenames)
+
+    if (set(declarations) != set(PAYLOAD_INVENTORIES)
+            or "install.py" not in declarations["SOURCE_FILES"]):
+        raise UpdateError("the package installer has an invalid payload inventory")
+
+    paths = tuple(
+        path
+        for inventory_name, directory in (
+            ("SOURCE_FILES", Path("scripts/python")),
+            ("SOURCE_SHELL_FILES", Path("scripts")),
+            ("IMMUTABLE_MOUNT_FILES", Path("immutable-mount")),
+        )
+        for path in (directory / filename for filename in declarations[inventory_name])
+    )
+    if len(paths) > MAX_PACKAGE_FILES - 2 or len(set(paths)) != len(paths):
+        raise UpdateError("the package installer has an invalid payload inventory")
+    return paths
+
+
+def _open_private_regular_file(path: Path) -> tuple[int, os.stat_result]:
+    """Open one private, regular file without following links or races."""
+    path = path.absolute()
+    fd: int | None = None
+    try:
+        installer.check_components(path)
+        before = os.lstat(path)
+        if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+                or before.st_mode & 0o7077):
+            raise UpdateError("a package payload file is not a private regular file")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        opened = os.fstat(fd)
+    except UpdateError:
+        if fd is not None:
+            os.close(fd)
+        raise
+    except (OSError, installer.InstallError):
+        if fd is not None:
+            os.close(fd)
+        raise UpdateError("a package payload file could not be read safely") from None
+    if (not stat.S_ISREG(opened.st_mode) or opened.st_mode & 0o7077
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+        os.close(fd)
+        raise UpdateError("a package payload file changed while being opened")
+    return fd, opened
+
+
+def _read_private_source(path: Path, maximum: int) -> bytes:
+    """Read a bounded source file that remains stable while it is opened."""
+    fd, opened = _open_private_regular_file(path)
+    try:
+        if opened.st_size > maximum:
+            raise UpdateError("the package installer source exceeds the supported size")
+        data = bytearray()
+        while len(data) <= maximum:
+            chunk = os.read(fd, min(64 * 1024, maximum + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(fd)
+        if (len(data) > maximum or len(data) != opened.st_size
+                or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            raise UpdateError("the package installer source changed while being read")
+        return bytes(data)
+    except OSError:
+        raise UpdateError("the package installer source could not be read safely") from None
+    finally:
+        os.close(fd)
+
+
+def _payload_inventory(source_root: Path) -> tuple[Path, ...]:
+    """Read a tree's declared payload paths without importing its installer."""
+    data = _read_private_source(source_root / "scripts/python/install.py", MAX_INSTALLER_SOURCE_BYTES)
+    return _parse_payload_inventory(data)
+
+
+def _hash_private_payload_file(path: Path) -> tuple[str, int]:
+    """Hash a bounded private payload file and report the bytes read."""
+    fd, opened = _open_private_regular_file(path)
+    try:
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, min(1024 * 1024, MAX_PACKAGE_BYTES - size + 1))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_PACKAGE_BYTES:
+                raise UpdateError("the package payload exceeds the supported size")
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if (size != opened.st_size
+                or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            raise UpdateError("a package payload file changed while being read")
+        return digest.hexdigest(), size
+    except OSError:
+        raise UpdateError("a package payload file could not be read safely") from None
+    finally:
+        os.close(fd)
+
+
+def package_identity(binary: Path, source_root: Path) -> dict[str, str]:
+    """Hash one tree using the payload inventory declared by that tree."""
+    inventory = _payload_inventory(source_root)
+    files: dict[Path, str] = {}
+    total_size = 0
+    for relative, path in (
+        (Path("bin/rclone"), binary),
+        (Path("degoo-rc"), source_root / "degoo-rc"),
+        *((relative, source_root / relative) for relative in inventory),
+    ):
+        file_hash, size = _hash_private_payload_file(path)
+        total_size += size
+        if total_size > MAX_PACKAGE_BYTES:
+            raise UpdateError("the package payload exceeds the supported size")
+        files[relative] = file_hash
+
+    payload = hashlib.sha256()
+    for relative, file_digest in sorted(files.items(), key=lambda item: item[0].as_posix()):
+        payload.update(relative.as_posix().encode("utf-8"))
+        payload.update(b"\0")
+        payload.update(bytes.fromhex(file_digest))
+    binary_sha256 = files[Path("bin/rclone")]
+    identity = {"binary_sha256": binary_sha256, "payload_sha256": payload.hexdigest()}
+    commit = installer._build_commit(source_root, binary_sha256)
+    if commit is not None:
+        identity["commit"] = commit
+    return identity
 
 
 class ActionsSource:
@@ -249,10 +422,20 @@ def extract_package(archive_path: Path, destination: Path) -> tuple[Path, str]:
                 members.append(member)
                 if len(members) > MAX_PACKAGE_FILES or total_size > MAX_PACKAGE_BYTES:
                     raise UpdateError("the extracted package exceeds the supported size")
+            installer_member = next((member for member in members
+                                     if member.name == "rclone-degoo/scripts/python/install.py"), None)
+            if installer_member is None or installer_member.size > MAX_INSTALLER_SOURCE_BYTES:
+                raise UpdateError("the package archive is incomplete or predates automatic updates")
+            installer_stream = archive.extractfile(installer_member)
+            if installer_stream is None:
+                raise UpdateError("the package archive is incomplete or predates automatic updates")
+            with installer_stream:
+                installer_source = installer_stream.read(MAX_INSTALLER_SOURCE_BYTES + 1)
+            if len(installer_source) != installer_member.size:
+                raise UpdateError("the package archive is incomplete or predates automatic updates")
+            inventory = _parse_payload_inventory(installer_source)
             required = {"degoo-rc", "bin/rclone", "docs/BUILD.json", "scripts/python/install.py",
-                        *(f"scripts/python/{name}" for name in installer.SOURCE_FILES),
-                        *(f"scripts/{name}" for name in installer.SOURCE_SHELL_FILES),
-                        *(f"immutable-mount/{name}" for name in installer.IMMUTABLE_MOUNT_FILES)}
+                        *(relative.as_posix() for relative in inventory)}
             if not {f"rclone-degoo/{name}" for name in required} <= seen:
                 raise UpdateError("the package archive is incomplete or predates automatic updates")
             for member in members:
@@ -291,14 +474,14 @@ def validate_package(package: Path, source: dict[str, Any]) -> dict[str, Any]:
                                 env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", RCLONE_CONFIG=os.devnull))
         if result.returncode != 0:
             raise UpdateError(f"the package failed its local {command} help check")
-    return installer.package_identity(package / "bin/rclone", package)
+    return package_identity(package / "bin/rclone", package)
 
 
 def installed_matches(root: Path, identity: dict[str, Any]) -> bool:
     """Compare the installed program payload, including installations without provenance."""
     try:
-        current = installer.package_identity(root / "bin/rclone", root)
-    except (OSError, installer.InstallError):
+        current = package_identity(root / "bin/rclone", root)
+    except (OSError, UpdateError, installer.InstallError):
         return False
     return current["payload_sha256"] == identity["payload_sha256"]
 

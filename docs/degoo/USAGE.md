@@ -80,6 +80,48 @@ is an explicit, guarded option, not a routine update repair. Deleting queued
 cache data is an exceptional recovery action and should occur only when the
 user has explicitly authorized that data loss for a specific recovery plan.
 
+## Updating with pending uploads and an older updater
+
+An ordinary `degoo-rc update` keeps pending uploads in the local cache, flushes
+their data and recovery metadata, normally unmounts, installs the package, and
+restarts a previously active mount. No queue-drain or resume flag is required.
+Do not select `--delete-cache` or `--wait-for-uploads` when the intention is to
+restart with pending work. Open application handles can delay preparation;
+`--writer-timeout 2m` allows more time for those handles to close. Preparation
+failure leaves the runtime and installation intact.
+
+The restarted mount queues dirty logical files again. An interrupted logical
+file can upload again from its beginning: there is no persistent transfer
+offset or per-chunk resume journal. Completed files remain completed. The
+local FUSE recovery tests exercise generated pending writes; interruption of
+an active multi-chunk upload against Degoo remains a live acceptance gate.
+
+An older updater can report `the downloaded package does not match its update
+manifest` when a valid release adds a helper absent from its own file list,
+such as `stats.py`. This failure happens before mount preparation and leaves
+the existing upload running. The corrected updater reads each tree's own
+inventory. To bootstrap an affected installation, use the verified package's
+own updater rather than replacing installed scripts manually.
+
+Replace `RUN_ID` below with the successful staging workflow run shown by the
+updater. Run as the installing user, outside the mounted vault. These commands
+download from GitHub, check the archive's matching checksum, and run the
+bundled updater against that archive; temporary files stay outside the mount.
+The local archive mode verifies its checksum and binary/package contents; it
+does not repeat the GitHub metadata/run comparison. Use the artifact from the
+same verified successful run and keep its checksum sidecar beside it.
+
+```sh
+cd /tmp
+update_dir=$(mktemp -d /tmp/rclone-degoo-update.XXXXXX)
+gh run download RUN_ID --repo georgeasiminei/rclone-degoo \
+  --name rclone-degoo-linux-amd64 --dir "$update_dir" &&
+  (cd "$update_dir" && sha256sum -c rclone-degoo-linux-amd64.tar.gz.sha256) &&
+  tar -xzf "$update_dir/rclone-degoo-linux-amd64.tar.gz" -C "$update_dir" &&
+  TMPDIR=/tmp "$update_dir/rclone-degoo/degoo-rc" update \
+    --archive "$update_dir/rclone-degoo-linux-amd64.tar.gz"
+```
+
 ## Tab completion in Bash
 
 Enable completion in the current terminal:

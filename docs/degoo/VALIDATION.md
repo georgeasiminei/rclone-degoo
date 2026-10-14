@@ -8,6 +8,42 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Updates across helper inventory changes — 2026-10-14
+
+An installed updater without `stats.py` in its helper inventory rejected the
+first statistics package during manifest comparison. The published archive,
+binary hash, and commit matched; only the payload hash differed because the
+old updater omitted the added helper. The mismatch was reproduced with the
+published staging artifact before any runtime preparation or installation.
+Its target installer produced the expected manifest hash.
+
+The updater now parses each tree's literal payload inventory without importing
+or executing that tree's installer. Both archive completeness and canonical
+payload hashing use those declarations. Existing checksum, source commit,
+binary validation, and post-install matching remain in place.
+
+Validation passed:
+
+- The inventory-drift regression failed before the fix. Added- and
+  removed-helper fixtures pass afterward, and a changed or missing new helper
+  prevents an installed-payload match. Invalid literal inventories are refused.
+- The full Python helper suite passed (428 tests), the packaging self-check
+  passed, and the fixed updater validated the exact published artifact against
+  its update manifest, archive checksum/size, binary hash, and commit.
+- The published package's own updater upgraded an isolated old-inventory
+  installation using `--archive`; generated pending bytes and vault
+  configuration remained byte-for-byte unchanged. Runtime stop/start actions
+  were mocked, so this is not evidence of a live Degoo service update.
+- `TestVaultNativeUpdatePreparation` passed with both local FUSE mount
+  implementations. Pending generated encrypted data survived preparation and
+  remount, then completed upload to the local fixture.
+- Scoped Markdown lint and `git diff --check` passed.
+
+Validation made no Degoo requests and did not stop or replace the installed
+production mount. An interrupted logical-file upload retries from the start
+after restart; byte-offset or persistent per-chunk resume is unsupported.
+Active multi-chunk interruption against Degoo remains a live acceptance gate.
+
 ## Local performance statistics — 2026-10-14
 
 `degoo-rc stats` reads aggregate counters from the private mount socket and
