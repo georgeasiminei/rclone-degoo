@@ -1228,3 +1228,18 @@ The resolver now follows the native mount's private-cache contract, validating
 the owned cache directory and rejecting symlink components without requiring
 the enclosing volume to be private. A regression covers a private cache under
 a writable shared volume and still rejects a non-private cache directory.
+
+The clean build of commit `64346f2d802ebfc665c1bdf44af213a4672ab1cb` was
+packaged and installed locally. After normal unmount, the cache identity was
+rebound offline to the direct external path. The obsolete cache bind mount
+and its `fstab` entry were removed; the service condition now checks the
+underlying volume rather than the former bind target. No cache data was
+discarded, and configuration hashes other than the intentional vault-path
+change remained identical, including authentication and provider cooldown.
+
+After restart, `vault.json`, the running process's `XDG_CACHE_HOME`, and
+`degoo-rc info` all selected the direct external cache directory. The mount
+and service were active, with zero pending files and zero provider HTTP
+attempts. Repeating the same local-package update returned an unchanged-build
+no-op while the external path remained configured. These are local lifecycle
+checks; live provider uploads remain unverified during cooldown.
