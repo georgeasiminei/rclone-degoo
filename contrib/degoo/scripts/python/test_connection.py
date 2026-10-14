@@ -13,12 +13,15 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import connection
+import install
 
 
 class ConnectionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "install"
+        self.root.mkdir(mode=0o700)
         (self.root / "tmp").mkdir()
 
     def tearDown(self) -> None:
@@ -69,12 +72,51 @@ class ConnectionTest(unittest.TestCase):
     def test_existing_vault_enables_saved_password_for_connection_checks(self) -> None:
         vault = self.root / "config/vault.json"
         vault.parent.mkdir(mode=0o700)
-        vault.write_text("{}\n", encoding="utf-8")
+        vault.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "remote": f"{install.REMOTE_NAME}:",
+                    "password": "vault-secret",
+                    "cache_dir": str(self.root / "cache"),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         vault.chmod(0o600)
         with mock.patch.object(connection.subprocess, "run", side_effect=self._run_result()) as run:
             connection.check_connection(self.root)
         args = run.call_args.args[0]
         self.assertEqual(args[args.index("--vault-config") + 1], str(vault))
+
+    def test_folder_query_uses_configured_external_cache_not_default_decoy(self) -> None:
+        config = self.root / "config"
+        config.mkdir(mode=0o700)
+        default_cache = self.root / "cache"
+        default_cache.mkdir(mode=0o700)
+        external_cache = self.base / "external cache"
+        external_cache.mkdir(mode=0o700)
+        vault = config / "vault.json"
+        vault.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "remote": f"{install.REMOTE_NAME}:",
+                    "password": "vault-secret",
+                    "cache_dir": str(external_cache),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        vault.chmod(0o600)
+
+        with mock.patch.object(connection.subprocess, "run", side_effect=self._run_result()) as run:
+            connection.check_connection(self.root)
+
+        self.assertEqual(run.call_args.kwargs["env"]["XDG_CACHE_HOME"], str(external_cache))
+        self.assertNotEqual(run.call_args.kwargs["env"]["XDG_CACHE_HOME"], str(default_cache))
 
     def test_list_folders_queries_children_and_preserves_same_name_entries(self) -> None:
         response = json.dumps(

@@ -33,7 +33,7 @@ def _root(value: str) -> Path:
         installer.check_directory(root / "config", private=True)
         installer.check_directory(root / "logs", private=True)
         installer.check_directory(root / "tmp", private=True)
-        installer.check_directory(root / "cache", private=True)
+        installer.check_directory(installer.configured_cache_dir(root), private=True)
         installer.load_manifest(root)
         return root
     except installer.InstallError as exc:
@@ -76,10 +76,15 @@ def _binary(root: Path) -> Path:
 
 def _run_create(root: Path, parent_id: str, name: str) -> str:
     binary = _binary(root)
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+        installer.check_directory(cache_dir, private=True)
+    except installer.InstallError:
+        raise SetupError("the configured local cache directory is unavailable or unsafe") from None
     env = {
         "HOME": str(installer.home_directory()),
         "XDG_CONFIG_HOME": str(root / "config"),
-        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_CACHE_HOME": str(cache_dir),
         "TMPDIR": str(root / "tmp"),
         "PATH": "/usr/bin:/bin",
         "LANG": "C.UTF-8",

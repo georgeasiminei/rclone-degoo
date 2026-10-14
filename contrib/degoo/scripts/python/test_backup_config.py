@@ -165,6 +165,32 @@ class BackupConfigTest(unittest.TestCase):
         self.assertEqual(self.pending.read_bytes(), pending_before)
         self.assertTrue((self.root / "cache").joinpath(next(path.name for path in (self.root / "cache").iterdir() if path.name.endswith(".lock"))).exists())
 
+    def test_backup_with_external_cache_keeps_runtime_data_out_and_restore_uses_target_default(self) -> None:
+        external_cache = self.base / "external cache"
+        external_cache.mkdir(mode=0o700)
+        external_cache.chmod(0o700)
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        raw_external_path = str(external_cache) + "//"
+        vault["cache_dir"] = raw_external_path
+        self.write_private(vault_path, (json.dumps(vault, sort_keys=True) + "\n").encode())
+        runtime_data = external_cache / "generated-pending-data"
+        self.write_private(runtime_data, b"pending content stays in the runtime cache")
+
+        destination = backup_config.run(self.root, self.base / "external-cache-backup")
+
+        self.assertFalse((destination / "cache").exists())
+        self.assertEqual(
+            json.loads((destination / "config/vault.json").read_bytes())["cache_dir"],
+            raw_external_path,
+        )
+        self.assertEqual(runtime_data.read_bytes(), b"pending content stays in the runtime cache")
+        restored = restore.inspect_backup(destination, self.base / "restored-install")
+        self.assertEqual(
+            restored.vault_settings["cache_dir"],
+            str(self.base / "restored-install" / "cache"),
+        )
+
     def test_command_creates_missing_private_parent_and_explains_backup_exclusions(self) -> None:
         destination = self.home / "private-backups" / "backup one"
         stdout = io.StringIO()

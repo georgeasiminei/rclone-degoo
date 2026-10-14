@@ -331,6 +331,14 @@ its directories to owner-only access (`0700`) and private config files to
 `0600`. The wizard offers to enable the systemd user service by default when a
 user manager responds. It does not enable lingering automatically.
 
+The initial cache defaults to the install's `cache/` directory. After setup,
+`cache_dir` in `config/vault.json` is authoritative; all helpers accept a
+validated dedicated private absolute path outside the install. Upgrades retain
+that value. Moving an existing cache also changes its local identity: follow
+the offline migration steps in [USAGE.md](USAGE.md), preserving the vault key
+and complete pending data. Portable imported backups choose a destination
+cache instead of reusing another machine's absolute path.
+
 New contained installs mount at `/mnt/degoo`. The installer tries to create
 that directory with mode `0700`. If it cannot create or secure the path, it
 prints privileged commands for the selected mountpoint and current user, such

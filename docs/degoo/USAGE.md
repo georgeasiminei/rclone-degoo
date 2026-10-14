@@ -26,8 +26,8 @@ Follow-up fixes for cross-process cooldown-state merging and bounded metadata
 calls passed scoped checks and a rebuilt localhost FUSE smoke test. The final
 full Go suite passed after a small error-path fix. Live Degoo upload recovery
 with the current code remains unverified.
-The external cache migration is complete: its copy was SHA-256 verified and
-bind-mounted over the unchanged recorded cache path. Startup is guarded so the
+The initial external cache migration was SHA-256 verified and used a bind
+mount to retain the recorded cache path. Startup was guarded so the
 service only runs when that path is a mount point; see [VALIDATION.md](VALIDATION.md).
 
 The contained installer and maintenance commands use one `degoo-rc` entrypoint.
@@ -432,58 +432,57 @@ small-object cache hits/misses/fills/evictions. It does not show IDs, names,
 URLs, request bodies, or credentials. Live upload recovery with the current
 code has not yet been tested against Degoo.
 
-The cache contains plaintext VFS data, including pending writes. To move it to
-a separate volume, keep the vault configuration's `cache_dir` unchanged and
-bind the new storage at that exact path. For an installed cache, the default
-path is under `$HOME/.local/share/rclone-degoo`; the `cache_dir` field in the
-vault JSON is authoritative if it was set elsewhere.
+The cache contains plaintext VFS data, including pending writes. The
+`cache_dir` in the private vault JSON is authoritative for the mount and its
+installed helpers. The default is `$HOME/.local/share/rclone-degoo/cache`;
+a dedicated owner-private absolute directory on another volume is supported
+without a bind mount. Update, status, disk reporting, locks, and cache retention
+use that configured location. Unsafe paths and conflicting cache identities
+are refused.
 
-1. Stop the user service or unmount the foreground mount normally, then verify
-   the mount is gone and no process holds the cache. Do not copy a live cache.
-2. Mount the external filesystem before starting the service. Create an
-   owner-private directory (mode `0700`) such as `/data.tr/degoo-cache`, and
-   copy the complete recorded cache into it while preserving ownership and
-   permissions.
-3. With the mount still stopped, compare checksums for all files under the old
-   and copied cache, checking file contents rather than only names, sizes, or
-   timestamps. Keep the old directory as a rollback copy until the new bind
-   mount is verified.
-4. Add a required bind entry to `/etc/fstab`, using absolute paths. For
-   example, replace the second path with the exact `cache_dir` from the vault
-   configuration:
+To move an existing cache:
 
-   ```text
-   /data.tr/degoo-cache  /absolute/path/from-vault-cache_dir  none  bind  0  0
+1. Stop the service or unmount normally and verify that the mount is gone.
+   Back up the vault configuration and keep it private (mode `0600`).
+2. Mount the destination filesystem, create a dedicated cache directory with
+   mode `0700`, and copy the complete cache with ownership and modes preserved.
+   Include the identity file, VFS data, recovery metadata, and encrypted
+   small-object cache. Do not copy a live cache or merge different vault caches.
+3. Compare full file checksums between the source and destination. Keep the old
+   cache and vault configuration until the destination has been verified.
+4. Change only `cache_dir` in `vault.json` to the new absolute path. Rebind the
+   copied cache identity locally using the original private configuration:
+
+   ```sh
+   rclone --config /path/to/rclone.conf degoo restore-cache \
+     /path/to/original-vault.json /path/to/vault.json \
+     --folder-id YOUR_CONFIGURED_VAULT_FOLDER_ID
    ```
 
-   `fstab` does not expand `$HOME`; replace the placeholder with the exact
-   absolute `cache_dir` recorded in the vault configuration. The underlying
-   target directory must be empty and mode `0500` while it is unbound. Do not
-   add `nofail`: the mount should not start with an empty underlying cache if
-   the external volume is unavailable.
-5. Add a user-service drop-in with a mount-point condition for the same exact
-   cache path:
+   This command is offline. The folder ID must match the installed remote, and
+   the configurations must match except for cache location. Preserve the vault
+   password, salt, chunk size, and object cap.
+5. If the cache is on a separately mounted volume, arrange for that volume to
+   be mounted before the service starts. An optional user-service condition
+   can require the volume's mountpoint:
 
    ```ini
    [Unit]
-   ConditionPathIsMountPoint=/absolute/path/from-vault-cache_dir
+   ConditionPathIsMountPoint=/path/to/cache-volume
    ```
 
-   Replace the placeholder with the saved absolute `cache_dir`, then reload
-   the user manager. Mount the bind entry, confirm it targets the external
-   filesystem and is still private to the owner, then start the service or
-   mount. Keep the original vault configuration and cache identity unchanged.
+   Use the filesystem mountpoint, not an ordinary cache subdirectory. Reload
+   the user manager after changing a drop-in. Remove obsolete cache bind-mount
+   entries and conditions when switching from a bind-mounted path to the direct
+   path.
+6. Start the service or mount, check `degoo-rc status` and `degoo-rc info`, and
+   compare the pending queue with the saved state. Remove the old copy only
+   after confirming the new cache works.
 
-The ordinary startup helper continues to use the saved cache path. A bind
-mount moves the backing storage without rebinding the vault identity. The
-completed copy was SHA-256 verified across 1,886 files totaling 258.013 GiB.
-Two dirty files truncated by an out-of-space copy were restored from stable
-originals and verified by full SHA-256. All 941 physical cache data files had
-complete ranges and remained dirty after restoration. The bind mount uses the
-same recorded cache path, preserving cache identity and pending local writes;
-it does not send them to Degoo. The old local copy was removed after the copy,
-restoration, and bind verification completed. Root storage recovered about
-258 GiB; see [VALIDATION.md](VALIDATION.md) for the runtime status.
+The initial external-cache migration used a bind mount to work around the
+helpers' former fixed-path restriction. Its SHA-256 verification and pending
+write restoration are recorded in [VALIDATION.md](VALIDATION.md). A bind mount
+remains an optional storage arrangement; it is not required by the helpers.
 
 ## Mounted throughput benchmark
 
@@ -603,8 +602,8 @@ and reads use each stored chunk's actual size; future writes use the configured
 size. Changing chunk size changes the local cache identity. Before changing it,
 wait for pending uploads to reach zero, unmount normally, and back up the vault
 configuration and cache. Start the new identity with a fresh, empty cache
-namespace and backing directory. The installed helpers expect the recorded
-`cache_dir` path to remain stable, so bind the new backing directory there.
+namespace and backing directory. The helpers use its configured `cache_dir`;
+a bind mount is optional.
 Confirm the configured `max_object_size` can hold the encrypted chunk, which is
 slightly larger than the plaintext chunk. The provisional 19 GiB cap includes
 crypt headers and authentication tags and leaves a margin below the historical

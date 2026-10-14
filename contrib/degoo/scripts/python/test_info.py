@@ -68,7 +68,15 @@ class InfoTest(unittest.TestCase):
         self.write_private(self.root / "config/mount.json", install.DEFAULT_MOUNT_SETTINGS)
         self.write_private(
             self.root / "config/vault.json",
-            {"version": 1, "remote": "degoo-live-test:", "password": "vault-secret", "password_salt": "salt-secret", "chunk_size": "1Gi", "max_object_size": "19Gi"},
+            {
+                "version": 1,
+                "remote": f"{install.REMOTE_NAME}:",
+                "password": "vault-secret",
+                "password_salt": "salt-secret",
+                "cache_dir": str(self.root / "cache"),
+                "chunk_size": "1Gi",
+                "max_object_size": "19Gi",
+            },
         )
         self.write_private(self.root / "config/rclone.conf", "[degoo-live-test]\ntype = degoo\n")
         self.write_private(self.root / "config/auth.json", {"token": "opaque-access-secret", "refresh_token": "refresh-secret"})
@@ -414,6 +422,65 @@ class InfoTest(unittest.TestCase):
         response = b'[{"id":"private-id","name":"Device","category":"device"}]'
         self.assertEqual(info._remote_names(response), ["Device"])
         self.assertIsNone(info._remote_names(b'[{"ID":"private-id","Name":"Device"}]'))
+
+    def test_remote_check_uses_the_configured_external_cache(self) -> None:
+        external_cache = self.base / "separate cache"
+        external_cache.mkdir(mode=0o700)
+        external_cache.chmod(0o700)
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        vault["cache_dir"] = str(external_cache)
+        self.write_private(vault_path, vault)
+        observed = self.base / "observed-cache-path"
+        binary = self.root / "bin/rclone"
+        binary.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s' \"$XDG_CACHE_HOME\" > {shlex.quote(str(observed))}\n"
+            "printf '%s\\n' '[]'\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+        state, names = info.remote_location(self.root)
+
+        self.assertEqual((state, names), ("checked", []))
+        self.assertEqual(observed.read_text(encoding="utf-8"), str(external_cache))
+
+    def test_report_and_bounded_scan_use_external_cache_for_disk_usage(self) -> None:
+        external_cache = self.base / "separate cache"
+        external_cache.mkdir(mode=0o700)
+        external_cache.chmod(0o700)
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        vault["cache_dir"] = str(external_cache)
+        self.write_private(vault_path, vault)
+        cached_file = external_cache / "vfsMeta/metadata.json"
+        cached_file.parent.mkdir(mode=0o700)
+        cached_file.write_bytes(b"x" * 13)
+        decoy = self.root / "cache/unused-decoy"
+        decoy.write_bytes(b"old default cache decoy")
+
+        scan = info.scan_install_tree(
+            self.root,
+            external_cache,
+            self.root / "mount",
+            mountpoints=set(),
+        )
+        self.assertEqual(scan["cache_allocated"], cached_file.stat().st_blocks * 512)
+        self.assertGreater(scan["allocated"], scan["cache_allocated"])
+
+        with (
+            mock.patch.object(info, "service_status", return_value="not configured for this install"),
+            mock.patch.object(info, "mounted_state", return_value="not mounted"),
+            mock.patch.object(info, "linger_status", return_value="unknown"),
+            mock.patch.object(info, "pending_uploads", return_value=(0, 0)),
+            mock.patch.object(info, "filesystem_stats", wraps=info.filesystem_stats) as filesystem_stats,
+        ):
+            report = info.report(self.root, self.manifest)
+
+        filesystem_stats.assert_called_once_with(external_cache)
+        self.assertIn(f"Cache: {external_cache}", report)
+        self.assertIn(f"Cache backing filesystem: {external_cache}", report)
 
     def test_remote_check_sanitizes_login_error(self) -> None:
         binary = self.root / "bin/rclone"

@@ -1169,6 +1169,45 @@ class WizardTest(unittest.TestCase):
         )
         wait_mount.assert_called_once_with(root / "mount", "not mounted", timeout=15.0)
 
+    def test_disconnected_mount_recovery_validates_configured_external_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "install"
+            root.mkdir(mode=0o700)
+            (root / "config").mkdir(mode=0o700)
+            external_cache = base / "external cache"
+            external_cache.mkdir(mode=0o700)
+            self._write_private(
+                root / "config/vault.json",
+                (
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "remote": f"{wizard.installer.REMOTE_NAME}:",
+                            "password": "vault-secret",
+                            "cache_dir": str(external_cache),
+                        }
+                    )
+                    + "\n"
+                ).encode(),
+            )
+            lock_fd = os.open(os.devnull, os.O_RDONLY)
+            with (
+                mock.patch.object(wizard.cleanup, "_acquire_cache_lock", return_value=lock_fd) as acquire_lock,
+                mock.patch.object(wizard.os, "close", wraps=os.close) as close_lock,
+                mock.patch.object(wizard, "_observed_mount_state", return_value="not mounted"),
+            ):
+                try:
+                    wizard._recover_disconnected_mount(root, input_fn=lambda _: "", service_configured=True)
+                finally:
+                    try:
+                        os.close(lock_fd)
+                    except OSError:
+                        pass
+
+        acquire_lock.assert_called_once_with(root, wait_seconds=0)
+        close_lock.assert_any_call(lock_fd)
+
     def test_disconnected_mount_recovery_never_lazily_unmounts_without_safe_checks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"

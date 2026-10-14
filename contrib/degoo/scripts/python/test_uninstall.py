@@ -103,6 +103,32 @@ class UninstallTest(unittest.TestCase):
         binary.write_text("#!/bin/sh\nprintf '%s\\n' '" + status + "'\n", encoding="ascii")
         binary.chmod(0o700)
 
+    def set_external_cache(self, path: Path) -> None:
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+        self.vault = self.vault | {"cache_dir": str(path)}
+        self.vault_bytes = (json.dumps(self.vault, sort_keys=True) + "\n").encode()
+        self.retained_vault = {key: value for key, value in self.vault.items() if key != "account_credentials"}
+        self.retained_vault_bytes = (json.dumps(self.retained_vault, sort_keys=True) + "\n").encode()
+        self.write_private(self.root / "config/vault.json", self.vault_bytes)
+
+    def add_cache_file(self, name: str, data: bytes, *, cache: Path | None = None) -> Path:
+        cache_root = cache or self.root / "cache"
+        cache_name = restore._cache_name()
+        for parent in ("vfs", "vfsMeta"):
+            namespace = cache_root / parent / cache_name
+            namespace.mkdir(parents=True, mode=0o700, exist_ok=True)
+            namespace.chmod(0o700)
+            namespace.parent.chmod(0o700)
+        self.write_private(cache_root / f"{cache_name}.identity", b"a" * 64 + b"\n")
+        path = cache_root / "vfs" / cache_name / name
+        self.write_private(path, data)
+        self.write_private(
+            cache_root / "vfsMeta" / cache_name / name,
+            json.dumps({"Dirty": True, "Size": len(data), "Fingerprint": "generated fingerprint"}).encode(),
+        )
+        return path
+
     def invoke(self, *extra: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -299,7 +325,7 @@ class UninstallTest(unittest.TestCase):
 
     def test_wizard_copies_selected_config_and_cache_to_private_directory(self) -> None:
         destination = self.base / "retained-state"
-        self.write_private(self.root / "cache/pending.bin", b"pending bytes")
+        self.add_cache_file("pending.bin", b"pending bytes")
         with (
             mock.patch.object(uninstall, "_default_retention_directory", return_value=destination),
             mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
@@ -320,7 +346,7 @@ class UninstallTest(unittest.TestCase):
         self.assertFalse((destination / "config/auth.json").exists())
         self.assertFalse((destination / "config/auth.json.lock").exists())
         self.assertEqual((destination / "config/login.json").read_bytes(), b'{"email":"owner@example.test"}\n')
-        self.assertEqual((destination / "cache/pending.bin").read_bytes(), b"pending bytes")
+        self.assertEqual((destination / "cache/vfs" / restore._cache_name() / "pending.bin").read_bytes(), b"pending bytes")
         self.assertFalse((destination / "logs").exists())
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
         self.assertEqual((destination / "config/vault.json").stat().st_mode & 0o777, 0o600)
@@ -385,7 +411,7 @@ class UninstallTest(unittest.TestCase):
 
     def test_pending_uploads_can_be_retained_only_with_config_and_cache(self) -> None:
         destination = self.base / "pending-recovery"
-        self.write_private(self.root / "cache/pending.bin", b"pending bytes")
+        self.add_cache_file("pending.bin", b"pending bytes")
         self.write_rclone("Pending local uploads: 2 files, 123 bytes")
         with mock.patch.object(uninstall, "read_mountpoints", return_value=set()):
             code, stdout, stderr = self.invoke(
@@ -399,11 +425,110 @@ class UninstallTest(unittest.TestCase):
         self.assertIn("were preserved in", stdout)
         self.assertIn("fresh Degoo login is required after restoration", stdout)
         self.assertFalse(self.root.exists())
-        self.assertEqual((destination / "cache/pending.bin").read_bytes(), b"pending bytes")
+        self.assertEqual((destination / "cache/vfs" / restore._cache_name() / "pending.bin").read_bytes(), b"pending bytes")
         self.assertEqual((destination / "config/vault.json").read_bytes(), self.retained_vault_bytes)
         self.assertFalse((destination / "config/auth.json").exists())
         self.assertTrue((destination / "bin/rclone").stat().st_mode & 0o100)
         self.assertTrue((destination / "install.json").exists())
+
+    def test_external_pending_cache_is_retained_then_only_owned_namespace_is_removed(self) -> None:
+        cache = self.base / "external-cache"
+        self.set_external_cache(cache)
+        sibling = self.base / "external-cache-not-owned"
+        sibling.mkdir(mode=0o700)
+        sibling_file = sibling / "keep"
+        sibling_file.write_bytes(b"unrelated generated data")
+        cache_data = self.add_cache_file("pending.bin", b"pending payload", cache=cache)
+        self.write_rclone("Pending local uploads: 1 files, 15 bytes")
+        destination = self.base / "retained-external-cache"
+
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()):
+            code, stdout, stderr = self.invoke(
+                "--delete-local", "--keep-config", "--keep-cache", "--keep-directory", str(destination)
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("were preserved in", stdout)
+        self.assertFalse(self.root.exists())
+        self.assertTrue((destination / "cache/vfs" / restore._cache_name() / "pending.bin").is_file())
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(sorted(path.name for path in cache.iterdir()), [f"{restore._cache_name()}.lock"])
+        self.assertFalse(cache_data.exists())
+        self.assertEqual(sibling_file.read_bytes(), b"unrelated generated data")
+
+    def test_cache_cleanup_refuses_an_unknown_file_added_after_audit(self) -> None:
+        cache = self.base / "external cache"
+        self.set_external_cache(cache)
+        unknown = cache / "unrelated.txt"
+        unknown.write_bytes(b"keep these bytes")
+        unknown.chmod(0o600)
+        with mock.patch.object(uninstall, "_audit_cache_namespace", return_value=False):
+            with self.assertRaisesRegex(uninstall.CleanupError, "unknown path appeared"):
+                uninstall._remove_owned_cache(self.root, cache, uninstall._cache_lock_path(self.root))
+        self.assertEqual(unknown.read_bytes(), b"keep these bytes")
+
+    def test_external_cache_uses_its_actual_writer_lock(self) -> None:
+        cache = self.base / "external-cache"
+        self.set_external_cache(cache)
+        path = uninstall._cache_lock_path(self.root)
+        self.assertEqual(path.parent, cache)
+        fd = uninstall._acquire_cache_lock(self.root, 0)
+        try:
+            with self.assertRaisesRegex(uninstall.CleanupError, "cache is active"):
+                uninstall._acquire_cache_lock(self.root, 0)
+        finally:
+            os.close(fd)
+
+    def test_external_uninstall_refuses_files_left_in_legacy_cache(self) -> None:
+        cache = self.base / "external-cache"
+        self.set_external_cache(cache)
+        legacy_file = self.root / "cache/old-pending.bin"
+        self.write_private(legacy_file, b"old local pending data")
+
+        code, _, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 2)
+        self.assertIn("legacy install cache still contains local files", stderr)
+        self.assertTrue(legacy_file.is_file())
+        self.assertTrue(self.root.exists())
+        self.assertTrue(cache.is_dir())
+
+    def test_external_uninstall_refuses_a_mismatched_cache_identity(self) -> None:
+        cache = self.base / "external-cache"
+        self.set_external_cache(cache)
+        self.add_cache_file("pending.bin", b"pending payload", cache=cache)
+        destination = self.base / "retained-mismatch"
+        self.write_rclone("Pending local uploads: 0 files, 0 bytes")
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()), \
+                mock.patch.object(uninstall, "_verify_cache_identity", side_effect=uninstall.CleanupError("identity mismatch")):
+            code, _, stderr = self.invoke(
+                "--delete-local", "--keep-config", "--keep-cache", "--keep-directory", str(destination)
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("identity mismatch", stderr)
+        self.assertTrue(self.root.exists())
+        self.assertTrue((cache / "vfs" / restore._cache_name() / "pending.bin").is_file())
+        self.assertFalse(destination.exists())
+
+    def test_external_uninstall_refuses_orphaned_vfs_data_before_stopping_runtime(self) -> None:
+        cache = self.base / "external-cache"
+        self.set_external_cache(cache)
+        cache_name = restore._cache_name()
+        data = cache / "vfs" / cache_name / "orphaned-pending.bin"
+        data.parent.mkdir(parents=True, mode=0o700)
+        data.parent.chmod(0o700)
+        data.parent.parent.chmod(0o700)
+        self.write_private(data, b"generated pending bytes")
+        self.write_private(cache / f"{cache_name}.identity", b"a" * 64 + b"\n")
+
+        code, _, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 2)
+        self.assertIn("recovery metadata is incomplete", stderr)
+        self.assertTrue(self.root.exists())
+        self.assertEqual(data.read_bytes(), b"generated pending bytes")
+        self.assertTrue((cache / "vfs" / cache_name).is_dir())
 
     def test_retention_filters_account_auth_and_restores_pending_cache(self) -> None:
         cache_name = restore._cache_name()

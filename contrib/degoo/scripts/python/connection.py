@@ -89,6 +89,10 @@ def _folder_entries(data: bytes) -> list[dict[str, Any]]:
 
 def _run_folder_query(root: Path, parent_id: str) -> bytes:
     root = Path(root)
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError:
+        raise ProviderQueryError("the configured local cache directory is unavailable or unsafe") from None
     binary = root / "bin" / "rclone"
     config = root / "config" / "rclone.conf"
     auth = root / "config" / "auth.json"
@@ -96,7 +100,7 @@ def _run_folder_query(root: Path, parent_id: str) -> bytes:
     env = {
         "HOME": str(installer.home_directory()),
         "XDG_CONFIG_HOME": str(root / "config"),
-        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_CACHE_HOME": str(cache_dir),
         "TMPDIR": str(output_path),
         "PATH": "/usr/bin:/bin",
         "LANG": "C.UTF-8",

@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import install as installer
+
 
 class LoginError(Exception):
     """A safe error message for the contained account login helper."""
@@ -171,13 +173,18 @@ def run(root: Path, *, clear_email: bool) -> int:
     vault_path = config_dir / "vault.json"
     _check_components(vault_path.parent)
     credential_args = ["--vault-config", str(vault_path)] if os.path.lexists(vault_path) else []
-    for required in (root / "logs", root / "tmp", root / "cache"):
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+        installer.check_directory(cache_dir, private=True)
+    except installer.InstallError:
+        raise LoginError("the configured local cache directory is unavailable or unsafe") from None
+    for required in (root / "logs", root / "tmp", cache_dir):
         _check_components(required)
     _write_email(email_path, email)
     env = {
         "HOME": str(account_home),
         "XDG_CONFIG_HOME": str(config_dir),
-        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_CACHE_HOME": str(cache_dir),
         "TMPDIR": str(root / "tmp"),
         "PATH": "/usr/bin:/bin",
         "LANG": "C.UTF-8",

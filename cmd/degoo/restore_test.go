@@ -159,3 +159,40 @@ func TestRestoreCacheIdentityRejectsActiveCacheLock(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, identity, got)
 }
+
+func TestVerifyCacheIdentityIsReadOnlyWithActiveLock(t *testing.T) {
+	setRestoreTestRemote(t, restoreTestFolderID)
+	_, cfg, _, filename := restoreTestConfigs(t)
+	identity, err := cacheIdentity(cfg, restoreCacheRemote+"\x00"+restoreTestFolderID)
+	require.NoError(t, err)
+	identityFilename := writeRestoreIdentity(t, cfg, identity)
+	before, err := os.Stat(identityFilename)
+	require.NoError(t, err)
+	lock, err := lockCache(cfg)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, lock.Close()) }()
+
+	require.NoError(t, verifyCacheIdentity(filename, restoreTestFolderID))
+	require.Error(t, verifyCacheIdentity(filename, "another-folder"))
+	after, err := os.Stat(identityFilename)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(before, after))
+	require.Equal(t, before.ModTime(), after.ModTime())
+	got, err := auth.ReadPrivateFile(identityFilename)
+	require.NoError(t, err)
+	require.Equal(t, identity, got)
+}
+
+func TestVerifyCacheIdentityRejectsMissingAndMismatchedIdentity(t *testing.T) {
+	setRestoreTestRemote(t, restoreTestFolderID)
+	_, cfg, _, filename := restoreTestConfigs(t)
+	require.Error(t, verifyCacheIdentity(filename, restoreTestFolderID))
+	entries, err := os.ReadDir(cfg.CacheDir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	identityFilename := writeRestoreIdentity(t, cfg, []byte("different identity\n"))
+	require.Error(t, verifyCacheIdentity(filename, restoreTestFolderID))
+	got, err := auth.ReadPrivateFile(identityFilename)
+	require.NoError(t, err)
+	require.Equal(t, []byte("different identity\n"), got)
+}

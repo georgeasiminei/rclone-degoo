@@ -24,7 +24,11 @@ MAX_MANIFEST_SIZE = 64 * 1024
 MAX_PRIVATE_CONFIG_SIZE = 1024 * 1024
 MAX_IDENTITY_SIZE = 128
 MAX_LOCK_SIZE = 4096
+MAX_METADATA_CACHE_FILE_SIZE = (256 << 10) + 1024
+MAX_METADATA_CACHE_BYTES = 64 << 20
+MAX_METADATA_CACHE_ENTRIES = 8192
 IDENTITY_PATTERN = re.compile(rb"[0-9a-f]{64}\n?")
+METADATA_CACHE_FILE = re.compile(r"[0-9a-f]{64}\.cache\Z")
 CONFIG_FILES = {"auth.json", "login.json", "mount.json", "rclone.conf", "vault.json"}
 SPARSE_SEEK_UNSUPPORTED = {
     errno.EINVAL,
@@ -343,6 +347,42 @@ def _scan_cache(path: Path) -> tuple[bool, tuple[tuple[Any, ...], ...]]:
             if info.st_size > MAX_LOCK_SIZE:
                 raise RestoreError("the retained cache lock file is invalid")
             snapshot[entry.name] = _stamp(info)
+        elif entry.name == "metadata":
+            top_info = _private_cache_directory(entry)
+            snapshot[entry.name] = _stamp(top_info)
+            try:
+                children = sorted(entry.iterdir(), key=lambda item: item.name)
+            except OSError:
+                raise RestoreError("the retained metadata cache could not be inspected") from None
+            if any(child.name != cache_name for child in children):
+                raise RestoreError("the retained metadata cache contains an unknown namespace")
+            if children:
+                metadata_dir = children[0]
+                metadata_info = _private_cache_directory(metadata_dir)
+                snapshot[f"metadata/{cache_name}"] = _stamp(metadata_info)
+                try:
+                    metadata_entries = sorted(metadata_dir.iterdir(), key=lambda item: item.name)
+                except OSError:
+                    raise RestoreError("the retained metadata cache could not be inspected") from None
+                if len(metadata_entries) > MAX_METADATA_CACHE_ENTRIES + 1:
+                    raise RestoreError("the retained metadata cache exceeds its bounded entry count")
+                total_bytes = 0
+                for metadata_entry in metadata_entries:
+                    relative = f"metadata/{cache_name}/{metadata_entry.name}"
+                    info = _private_cache_file(metadata_entry)
+                    if metadata_entry.name == ".lock":
+                        if info.st_size > MAX_LOCK_SIZE:
+                            raise RestoreError("the retained metadata cache lock file is invalid")
+                    elif METADATA_CACHE_FILE.fullmatch(metadata_entry.name):
+                        if info.st_size > MAX_METADATA_CACHE_FILE_SIZE:
+                            raise RestoreError("the retained metadata cache file is oversized")
+                        total_bytes += info.st_size
+                        if total_bytes > MAX_METADATA_CACHE_BYTES:
+                            raise RestoreError("the retained metadata cache exceeds its bounded size")
+                        has_data = True
+                    else:
+                        raise RestoreError("the retained metadata cache contains an unknown file")
+                    snapshot[relative] = _stamp(info)
         elif entry.name in {"vfs", "vfsMeta"}:
             top_info = _private_cache_directory(entry)
             snapshot[entry.name] = _stamp(top_info)
@@ -365,6 +405,38 @@ def _validate_target_path(path: Path, label: str) -> Path:
     normalized = _absolute_path(path, label)
     _check_components(normalized, missing_ok=True)
     return normalized
+
+
+def _ensure_target_cache_directory(path: Path) -> None:
+    """Create a missing private restore cache path without following links."""
+    missing: list[Path] = []
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            missing.append(current)
+            continue
+        except OSError:
+            raise RestoreError("the target cache path could not be inspected safely") from None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RestoreError("the target cache path has an unsafe parent")
+        if missing:
+            raise RestoreError("the target cache path changed while being prepared")
+    for directory in missing:
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            raise RestoreError("the target cache directory could not be prepared safely") from None
+        info = _private_cache_directory(directory)
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            raise RestoreError("the target cache directory has unsafe permissions")
+    info = _private_cache_directory(path)
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        raise RestoreError("the target cache directory has unsafe permissions")
 
 
 def inspect_backup(path: str | os.PathLike[str], target_root: str | os.PathLike[str]) -> Backup:
@@ -404,6 +476,7 @@ def inspect_backup(path: str | os.PathLike[str], target_root: str | os.PathLike[
                     raise RestoreError("the retained vault config has an unsafe cache path")
                 normalized = installer.import_vault_config(str(vault_config_path), target)
                 vault_settings = installer.parse_json_object(normalized, "invalid")
+                vault_settings["cache_dir"] = str(installer.configured_cache_dir(target))
                 vault_settings.pop("account_credentials", None)
             except installer.InstallError:
                 raise RestoreError("the retained vault configuration is invalid or unsafe") from None
@@ -785,10 +858,14 @@ def _restore_cache_binding(backup: Backup, root: Path) -> None:
         "--folder-id",
         backup.folder_id,
     ]
+    try:
+        cache_dir = installer.configured_cache_dir(root)
+    except installer.InstallError:
+        raise RestoreError("the restored vault cache configuration is invalid") from None
     env = {
         "HOME": os.path.expanduser("~"),
         "XDG_CONFIG_HOME": str(root / "config"),
-        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_CACHE_HOME": str(cache_dir),
         "TMPDIR": str(root / "tmp"),
         "PATH": "/usr/bin:/bin",
         "LANG": "C.UTF-8",
@@ -805,11 +882,11 @@ def _restore_cache_binding(backup: Backup, root: Path) -> None:
         )
     except (OSError, subprocess.TimeoutExpired):
         raise RestoreError(
-            f"the cache was copied to {root / 'cache'} with its saved identity, but local cache rebinding did not finish; keep the backup and retry recovery before mounting"
+            f"the cache was copied to {cache_dir} with its saved identity, but local cache rebinding did not finish; keep the backup and retry recovery before mounting"
         ) from None
     if result.returncode != 0:
         raise RestoreError(
-            f"the cache was copied to {root / 'cache'} with its saved identity, but local cache rebinding was refused; keep the backup and retry recovery before mounting"
+            f"the cache was copied to {cache_dir} with its saved identity, but local cache rebinding was refused; keep the backup and retry recovery before mounting"
         )
 
 
@@ -844,9 +921,15 @@ def _restore_to_install_locked(backup: Backup, target: Path) -> None:
 
     _check_directory(target, private=True)
     config_dir = target / "config"
-    cache_dir = target / "cache"
     _check_directory(config_dir, private=True)
-    _check_directory(cache_dir, private=True)
+    try:
+        cache_dir = installer.configured_cache_dir(target)
+    except installer.InstallError:
+        raise RestoreError("the target install cache configuration is invalid") from None
+    if backup.cache_has_data:
+        _ensure_target_cache_directory(cache_dir)
+    elif os.path.lexists(cache_dir):
+        _private_cache_directory(cache_dir)
 
     target_vault_bytes = _read_private_file(config_dir / "vault.json", installer.MAX_CONFIG_SIZE, missing_ok=True)
     if target_vault_bytes is not None:
@@ -907,7 +990,10 @@ def _restore_to_install_locked(backup: Backup, target: Path) -> None:
     if not backup.cache_has_data:
         return
     assert backup.cache_path is not None
-    stage = Path(tempfile.mkdtemp(prefix=".restore-cache-", dir=target))
+    try:
+        stage = Path(tempfile.mkdtemp(prefix=".restore-cache-", dir=cache_dir.parent))
+    except OSError:
+        raise RestoreError("the target cache parent could not stage retained data safely") from None
     os.chmod(stage, 0o700)
     try:
         try:
@@ -920,18 +1006,23 @@ def _restore_to_install_locked(backup: Backup, target: Path) -> None:
         if not _same_inspection(backup, inspect_backup(backup.directory, target)):
             raise RestoreError(f"the backup changed during copying; staged data remains at {stage} and the backup is intact")
         try:
+            if installer.configured_cache_dir(target) != cache_dir:
+                raise RestoreError(f"the target cache configuration changed during copying; staged data remains at {stage}")
+        except installer.InstallError:
+            raise RestoreError(f"the target cache configuration changed during copying; staged data remains at {stage}") from None
+        try:
             os.replace(stage, cache_dir)
         except OSError:
             raise RestoreError(f"the retained cache is staged at {stage}; the original backup remains intact") from None
         try:
-            root_fd = _open_directory(target)
+            root_fd = _open_directory(cache_dir.parent)
             try:
                 os.fsync(root_fd)
             finally:
                 os.close(root_fd)
         except RestoreError:
             raise RestoreError(
-                f"the cache was copied to {cache_dir} with its saved identity, but the install directory could not be flushed; keep the backup"
+                f"the cache was copied to {cache_dir} with its saved identity, but the cache parent could not be flushed; keep the backup"
             ) from None
         _restore_cache_binding(backup, target)
     except RestoreError:
@@ -939,4 +1030,4 @@ def _restore_to_install_locked(backup: Backup, target: Path) -> None:
         # data, so leave it in place for inspection instead of deleting it.
         raise
     except OSError:
-        raise RestoreError(f"cache restoration stopped; any staged files remain under {target}") from None
+        raise RestoreError(f"cache restoration stopped; any staged files remain under {cache_dir.parent}") from None

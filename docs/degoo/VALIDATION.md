@@ -1196,3 +1196,50 @@ group-writable managed source file: both report the relative path and repair
 action before mount preparation or shutdown, without modifying the files.
 The snapshot-time ownership and permission checks remain in place. Scoped
 Markdown lint and `git diff --check` also passed.
+
+## Authoritative configured cache paths — 2026-10-14
+
+The contained Python helpers now resolve the private vault's `cache_dir`
+through one shared validator. Installer and runtime tests cover an external
+private directory, a disjoint custom directory inside the install, unsafe
+paths, bootstrap fallback, runtime shell resolution without bytecode writes,
+upgrade locks, status metadata, and external-cache disk accounting. Lifecycle
+tests cover external pending-write retention, configuration backup, local
+restore, clean-cache deletion, and refusal of unknown, orphaned, mismatched,
+or legacy cache data during destructive cleanup.
+
+All 410 offline Python helper tests and the packaging self-check passed.
+The credential-free full Go suite passed with serialized package execution
+and an isolated runtime cache. A first parallel run failed an S3 cached
+writeback test; its targeted rerun and the final full run passed. The complete
+Degoo command race suite, scoped vet and lint, Markdown lint, and
+`git diff --check` passed.
+
+The new offline, read-only `degoo verify-cache` command checks the exact cache
+identity while a maintenance caller retains its existing lock. Tests verify
+that it accepts a matching identity under an active lock without modifying
+files and rejects missing, mismatched, or wrong-folder identities. A local
+read-only check also succeeded against the existing mount while it held its
+cache lock; no provider request was involved.
+
+The direct-path migration exposed an overly strict ancestor-permission check:
+the shared volume was writable while the dedicated cache remained mode 0700.
+The resolver now follows the native mount's private-cache contract, validating
+the owned cache directory and rejecting symlink components without requiring
+the enclosing volume to be private. A regression covers a private cache under
+a writable shared volume and still rejects a non-private cache directory.
+
+The clean build of commit `64346f2d802ebfc665c1bdf44af213a4672ab1cb` was
+packaged and installed locally. After normal unmount, the cache identity was
+rebound offline to the direct external path. The obsolete cache bind mount
+and its `fstab` entry were removed; the service condition now checks the
+underlying volume rather than the former bind target. No cache data was
+discarded, and configuration hashes other than the intentional vault-path
+change remained identical, including authentication and provider cooldown.
+
+After restart, `vault.json`, the running process's `XDG_CACHE_HOME`, and
+`degoo-rc info` all selected the direct external cache directory. The mount
+and service were active, with zero pending files and zero provider HTTP
+attempts. Repeating the same local-package update returned an unchanged-build
+no-op while the external path remained configured. These are local lifecycle
+checks; live provider uploads remain unverified during cooldown.
