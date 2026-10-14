@@ -41,16 +41,17 @@ type syncErrorResponse struct {
 }
 
 type syncEndpoint struct {
-	server     *http.Server
-	listener   *net.UnixListener
-	socketPath string
-	socketDev  uint64
-	socketIno  uint64
-	refreshMu  sync.Mutex
-	updates    *updateControl
+	server       *http.Server
+	listener     *net.UnixListener
+	socketPath   string
+	socketDev    uint64
+	socketIno    uint64
+	refreshMu    sync.Mutex
+	updates      *updateControl
+	requestStats func() any
 }
 
-func startSyncEndpoint(socketPath string, mountedVFS *vfs.VFS, flushRaw func()) (*syncEndpoint, error) {
+func startSyncEndpoint(socketPath string, mountedVFS *vfs.VFS, flushRaw func(), stats ...func() any) (*syncEndpoint, error) {
 	if mountedVFS == nil || flushRaw == nil {
 		return nil, errors.New("invalid sync endpoint configuration")
 	}
@@ -84,6 +85,9 @@ func startSyncEndpoint(socketPath string, mountedVFS *vfs.VFS, flushRaw func()) 
 		socketDev:  socketStat.Dev,
 		socketIno:  socketStat.Ino,
 		updates:    &updateControl{mountedVFS: mountedVFS, lease: updateLease},
+	}
+	if len(stats) > 0 {
+		endpoint.requestStats = stats[0]
 	}
 	handler := &syncHandler{mountedVFS: mountedVFS, flushRaw: flushRaw, endpoint: endpoint}
 	endpoint.server = &http.Server{
@@ -158,6 +162,19 @@ func queueStatus(ctx context.Context, mountedVFS *vfs.VFS) (uploadQueueStatus, e
 }
 
 func (handler *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/stats" && r.URL.RawQuery == "" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeSyncError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if handler.endpoint.requestStats == nil {
+			writeSyncError(w, http.StatusServiceUnavailable, "request statistics unavailable")
+			return
+		}
+		writeSyncJSON(w, http.StatusOK, handler.endpoint.requestStats())
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/update/") {
 		handler.endpoint.refreshMu.Lock()
 		defer handler.endpoint.refreshMu.Unlock()

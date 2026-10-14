@@ -175,6 +175,7 @@ local Unix socket for targeted VFS cache refreshes.`, Args: cobra.ExactArgs(2), 
 	addSetupCommands(root)
 	addRestoreCommands(root)
 	addTrashCommands(root)
+	addStatsCommand(root)
 }
 
 func promptPassword(prompt string) (string, error) {
@@ -771,6 +772,9 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 	if !ok || mountDF.RootFolderID() != df.RootFolderID() {
 		return errors.New("verification override did not preserve the configured Degoo vault remote")
 	}
+	if err := mountDF.EnableMetadataCache(filepath.Join(c.CacheDir, "metadata", c.cacheName())); err != nil {
+		return fmt.Errorf("configure persistent metadata cache: %w", err)
+	}
 	stack, err := newStack(mountCtx, mountBase, c)
 	if err != nil {
 		return err
@@ -818,7 +822,9 @@ func mountVault(ctx context.Context, filename, mountpoint, settingsFile, syncSoc
 	rfs.Logf(nil, "degoo: vault mounted (folder ID %q, mountpoint %q)", folderID, mountpoint)
 	var syncEndpoint *syncEndpoint
 	if syncSocket != "" {
-		syncEndpoint, err = startSyncEndpoint(syncSocket, mnt.VFS, mountDF.DirCacheFlush)
+		syncEndpoint, err = startSyncEndpoint(syncSocket, mnt.VFS, mountDF.DirCacheFlush, func() any {
+			return map[string]any{"api": mountDF.RequestStats(), "metadata_cache": mountDF.MetadataCacheStats()}
+		})
 		if err != nil {
 			unmountErr := mnt.Unmount()
 			if unmountErr != nil {

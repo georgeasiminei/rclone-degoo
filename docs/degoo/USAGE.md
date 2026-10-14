@@ -8,7 +8,10 @@ Linux FUSE -> VFS full cache -> chunker -> crypt -> Degoo
 ```
 
 The implementation is experimental. Offline tests exercise the request shapes
-and vault behavior. A disposable live vault passed encrypted publication,
+and vault behavior. The latest request-reduction, upload-batching, and
+encrypted small-object cache changes passed the credential-free Go suite,
+scoped race, vet, and lint checks, plus a localhost FUSE test; they were not
+tested against Degoo. A disposable live vault passed encrypted publication,
 fresh-cache readback, and CDN range reads. An expired-token refresh initially
 returned HTTP 401; authentication was later renewed and read-only provider
 queries confirmed the intended folder. The local vault binding was corrected
@@ -345,9 +348,63 @@ Metadata calls have a ten-second total bound across pagination and retries,
 honor cancellation, and stop on provider `Retry-After`; a failed listing is an
 error, never an empty-directory result. Background writeback keeps pending
 uploads in the VFS queue until the provider deadline rather than sleeping in
-the request path. `GetFileChildren5` uses a five-second cache with at most 32
-parent listings; mutations, `DirCacheFlush`, and fresh-list requests invalidate
-snapshots, including in-flight results. Live upload recovery with the current
+the request path.
+
+Ordinary `GetFileChildren5` listings use a five-second in-memory cache capped
+at 32 parent directories. Concurrent misses for the same parent share one
+paginated request, and waiters can cancel independently. A fresh listing used
+for mutation confirmation bypasses cached results and cache storage and only
+invalidates that parent. Known mutations also invalidate only their known
+parent directories before and after the attempt; an unknown parent triggers a
+conservative full in-memory cache clear. This keeps the short freshness window
+while avoiding duplicate work during bursts. Sync still needs a listing for
+each distinct directory and an HTTP request for every page, so this cache does
+not eliminate all listing traffic or prove a numeric provider quota.
+
+Concurrent uploads can share storage-authorization requests in batches of up
+to 30 files from the same parent and metadata-registration mutations in batches
+of up to 100 files across parents. A 150-millisecond window collects concurrent
+uploads, with a 30-second ceiling for the shared request. Each upload receives
+its own result, and one caller's cancellation does not cancel the others.
+Path-specific locks serialize writes to the same file while independent files
+can upload concurrently. Registration is not blindly retried after an
+ambiguous response; the backend confirms each staged object's ID, name, parent,
+and size, verifies the full uploaded content by default, then rechecks the
+destination immediately before publication. `skip_upload_verification` can
+disable the full readback. Failed confirmation keeps the local write pending.
+Confirmation polls begin at 250 milliseconds and double
+to three seconds, honor a longer provider `Retry-After`, and can be cancelled.
+Existing 20-second and two-second visibility windows are retained. These batch
+sizes are local implementation bounds, not a Degoo-published request limit.
+
+The native encrypted vault can persist raw encrypted provider objects up to
+256 KiB in `cache_dir/metadata/<vault-cache-name>`. Entries expire after 30
+minutes, with maximums of 64 MiB encoded and 8,192 objects. The cache uses a
+SHA-256 key derived from object ID, size, modification time, and creation time;
+it checks exact length and content SHA-256 before use. Corrupt or stale
+entries are fetched again. Open ranges can be served from a cached full object,
+while upload verification reads bypass the cache. The cache contains
+ciphertext, never decrypted file data, and it does not cache directory
+listings or lower the number of `GetFileChildren5` calls. Its index is swept
+once per minute. If a cache path is unsafe, the mount fails closed. Cache
+write errors do not fail a successful remote read. `DirCacheFlush` clears both
+the in-memory listings and the persistent small-object cache.
+
+To inspect request and cache activity for a running mount, use its private
+statistics socket:
+
+```sh
+"$HOME/.local/share/rclone-degoo/bin/rclone" degoo stats \
+  --sync-socket "$HOME/.local/share/rclone-degoo/tmp/vfs-sync.sock"
+```
+
+Use the executable and socket installed for your mount if they are elsewhere.
+This is an `rclone degoo` command; the `degoo-rc` Python wrapper does not yet
+provide a `stats` subcommand.
+The command reads aggregate counters locally and does not contact Degoo. It
+reports HTTP attempts by operation, listing cache hits/misses/coalescing, and
+small-object cache hits/misses/fills/evictions. It does not show IDs, names,
+URLs, request bodies, or credentials. Live upload recovery with the current
 code has not yet been tested against Degoo.
 
 The cache contains plaintext VFS data, including pending writes. To move it to
@@ -512,10 +569,23 @@ chunks and their manifests. Authenticated reads reject damaged ciphertext.
 Missing chunks fail reads and listings rather than succeeding with truncated
 data. Provider deletion and rollback are outside encryption's protection.
 
-Chunks default to 1 GiB. The provisional maximum encrypted object size is
-19 GiB, including crypt headers and authentication tags, leaving a margin
-below the historical 20 GiB report. This is a configuration safety cap, not a
-verified provider limit. Choose a smaller cap if required by your account.
+The native mount defaults to 1 GiB when `chunk_size` is omitted. The current
+`degoo-rc` setup flow saves 128 MiB for a new vault, so check the actual saved
+configuration instead of assuming its value from the binary version. An
+existing vault keeps the size saved in its configuration; upgrading does not
+change it automatically. Existing files retain their recorded chunk layout,
+and reads use each stored chunk's actual size; future writes use the configured
+size. Changing chunk size changes the local cache identity. Before changing it,
+wait for pending uploads to reach zero, unmount normally, and back up the vault
+configuration and cache. Start the new identity with a fresh, empty cache
+namespace and backing directory. The installed helpers expect the recorded
+`cache_dir` path to remain stable, so bind the new backing directory there.
+Confirm the configured `max_object_size` can hold the encrypted chunk, which is
+slightly larger than the plaintext chunk. The provisional 19 GiB cap includes
+crypt headers and authentication tags and leaves a margin below the historical
+20 GiB report; it is a configuration safety cap, not a verified provider
+limit. Choose a smaller cap if required by your account. No production
+chunk-size change is required by this guidance.
 
 Chunker publishes a manifest after all its chunks are uploaded. For `norename`
 overwrites, old chunks are retired after successful manifest publication.

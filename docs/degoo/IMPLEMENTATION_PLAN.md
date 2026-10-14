@@ -27,6 +27,10 @@ recovery under Degoo's consistency model also remain unverified. Native Linux
 acceptance now confirms that the administrator-installed helper mounts and
 unmounts `/mnt/degoo` while retaining its immutable flag, using generated local
 encrypted data. This does not establish live Degoo provider behavior.
+The request-reduction, upload-batching, and encrypted small-object-cache
+follow-up also passed the credential-free full Go suite, scoped race, vet, and
+lint checks, plus a localhost FUSE fixture; no live Degoo request or write was
+run for that follow-up. See [VALIDATION.md](VALIDATION.md).
 
 ## Implementation decisions and validation plan
 
@@ -58,12 +62,83 @@ existing fallback; Windows API/auth cross-compilation passed, but that check
 does not validate cross-process lock behavior there.
 
 `GetFileChildren5` uses a bounded snapshot cache with a five-second lifetime
-and at most 32 cached parent listings. Mutations and explicit directory-cache
-flushes invalidate snapshots, and a generation guard prevents an older
-in-flight list response from repopulating the cache after invalidation. Tests
-cover the cache bounds, invalidation, and in-flight race. This reduces
-duplicate listing calls during bursts; it does not establish or change
-Degoo's unpublished request quota.
+and at most 32 cached parent listings. Known mutations invalidate only the
+affected parent or parents; an unknown parent uses a conservative global
+invalidation. Explicit directory-cache flushes clear all snapshots. Generation
+checks prevent an older in-flight response from restoring invalidated data.
+Fresh-list reads bypass cached responses and cache writes, invalidate only the
+requested parent, and coalesce concurrent fresh reads for that parent and
+generation. Ordinary concurrent misses share one paginated request; waiters
+cancel independently, and the shared request has a 30-second ceiling while
+preserving the initiating caller's context values. The backend's enclosing
+metadata lookup retains its ten-second deadline. These changes reduce
+duplicate listing calls without extending the five-second freshness window or
+claiming a numeric Degoo quota.
+
+### Metadata request reduction and encrypted small-object cache (2026-10-14)
+
+The API snapshot cache is deliberately short lived because listings are used
+for path resolution and mutation confirmation. The cache coalesces
+simultaneous misses for the same parent, while every distinct uncached parent
+and every page still requires its own provider request. A generation-aware
+item-to-parent hint table lets mutation attempts invalidate known parents
+instead of discarding unrelated snapshots. Known parents are invalidated
+before and after each attempt, including errors. If an item's parent is
+unknown, global invalidation remains the safe fallback. An epoch guard prevents
+stale in-flight lookups from overwriting parent hints after a move.
+
+Concurrent uploads now collect write-authorization records for the same parent
+for up to 150 milliseconds, with a maximum of 30 records per request.
+Registration records can span parents and are batched up to 100 per mutation.
+Path-specific locks serialize writes to the same remote file while allowing
+independent paths to upload concurrently. Shared requests are bounded to 30
+seconds, callers cancel independently, and registration is never automatically
+replayed after an ambiguous response. The caller confirms each staged item by
+its own ID, name, parent, and size, performs the configured full-payload
+readback verification unless `skip_upload_verification` is enabled, then
+rechecks the destination immediately before publishing. Unconfirmed writes
+remain pending. Confirmation polls start at 250 milliseconds and double to a
+three-second cap, honor a longer provider `Retry-After`, and stop on
+cancellation; the existing 20-second and two-second registration visibility
+windows remain in place. This uses known array-shaped provider operations; it
+does not establish the provider's maximum batch size or retry semantics.
+The signed storage byte transfer alone does not change folder metadata or
+invalidate directory snapshots; the registration mutation performs the
+parent-scoped invalidation.
+
+The native encrypted vault has a separate persistent cache for raw ciphertext
+objects up to 256 KiB. It is bound to the vault cache namespace and validates
+object ID, size, modification and creation times through a hashed version key,
+plus exact length and SHA-256 before use. Its 30-minute expiry, 64 MiB encoded
+size limit, and 8,192-entry limit keep local storage bounded. A one-minute index
+sweep avoids scanning the directory for each small object. Ranges can read
+from the cached full object; upload verification bypasses the cache. The cache
+does not store decrypted bytes and does not cache GraphQL listing results.
+Unsafe paths fail closed, and cache write errors do not fail remote reads.
+`DirCacheFlush` clears this cache with the directory snapshots.
+
+Use `rclone degoo stats --sync-socket PATH` with the private socket of a running
+mount to inspect aggregate HTTP attempts by operation, listing-cache activity,
+and small-object cache hit/miss/fill/eviction counts. It reads the mount's
+local private endpoint and makes no Degoo request. Counters do not include
+identifiers, names, URLs, request bodies, or credentials. Final offline test
+status for this follow-up is recorded in [VALIDATION.md](VALIDATION.md); no
+live-provider request or write was used to validate these changes.
+
+The native mount defaults to 1 GiB when `chunk_size` is omitted, while the
+current `degoo-rc` setup flow writes 128 MiB into new vault configurations.
+For an existing vault, its saved value remains authoritative and is not
+rewritten by a binary upgrade. Existing files retain their recorded chunk
+layout, and reads use the actual stored chunk sizes; future writes use the
+configured size. Changing chunk size changes the local cache identity, so
+drain pending uploads to zero, unmount normally, and back up the vault
+configuration and cache before changing it. Start the new identity with a
+fresh, empty cache namespace and backing directory. The installed helpers
+expect the recorded `cache_dir` path to remain stable, so bind the new backing
+directory at that path. Check that the encrypted chunk size still fits under
+`max_object_size`. A 1 GiB setting remains a recommendation to validate with
+the account's limits and workload, not evidence of a provider limit or a
+required production change.
 
 Large local caches can be moved to a separate volume while preserving the
 `cache_dir` value in the vault configuration. Stop the mount with its normal

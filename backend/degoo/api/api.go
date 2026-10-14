@@ -35,6 +35,10 @@ const defaultRateLimitCooldown = time.Minute
 const rateLimitLockTimeout = 5 * time.Second
 const metadataCacheTTL = 5 * time.Second
 const metadataCacheMaxEntries = 32
+const metadataListFlightTimeout = 30 * time.Second
+const itemParentCacheMaxEntries = 4096
+const maxWriteAuthBatch = 30
+const maxRegisterBatch = 100
 
 const unixToInternalSeconds = 62135596800
 const maxUnixTimeSeconds = int64(math.MaxInt64) - unixToInternalSeconds
@@ -171,12 +175,87 @@ type Client struct {
 	metadataMu         sync.Mutex
 	metadataGeneration uint64
 	metadataCache      map[string]metadataCacheEntry
+	metadataParents    map[string]*metadataParentState
+	metadataFlights    map[metadataFlightKey]*metadataListCall
+	itemParents        map[string]itemParentEntry
+	itemParentSequence uint64
+	mutationEpoch      uint64
+
+	statsMu sync.Mutex
+	stats   RequestStats
 }
 
 type metadataCacheEntry struct {
-	items     []Item
-	expires   time.Time
-	createdAt time.Time
+	items            []Item
+	expires          time.Time
+	createdAt        time.Time
+	globalGeneration uint64
+	parentGeneration uint64
+}
+
+type metadataParentState struct {
+	generation    uint64
+	activeFlights int
+}
+
+type metadataFlightKey struct {
+	parentID         string
+	globalGeneration uint64
+	parentGeneration uint64
+	fresh            bool
+}
+
+type metadataListCall struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	done     chan struct{}
+	waiters  int
+	finished bool
+	items    []Item
+	err      error
+}
+
+type itemParentEntry struct {
+	parentID string
+	sequence uint64
+}
+
+// UploadInfo describes one file for which Degoo should authorize storage upload.
+type UploadInfo struct {
+	Name     string // Name is the file name Degoo will associate with the upload.
+	Checksum string // Checksum is the content checksum sent to Degoo.
+	Size     int64  // Size is the content size in bytes.
+}
+
+// WriteAuthResult contains one upload authorization or its per-file error.
+type WriteAuthResult struct {
+	AuthData AuthData // AuthData contains the storage authorization when Err is nil.
+	Err      error    // Err reports a per-file authorization failure.
+}
+
+// RegistrationInfo describes one file metadata record to register with Degoo.
+type RegistrationInfo struct {
+	ParentID string    // ParentID is the destination directory ID.
+	Name     string    // Name is the remote file name.
+	Checksum string    // Checksum is the content checksum recorded by Degoo.
+	Size     int64     // Size is the stored object size in bytes.
+	Created  time.Time // Created is the remote creation time.
+}
+
+// RequestStats is a concurrency-safe snapshot of API requests and metadata caching.
+// It contains operation names and counts only, without request data or identifiers.
+type RequestStats struct {
+	MetadataCacheHits             uint64            `json:"metadata_cache_hits"`             // MetadataCacheHits counts directory snapshots served from cache.
+	MetadataCacheMisses           uint64            `json:"metadata_cache_misses"`           // MetadataCacheMisses counts directory lookups that missed cache.
+	MetadataCacheCoalesced        uint64            `json:"metadata_cache_coalesced"`        // MetadataCacheCoalesced counts callers sharing an in-flight listing.
+	MetadataPages                 uint64            `json:"metadata_pages"`                  // MetadataPages counts listing HTTP attempts.
+	MetadataMutationInvalidations uint64            `json:"metadata_mutation_invalidations"` // MetadataMutationInvalidations counts API mutations that invalidate metadata.
+	MetadataParentInvalidations   uint64            `json:"metadata_parent_invalidations"`   // MetadataParentInvalidations counts parent-scoped invalidation events.
+	MetadataGlobalInvalidations   uint64            `json:"metadata_global_invalidations"`   // MetadataGlobalInvalidations counts full-cache invalidation events.
+	HTTPRequests                  uint64            `json:"http_requests"`                   // HTTPRequests counts GraphQL and object-storage HTTP attempts.
+	ReadHTTPRequests              uint64            `json:"read_http_requests"`              // ReadHTTPRequests counts API and storage read attempts.
+	WriteHTTPRequests             uint64            `json:"write_http_requests"`             // WriteHTTPRequests counts API and storage write attempts.
+	RequestsByOperation           map[string]uint64 `json:"requests_by_operation"`           // RequestsByOperation counts attempts by fixed operation name.
 }
 
 type rateLimitFileState struct {
@@ -380,9 +459,111 @@ func (c *Client) checkRateLimit(ctx context.Context, operation string) error {
 // results from listing requests that were already in flight.
 func (c *Client) ClearMetadataCache() {
 	c.metadataMu.Lock()
+	c.clearMetadataCacheLocked()
+	c.metadataMu.Unlock()
+}
+
+func (c *Client) clearMetadataCacheLocked() {
 	c.metadataGeneration++
 	c.metadataCache = nil
+	for parentID, state := range c.metadataParents {
+		if state.activeFlights == 0 {
+			delete(c.metadataParents, parentID)
+		}
+	}
+	c.itemParents = nil
+	c.itemParentSequence = 0
+	c.statsMu.Lock()
+	c.stats.MetadataGlobalInvalidations++
+	c.statsMu.Unlock()
+}
+
+func (c *Client) invalidateMetadataParents(parents []string, known bool) {
+	if !known || len(parents) == 0 {
+		c.metadataMu.Lock()
+		c.clearMetadataCacheLocked()
+		c.metadataMu.Unlock()
+		return
+	}
+	unique := make(map[string]struct{}, len(parents))
+	for _, parentID := range parents {
+		if parentID == "" {
+			c.metadataMu.Lock()
+			c.clearMetadataCacheLocked()
+			c.metadataMu.Unlock()
+			return
+		}
+		unique[parentID] = struct{}{}
+	}
+	c.metadataMu.Lock()
+	for parentID := range unique {
+		delete(c.metadataCache, parentID)
+		if state := c.metadataParents[parentID]; state != nil {
+			state.generation++
+			if state.activeFlights == 0 {
+				delete(c.metadataParents, parentID)
+			}
+		}
+	}
 	c.metadataMu.Unlock()
+	c.statsMu.Lock()
+	c.stats.MetadataParentInvalidations += uint64(len(unique))
+	c.statsMu.Unlock()
+}
+
+func (c *Client) recordMutationInvalidation() {
+	c.statsMu.Lock()
+	c.stats.MetadataMutationInvalidations++
+	c.statsMu.Unlock()
+}
+
+func (c *Client) recordHTTPRequest(operation string, write bool) {
+	c.statsMu.Lock()
+	if c.stats.RequestsByOperation == nil {
+		c.stats.RequestsByOperation = make(map[string]uint64)
+	}
+	c.stats.HTTPRequests++
+	c.stats.RequestsByOperation[operation]++
+	if write {
+		c.stats.WriteHTTPRequests++
+	} else {
+		c.stats.ReadHTTPRequests++
+	}
+	if operation == "GetFileChildren5" {
+		c.stats.MetadataPages++
+	}
+	c.statsMu.Unlock()
+}
+
+func (c *Client) recordMetadataLookup(hit, coalesced bool) {
+	c.statsMu.Lock()
+	if hit {
+		c.stats.MetadataCacheHits++
+	} else {
+		c.stats.MetadataCacheMisses++
+	}
+	if coalesced {
+		c.stats.MetadataCacheCoalesced++
+	}
+	c.statsMu.Unlock()
+}
+
+func (c *Client) recordMetadataCoalesced() {
+	c.statsMu.Lock()
+	c.stats.MetadataCacheCoalesced++
+	c.statsMu.Unlock()
+}
+
+// RequestStats returns a safe snapshot of operation counts and metadata cache activity.
+func (c *Client) RequestStats() RequestStats {
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	stats := c.stats
+	stats.RequestsByOperation = make(map[string]uint64, len(c.stats.RequestsByOperation))
+	for operation, count := range c.stats.RequestsByOperation {
+		stats.RequestsByOperation[operation] = count
+	}
+	return stats
 }
 
 func cloneItems(items []Item) []Item {
@@ -391,40 +572,79 @@ func cloneItems(items []Item) []Item {
 	return copyItems
 }
 
-func (c *Client) cachedListDir(parentID string, generation uint64) ([]Item, bool) {
-	c.metadataMu.Lock()
-	defer c.metadataMu.Unlock()
-	if generation != c.metadataGeneration {
-		return nil, false
+func (c *Client) parentStateLocked(parentID string) *metadataParentState {
+	if c.metadataParents == nil {
+		c.metadataParents = make(map[string]*metadataParentState)
 	}
-	now := time.Now()
-	for key, entry := range c.metadataCache {
+	state := c.metadataParents[parentID]
+	if state == nil {
+		state = &metadataParentState{}
+		c.metadataParents[parentID] = state
+	}
+	return state
+}
+
+func (c *Client) parentGenerationLocked(parentID string) uint64 {
+	if state := c.metadataParents[parentID]; state != nil {
+		return state.generation
+	}
+	return 0
+}
+
+func (c *Client) invalidateParentLocked(parentID string) {
+	delete(c.metadataCache, parentID)
+	c.parentStateLocked(parentID).generation++
+}
+
+func (c *Client) newMetadataListCallLocked(ctx context.Context, key metadataFlightKey) *metadataListCall {
+	if c.metadataFlights == nil {
+		c.metadataFlights = make(map[metadataFlightKey]*metadataListCall)
+	}
+	callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metadataListFlightTimeout)
+	call := &metadataListCall{ctx: callCtx, cancel: cancel, done: make(chan struct{}), waiters: 1}
+	c.metadataFlights[key] = call
+	c.parentStateLocked(key.parentID).activeFlights++
+	return call
+}
+
+func (c *Client) cleanupParentStateLocked(parentID string) {
+	state := c.metadataParents[parentID]
+	if state == nil || state.activeFlights != 0 {
+		return
+	}
+	if _, exists := c.metadataCache[parentID]; !exists {
+		delete(c.metadataParents, parentID)
+	}
+}
+
+func (c *Client) pruneMetadataCacheLocked(now time.Time) {
+	for parentID, entry := range c.metadataCache {
 		if !now.Before(entry.expires) {
-			delete(c.metadataCache, key)
+			delete(c.metadataCache, parentID)
+			c.cleanupParentStateLocked(parentID)
 		}
 	}
+}
+
+func (c *Client) cachedListDirLocked(parentID string, globalGeneration, parentGeneration uint64) ([]Item, bool) {
+	now := time.Now()
+	c.pruneMetadataCacheLocked(now)
 	entry, ok := c.metadataCache[parentID]
-	if !ok || !now.Before(entry.expires) {
+	if !ok || entry.globalGeneration != globalGeneration || entry.parentGeneration != parentGeneration || !now.Before(entry.expires) {
 		return nil, false
 	}
 	return cloneItems(entry.items), true
 }
 
-func (c *Client) cacheListDir(parentID string, items []Item, generation uint64) {
-	c.metadataMu.Lock()
-	defer c.metadataMu.Unlock()
-	if generation != c.metadataGeneration {
+func (c *Client) cacheListDirLocked(parentID string, items []Item, globalGeneration, parentGeneration uint64) {
+	if globalGeneration != c.metadataGeneration || parentGeneration != c.parentGenerationLocked(parentID) {
 		return
 	}
 	now := time.Now()
 	if c.metadataCache == nil {
 		c.metadataCache = make(map[string]metadataCacheEntry)
 	}
-	for key, entry := range c.metadataCache {
-		if !now.Before(entry.expires) {
-			delete(c.metadataCache, key)
-		}
-	}
+	c.pruneMetadataCacheLocked(now)
 	if _, exists := c.metadataCache[parentID]; !exists && len(c.metadataCache) >= metadataCacheMaxEntries {
 		oldestKey := ""
 		var oldestTime time.Time
@@ -438,13 +658,107 @@ func (c *Client) cacheListDir(parentID string, items []Item, generation uint64) 
 		}
 		if haveOldest {
 			delete(c.metadataCache, oldestKey)
+			c.cleanupParentStateLocked(oldestKey)
 		}
 	}
+	state := c.parentStateLocked(parentID)
+	state.generation = parentGeneration
 	c.metadataCache[parentID] = metadataCacheEntry{
-		items:     cloneItems(items),
-		expires:   now.Add(metadataCacheTTL),
-		createdAt: now,
+		items:            cloneItems(items),
+		expires:          now.Add(metadataCacheTTL),
+		createdAt:        now,
+		globalGeneration: globalGeneration,
+		parentGeneration: parentGeneration,
 	}
+}
+
+func (c *Client) rememberItemsLocked(items []Item) {
+	for _, item := range items {
+		c.rememberItemParentLocked(item)
+	}
+}
+
+func (c *Client) rememberItemParentLocked(item Item) {
+	if item.ID == "" || item.ParentID == "" {
+		return
+	}
+	if c.itemParents == nil {
+		c.itemParents = make(map[string]itemParentEntry)
+	}
+	c.itemParentSequence++
+	if _, exists := c.itemParents[item.ID]; !exists && len(c.itemParents) >= itemParentCacheMaxEntries {
+		oldestID := ""
+		oldestSequence := uint64(0)
+		for id, entry := range c.itemParents {
+			if oldestID == "" || entry.sequence < oldestSequence {
+				oldestID = id
+				oldestSequence = entry.sequence
+			}
+		}
+		delete(c.itemParents, oldestID)
+	}
+	c.itemParents[item.ID] = itemParentEntry{parentID: item.ParentID, sequence: c.itemParentSequence}
+}
+
+func (c *Client) rememberItemParent(item Item) {
+	c.metadataMu.Lock()
+	c.rememberItemParentLocked(item)
+	c.metadataMu.Unlock()
+}
+
+func (c *Client) mutationEpochSnapshot() uint64 {
+	c.metadataMu.Lock()
+	epoch := c.mutationEpoch
+	c.metadataMu.Unlock()
+	return epoch
+}
+
+func (c *Client) rememberItemParentAtMutationEpoch(item Item, epoch uint64) {
+	c.metadataMu.Lock()
+	if c.mutationEpoch == epoch {
+		c.rememberItemParentLocked(item)
+	}
+	c.metadataMu.Unlock()
+}
+
+func (c *Client) rememberItemsAtMutationEpoch(items []Item, epoch uint64) {
+	c.metadataMu.Lock()
+	if c.mutationEpoch == epoch {
+		c.rememberItemsLocked(items)
+	}
+	c.metadataMu.Unlock()
+}
+
+func (c *Client) advanceMutationEpoch() {
+	c.metadataMu.Lock()
+	c.mutationEpoch++
+	c.metadataMu.Unlock()
+}
+
+func (c *Client) forgetItemParents(ids []string) {
+	c.metadataMu.Lock()
+	for _, id := range ids {
+		delete(c.itemParents, id)
+	}
+	c.metadataMu.Unlock()
+}
+
+func (c *Client) parentsForItems(ids []string) ([]string, bool) {
+	c.metadataMu.Lock()
+	defer c.metadataMu.Unlock()
+	parents := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		entry, ok := c.itemParents[id]
+		if !ok || entry.parentID == "" {
+			return nil, false
+		}
+		if _, exists := seen[entry.parentID]; !exists {
+			parents = append(parents, entry.parentID)
+			seen[entry.parentID] = struct{}{}
+		}
+	}
+	return parents, len(ids) != 0
 }
 
 func (c *Client) rateLimited(operation string, resp *http.Response, cause error) error {
@@ -981,10 +1295,6 @@ func canRefreshGraphQL(mutation bool, data json.RawMessage, errs []graphQLError)
 }
 
 func (c *Client) graphql(ctx context.Context, operation, query string, variables map[string]any, result any, mutation bool) error {
-	if mutation {
-		c.ClearMetadataCache()
-		defer c.ClearMetadataCache()
-	}
 	if err := c.checkRateLimit(ctx, operation); err != nil {
 		return err
 	}
@@ -1004,6 +1314,7 @@ func (c *Client) graphql(ctx context.Context, operation, query string, variables
 		vars["Token"] = token
 		request := map[string]any{"query": query, "operationName": operation, "variables": vars}
 		var envelope graphQLEnvelope
+		c.recordHTTPRequest(operation, mutation || operation == "GetBucketWriteAuth4")
 		resp, callErr := c.gql.CallJSON(ctx, &rest.Opts{
 			Method:     http.MethodPost,
 			NoRedirect: true, // The access token is in the JSON body and must not be redirected.
@@ -1017,7 +1328,7 @@ func (c *Client) graphql(ctx context.Context, operation, query string, variables
 			if status == http.StatusTooManyRequests {
 				return c.rateLimited(operation, resp, apiErr)
 			}
-			if attempt == 0 && isUnauthorized(status, nil) {
+			if attempt == 0 && !mutation && isUnauthorized(status, nil) {
 				if err := c.checkRateLimit(ctx, operation); err != nil {
 					return err
 				}
@@ -1036,7 +1347,7 @@ func (c *Client) graphql(ctx context.Context, operation, query string, variables
 				gqlErrors = append(gqlErrors, gqlErr)
 			}
 			apiErr := &Error{operation: operation, message: "GraphQL request failed", graphQLErrors: gqlErrors}
-			if attempt == 0 && canRefreshGraphQL(mutation, envelope.Data, gqlErrors) {
+			if attempt == 0 && !mutation && canRefreshGraphQL(false, envelope.Data, gqlErrors) {
 				if err := c.checkRateLimit(ctx, operation); err != nil {
 					return err
 				}
@@ -1063,32 +1374,142 @@ func (c *Client) graphql(ctx context.Context, operation, query string, variables
 // otherwise loads every item under parentID, requesting at most 1,000 items per
 // page. It rejects repeated item IDs and repeated pagination cursors.
 func (c *Client) ListDir(ctx context.Context, parentID string) ([]Item, error) {
-	if err := c.checkRateLimit(ctx, "GetFileChildren5"); err != nil {
-		return nil, err
-	}
-	c.metadataMu.Lock()
-	generation := c.metadataGeneration
-	c.metadataMu.Unlock()
-	if items, ok := c.cachedListDir(parentID, generation); ok {
-		return items, nil
-	}
-	items, err := c.listDirUncached(ctx, parentID)
-	if err != nil {
-		return nil, err
-	}
-	c.cacheListDir(parentID, items, generation)
-	return items, nil
+	return c.listDir(ctx, parentID, false)
 }
 
 // ListDirFresh loads every item under parentID without reading or storing a
-// cached snapshot. It clears existing and in-flight snapshots around the read.
+// cached snapshot. It invalidates only that directory before and after loading.
 func (c *Client) ListDirFresh(ctx context.Context, parentID string) ([]Item, error) {
+	return c.listDir(ctx, parentID, true)
+}
+
+func (c *Client) listDir(ctx context.Context, parentID string, fresh bool) ([]Item, error) {
 	if err := c.checkRateLimit(ctx, "GetFileChildren5"); err != nil {
 		return nil, err
 	}
-	c.ClearMetadataCache()
-	defer c.ClearMetadataCache()
-	return c.listDirUncached(ctx, parentID)
+
+	var (
+		call      *metadataListCall
+		key       metadataFlightKey
+		startCall bool
+		cacheHit  bool
+		items     []Item
+	)
+	c.metadataMu.Lock()
+	c.pruneMetadataCacheLocked(time.Now())
+	globalGeneration := c.metadataGeneration
+	parentGeneration := c.parentGenerationLocked(parentID)
+	if fresh {
+		key = metadataFlightKey{parentID: parentID, globalGeneration: globalGeneration, parentGeneration: parentGeneration, fresh: true}
+		if existing := c.metadataFlights[key]; existing != nil && !existing.finished {
+			existing.waiters++
+			call = existing
+		} else {
+			c.invalidateParentLocked(parentID)
+			parentGeneration = c.parentGenerationLocked(parentID)
+			key = metadataFlightKey{parentID: parentID, globalGeneration: globalGeneration, parentGeneration: parentGeneration, fresh: true}
+			call = c.newMetadataListCallLocked(ctx, key)
+			startCall = true
+		}
+	} else {
+		if cached, ok := c.cachedListDirLocked(parentID, globalGeneration, parentGeneration); ok {
+			items = cached
+			cacheHit = true
+		} else {
+			key = metadataFlightKey{parentID: parentID, globalGeneration: globalGeneration, parentGeneration: parentGeneration}
+			if existing := c.metadataFlights[key]; existing != nil && !existing.finished {
+				existing.waiters++
+				call = existing
+			} else {
+				call = c.newMetadataListCallLocked(ctx, key)
+				startCall = true
+			}
+		}
+	}
+	c.metadataMu.Unlock()
+
+	if fresh {
+		if startCall {
+			c.recordParentInvalidation()
+		} else {
+			c.recordMetadataCoalesced()
+		}
+	} else if cacheHit {
+		c.recordMetadataLookup(true, false)
+		return items, nil
+	} else {
+		c.recordMetadataLookup(false, !startCall)
+	}
+	if startCall {
+		go c.runMetadataListCall(key, call)
+	}
+	return c.waitForMetadataList(ctx, key, call)
+}
+
+func (c *Client) recordParentInvalidation() {
+	c.statsMu.Lock()
+	c.stats.MetadataParentInvalidations++
+	c.statsMu.Unlock()
+}
+
+func (c *Client) waitForMetadataList(ctx context.Context, key metadataFlightKey, call *metadataListCall) ([]Item, error) {
+	select {
+	case <-ctx.Done():
+		c.removeMetadataListWaiter(key, call)
+		return nil, ctx.Err()
+	case <-call.done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return cloneItems(call.items), call.err
+	}
+}
+
+func (c *Client) removeMetadataListWaiter(key metadataFlightKey, call *metadataListCall) {
+	c.metadataMu.Lock()
+	if !call.finished {
+		call.waiters--
+		if call.waiters == 0 {
+			if c.metadataFlights[key] == call {
+				delete(c.metadataFlights, key)
+			}
+			call.cancel()
+		}
+	}
+	c.metadataMu.Unlock()
+}
+
+func (c *Client) runMetadataListCall(key metadataFlightKey, call *metadataListCall) {
+	items, err := c.listDirUncached(call.ctx, key.parentID)
+	c.metadataMu.Lock()
+	if err == nil && call.ctx.Err() == nil && key.globalGeneration == c.metadataGeneration && key.parentGeneration == c.parentGenerationLocked(key.parentID) {
+		if key.fresh {
+			c.rememberItemsLocked(items)
+		} else {
+			c.cacheListDirLocked(key.parentID, items, key.globalGeneration, key.parentGeneration)
+			c.rememberItemsLocked(items)
+		}
+	}
+	if key.fresh {
+		// Fresh reads are always invalidating reads, including failed reads.
+		c.invalidateParentLocked(key.parentID)
+	}
+	if c.metadataFlights[key] == call {
+		delete(c.metadataFlights, key)
+	}
+	if state := c.metadataParents[key.parentID]; state != nil && state.activeFlights > 0 {
+		state.activeFlights--
+	}
+	c.cleanupParentStateLocked(key.parentID)
+	call.items = cloneItems(items)
+	call.err = err
+	call.finished = true
+	close(call.done)
+	c.metadataMu.Unlock()
+	call.cancel()
+	if key.fresh {
+		c.recordParentInvalidation()
+	}
 }
 
 func (c *Client) listDirUncached(ctx context.Context, parentID string) ([]Item, error) {
@@ -1131,6 +1552,19 @@ func (c *Client) listDirUncached(ctx context.Context, parentID string) ([]Item, 
 	}
 }
 
+func (c *Client) beginMutationInvalidation(parents []string, known bool) func() {
+	c.advanceMutationEpoch()
+	c.invalidateMetadataParents(parents, known)
+	c.recordMutationInvalidation()
+	var finishOnce sync.Once
+	return func() {
+		finishOnce.Do(func() {
+			c.advanceMutationEpoch()
+			c.invalidateMetadataParents(parents, known)
+		})
+	}
+}
+
 // ListTrash returns items in the account-wide recycle bin. A limit of zero or
 // less requests every page; a positive limit returns at most that many items.
 // It rejects items that are not marked as recycled, repeated item IDs, and
@@ -1139,6 +1573,7 @@ func (c *Client) ListTrash(ctx context.Context, limit int) ([]Item, error) {
 	if limit < 0 {
 		return nil, &Error{operation: "GetDeletedFiles", message: "negative item limit"}
 	}
+	mutationEpoch := c.mutationEpochSnapshot()
 	items := make([]Item, 0)
 	seenIDs := make(map[string]struct{})
 	seenTokens := make(map[string]struct{})
@@ -1175,10 +1610,13 @@ func (c *Client) ListTrash(ctx context.Context, limit int) ([]Item, error) {
 			items = append(items, item)
 		}
 		if limit > 0 && len(items) >= limit {
-			return items[:limit], nil
+			items = items[:limit]
+			c.rememberItemsAtMutationEpoch(items, mutationEpoch)
+			return items, nil
 		}
 		nextToken = response.GetDeletedFiles.NextToken
 		if nextToken == "" {
+			c.rememberItemsAtMutationEpoch(items, mutationEpoch)
 			return items, nil
 		}
 		if _, exists := seenTokens[nextToken]; exists {
@@ -1190,6 +1628,7 @@ func (c *Client) ListTrash(ctx context.Context, limit int) ([]Item, error) {
 
 // GetItem returns fresh metadata for an item, including its short-lived URL.
 func (c *Client) GetItem(ctx context.Context, id string) (Item, error) {
+	mutationEpoch := c.mutationEpochSnapshot()
 	var response struct {
 		GetOverlay4 *Item `json:"getOverlay4"`
 	}
@@ -1200,18 +1639,29 @@ func (c *Client) GetItem(ctx context.Context, id string) (Item, error) {
 	if response.GetOverlay4 == nil {
 		return Item{}, &Error{operation: "GetOverlay4", message: fmt.Sprintf("item %q was not found", id)}
 	}
+	c.rememberItemParentAtMutationEpoch(*response.GetOverlay4, mutationEpoch)
 	return *response.GetOverlay4, nil
 }
 
-// GetWriteAuth returns the first GCS authorization for an upload.
-func (c *Client) GetWriteAuth(ctx context.Context, parentID, name string, size int64, checksum string) (AuthData, error) {
+// GetWriteAuthBatch requests storage authorizations for up to 30 files.
+func (c *Client) GetWriteAuthBatch(ctx context.Context, parentID string, infos []UploadInfo) ([]WriteAuthResult, error) {
+	if len(infos) > maxWriteAuthBatch {
+		return nil, &Error{operation: "GetBucketWriteAuth4", message: fmt.Sprintf("batch contains %d uploads; maximum is %d", len(infos), maxWriteAuthBatch)}
+	}
+	if len(infos) == 0 {
+		return []WriteAuthResult{}, nil
+	}
+	storageUploadInfos := make([]map[string]string, 0, len(infos))
+	for _, info := range infos {
+		storageUploadInfos = append(storageUploadInfos, map[string]string{
+			"FileName": info.Name,
+			"Checksum": info.Checksum,
+			"Size":     strconv.FormatInt(info.Size, 10),
+		})
+	}
 	variables := map[string]any{
-		"ParentID": parentID,
-		"StorageUploadInfos": []map[string]string{{
-			"FileName": name,
-			"Checksum": checksum,
-			"Size":     strconv.FormatInt(size, 10),
-		}},
+		"ParentID":           parentID,
+		"StorageUploadInfos": storageUploadInfos,
 	}
 	var response struct {
 		GetBucketWriteAuth4 []struct {
@@ -1220,23 +1670,40 @@ func (c *Client) GetWriteAuth(ctx context.Context, parentID, name string, size i
 		} `json:"getBucketWriteAuth4"`
 	}
 	if err := c.graphql(ctx, "GetBucketWriteAuth4", getWriteAuthQuery, variables, &response, false); err != nil {
+		return nil, err
+	}
+	if len(response.GetBucketWriteAuth4) != len(infos) {
+		return nil, &Error{operation: "GetBucketWriteAuth4", message: fmt.Sprintf("response returned %d authorizations for %d uploads", len(response.GetBucketWriteAuth4), len(infos))}
+	}
+	results := make([]WriteAuthResult, len(infos))
+	for index, entry := range response.GetBucketWriteAuth4 {
+		if entry.Error != "" {
+			var alreadyExists error
+			if strings.Contains(strings.ToLower(entry.Error), "already exist") {
+				alreadyExists = ErrAlreadyExists
+			}
+			results[index].Err = &Error{operation: "GetBucketWriteAuth4", message: "upload authorization was rejected", err: alreadyExists}
+			continue
+		}
+		if entry.AuthData == nil {
+			results[index].Err = &Error{operation: "GetBucketWriteAuth4", message: "response contained no AuthData"}
+			continue
+		}
+		results[index].AuthData = *entry.AuthData
+	}
+	return results, nil
+}
+
+// GetWriteAuth returns the GCS authorization for one upload.
+func (c *Client) GetWriteAuth(ctx context.Context, parentID, name string, size int64, checksum string) (AuthData, error) {
+	results, err := c.GetWriteAuthBatch(ctx, parentID, []UploadInfo{{Name: name, Size: size, Checksum: checksum}})
+	if err != nil {
 		return AuthData{}, err
 	}
-	if len(response.GetBucketWriteAuth4) == 0 {
+	if len(results) != 1 {
 		return AuthData{}, &Error{operation: "GetBucketWriteAuth4", message: "response contained no upload authorization"}
 	}
-	entry := response.GetBucketWriteAuth4[0]
-	if entry.Error != "" {
-		var alreadyExists error
-		if strings.Contains(strings.ToLower(entry.Error), "already exist") {
-			alreadyExists = ErrAlreadyExists
-		}
-		return AuthData{}, &Error{operation: "GetBucketWriteAuth4", message: "upload authorization was rejected", err: alreadyExists}
-	}
-	if entry.AuthData == nil {
-		return AuthData{}, &Error{operation: "GetBucketWriteAuth4", message: "response contained no AuthData"}
-	}
-	return *entry.AuthData, nil
+	return results[0].AuthData, results[0].Err
 }
 
 // Upload sends one multipart request to GCS. It does not retry because a lost
@@ -1251,8 +1718,6 @@ func (c *Client) Upload(ctx context.Context, auth AuthData, name, checksum strin
 	if err := validateUploadBaseURL(auth.BaseURL); err != nil {
 		return err
 	}
-	c.ClearMetadataCache()
-	defer c.ClearMetadataCache()
 	if err := c.checkRateLimit(ctx, "GCS upload"); err != nil {
 		return err
 	}
@@ -1280,6 +1745,7 @@ func (c *Client) Upload(ctx context.Context, auth AuthData, name, checksum strin
 
 	contentLength := size
 	storage := rest.NewClient(c.http).SetErrorHandler(safeHTTPError)
+	c.recordHTTPRequest("GCS upload", true)
 	resp, err := storage.CallJSON(ctx, &rest.Opts{
 		Method:               http.MethodPost,
 		RootURL:              auth.BaseURL,
@@ -1339,17 +1805,41 @@ func mutationAcknowledgement(operation string, raw json.RawMessage) (string, err
 // it can determine whether registration succeeded. It returns legacy string
 // responses and an empty string for a boolean success acknowledgement.
 func (c *Client) Register(ctx context.Context, parentID, name, checksum string, size int64, created time.Time) (string, error) {
-	fileInfo := map[string]string{
-		"Name":         name,
-		"ParentID":     parentID,
-		"Size":         strconv.FormatInt(size, 10),
-		"Checksum":     checksum,
-		"CreationTime": strconv.FormatInt(created.UnixMilli(), 10),
+	return c.RegisterBatch(ctx, []RegistrationInfo{{ParentID: parentID, Name: name, Checksum: checksum, Size: size, Created: created}})
+}
+
+// RegisterBatch registers up to 100 uploaded files in one non-replayed mutation.
+// An ambiguous response is returned to the caller for reconciliation.
+func (c *Client) RegisterBatch(ctx context.Context, infos []RegistrationInfo) (string, error) {
+	if len(infos) > maxRegisterBatch {
+		return "", &Error{operation: "SetUploadFile3", message: fmt.Sprintf("batch contains %d registrations; maximum is %d", len(infos), maxRegisterBatch)}
 	}
+	if len(infos) == 0 {
+		return "", nil
+	}
+	fileInfos := make([]map[string]string, 0, len(infos))
+	parents := make([]string, 0, len(infos))
+	knownParents := true
+	for _, info := range infos {
+		fileInfos = append(fileInfos, map[string]string{
+			"Name":         info.Name,
+			"ParentID":     info.ParentID,
+			"Size":         strconv.FormatInt(info.Size, 10),
+			"Checksum":     info.Checksum,
+			"CreationTime": strconv.FormatInt(info.Created.UnixMilli(), 10),
+		})
+		if info.ParentID == "" {
+			knownParents = false
+		} else {
+			parents = append(parents, info.ParentID)
+		}
+	}
+	finishInvalidation := c.beginMutationInvalidation(parents, knownParents)
+	defer finishInvalidation()
 	var response struct {
 		SetUploadFile3 json.RawMessage `json:"setUploadFile3"`
 	}
-	if err := c.graphql(ctx, "SetUploadFile3", registerMutation, map[string]any{"FileInfos": []map[string]string{fileInfo}}, &response, true); err != nil {
+	if err := c.graphql(ctx, "SetUploadFile3", registerMutation, map[string]any{"FileInfos": fileInfos}, &response, true); err != nil {
 		return "", err
 	}
 	return mutationAcknowledgement("SetUploadFile3", response.SetUploadFile3)
@@ -1358,24 +1848,20 @@ func (c *Client) Register(ctx context.Context, parentID, name, checksum string, 
 // Mkdir creates a Degoo folder placeholder and returns a string provider response.
 // A boolean success acknowledgement returns an empty string.
 func (c *Client) Mkdir(ctx context.Context, parentID, name string) (string, error) {
-	fileInfo := map[string]string{
-		"Name":         name,
-		"ParentID":     parentID,
-		"Size":         "0",
-		"Checksum":     "",
-		"CreationTime": strconv.FormatInt(time.Now().UnixMilli(), 10),
-	}
-	var response struct {
-		SetUploadFile3 json.RawMessage `json:"setUploadFile3"`
-	}
-	if err := c.graphql(ctx, "SetUploadFile3", registerMutation, map[string]any{"FileInfos": []map[string]string{fileInfo}}, &response, true); err != nil {
-		return "", err
-	}
-	return mutationAcknowledgement("SetUploadFile3", response.SetUploadFile3)
+	return c.RegisterBatch(ctx, []RegistrationInfo{{ParentID: parentID, Name: name, Created: time.Now()}})
 }
 
 // Rename changes the name of one Degoo item.
 func (c *Client) Rename(ctx context.Context, id, newName string) error {
+	parents, known := c.parentsForItems([]string{id})
+	finishInvalidation := c.beginMutationInvalidation(parents, known)
+	mutationSucceeded := false
+	defer func() {
+		finishInvalidation()
+		if !mutationSucceeded {
+			c.forgetItemParents([]string{id})
+		}
+	}()
 	var response struct {
 		SetRenameFile json.RawMessage `json:"setRenameFile"`
 	}
@@ -1385,11 +1871,26 @@ func (c *Client) Rename(ctx context.Context, id, newName string) error {
 		return err
 	}
 	_, err := mutationAcknowledgement("SetRenameFile", response.SetRenameFile)
+	mutationSucceeded = err == nil
 	return err
 }
 
 // Move moves one Degoo item under a new parent.
 func (c *Client) Move(ctx context.Context, id, newParent string) error {
+	parents, known := c.parentsForItems([]string{id})
+	if newParent == "" {
+		known = false
+	} else {
+		parents = append(parents, newParent)
+	}
+	finishInvalidation := c.beginMutationInvalidation(parents, known)
+	mutationSucceeded := false
+	defer func() {
+		finishInvalidation()
+		if !mutationSucceeded {
+			c.forgetItemParents([]string{id})
+		}
+	}()
 	var response struct {
 		SetMoveFile json.RawMessage `json:"setMoveFile"`
 	}
@@ -1401,12 +1902,24 @@ func (c *Client) Move(ctx context.Context, id, newParent string) error {
 		return err
 	}
 	_, err := mutationAcknowledgement("SetMoveFile", response.SetMoveFile)
-	return err
+	if err != nil {
+		return err
+	}
+	finishInvalidation()
+	c.rememberItemParent(Item{ID: id, ParentID: newParent})
+	mutationSucceeded = true
+	return nil
 }
 
 // Delete recycles an active item when inRecycleBin is false. When true, the
 // item must already be in the recycle bin and is permanently deleted.
 func (c *Client) Delete(ctx context.Context, id string, inRecycleBin bool) error {
+	parents, known := c.parentsForItems([]string{id})
+	finishInvalidation := c.beginMutationInvalidation(parents, known)
+	defer func() {
+		finishInvalidation()
+		c.forgetItemParents([]string{id})
+	}()
 	var response struct {
 		SetDeleteFile5 json.RawMessage `json:"setDeleteFile5"`
 	}
@@ -1433,6 +1946,12 @@ func (c *Client) DeleteTrashItems(ctx context.Context, ids []string) error {
 		}
 		input = append(input, map[string]string{"FileID": id})
 	}
+	parents, known := c.parentsForItems(ids)
+	finishInvalidation := c.beginMutationInvalidation(parents, known)
+	defer func() {
+		finishInvalidation()
+		c.forgetItemParents(ids)
+	}()
 	var response struct {
 		SetDeleteFile5 json.RawMessage `json:"setDeleteFile5"`
 	}
@@ -1471,6 +1990,7 @@ func (c *Client) Download(ctx context.Context, downloadURL, rangeHeader string) 
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
 	}
+	c.recordHTTPRequest("download", false)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, &Error{operation: "download", message: "HTTP request failed", err: err}
