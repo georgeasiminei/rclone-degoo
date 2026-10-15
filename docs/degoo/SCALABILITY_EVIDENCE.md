@@ -667,6 +667,10 @@ selected-format production code, reset or installation is part of this work.
 
 ## Durable allocation and adaptive-placement follow-up
 
+Delivery: [PR #49](https://github.com/georgeasiminei/rclone-degoo/pull/49),
+targeting `staging`;
+merging and source-branch deletion remain with the user.
+
 This continuation starts from merged PR #48 at `773b9f8c3`. A local-only
 cooldown check at 09:56 UTC on 2026-10-15, repeated at 10:00 UTC, still found
 expiry at **21:30:29 UTC**. No Degoo API/authentication request, runtime update,

@@ -244,6 +244,10 @@ CAS experiment to run blindly; discover a supported primitive first.
 
 ## Offline recovery refinement — PR #48 follow-up
 
+Delivery: [PR #49](https://github.com/georgeasiminei/rclone-degoo/pull/49),
+targeting `staging`;
+merging and source-branch deletion remain with the user.
+
 The follow-up [evidence](SCALABILITY_EVIDENCE.md#durable-allocation-and-adaptive-placement-follow-up)
 extends the conditional architecture with disk-persisted intent-before-effect,
 checkpoint-error refusal until reopen, fixed temporary-journal capacity,

@@ -36,6 +36,10 @@ incident record; offline scalability fixtures remain separate evidence.
 
 ## Durable allocation and adaptive placement — 2026-10-15
 
+Delivery: [PR #49](https://github.com/georgeasiminei/rclone-degoo/pull/49),
+targeting `staging`;
+merging and source-branch deletion remain with the user.
+
 This continuation starts from merged PR #48 at `773b9f8c3`, using a fresh
 isolated worktree. Fetch/ancestry and actual-change checks found the existing
 branches integrated; no previous worktree or branch was overwritten. The
@@ -90,7 +94,7 @@ Checks completed:
   removing one unused initial store assignment in the new test.
 - `RCLONE_CONFIG=/notfound go test -race -p 1 ./backend/degoo/... -count=1`:
   backend, API and authentication packages passed after isolated diagnosis.
-- Changed Markdown lint, 59 relative links, eighteen unique task IDs,
+- Changed Markdown lint, 60 relative links, eighteen unique task IDs,
   `gofmt` and staged diff checks passed.
 
 No live backend integration, new-format mount recovery, remote-only journal

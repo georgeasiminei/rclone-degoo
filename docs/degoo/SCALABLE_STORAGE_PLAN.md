@@ -211,7 +211,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   2026-10-15 21:30:29 UTC. Re-read state before any later probe.
 - **P1-DECISION** — Status: `in progress`; dependencies: P1-FIXTURES,
   P1-RATELIMIT, P1-LOOKUP; evidencePR:
-  [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48).
+  [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
+  [#49](https://github.com/georgeasiminei/rclone-degoo/pull/49).
   Compare smaller pages, a bounded persistent local ID cache, and adaptive
   ciphertext buckets with an encrypted sharded remote index. Record the
   selected design, measured tradeoffs,
@@ -544,6 +545,10 @@ For each future task:
   remain unstarted; no reset/reseed was needed.
 
 ### 2026-10-15 — durable allocation and adaptive-placement experiments
+
+Delivery: [PR #49](https://github.com/georgeasiminei/rclone-degoo/pull/49),
+targeting `staging`;
+implementation commit `4af0011c8`. The user merges and removes the source branch.
 
 - Owner: coordinating Codex agent with independent durable-intent,
   adaptive-placement and provider-contract review workers. PR #48 is merged at
