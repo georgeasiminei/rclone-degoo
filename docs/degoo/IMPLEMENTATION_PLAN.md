@@ -1007,3 +1007,250 @@ it does not establish root freshness or provider immutability. Metadata payload
 schemas, sharding, manifests, allocator, bootstrap/publication and mount wiring
 remain separate implementation gates. Physical page names must be opaque
 random locators; user names belong only inside encrypted payloads.
+
+### Bounded encrypted manifest-tree component
+
+Continue P3-FORMAT offline with an inactive manifest-tree library over the page
+codec. A manifest root reference is held by its authenticated file/index record.
+Each manifest page identifies the logical file and a contiguous byte range;
+leaves hold at most 64 chunk descriptors, and branches at most 64 child ranges.
+Maximum depth is eight branch levels. Bound plaintext encoding by the page
+codec as well as record count; reject overflow, gaps, overlaps, wrong file IDs,
+invalid references and unsupported versions before use. An empty file has one
+empty leaf. Logical size uses nonnegative int64 with checked addition.
+
+Each physical reference contains a bounded opaque locator (maximum 256 bytes),
+expected logical page ID/generation and encrypted-byte digest. A chunk descriptor
+contains its logical offset/length, stored length, immutable opaque data locator,
+stored-byte digest and expected 32-byte crypt stream header. Data encryption and
+range opening remain separate implementation work; those fields alone do not
+validate a partial data read. Default future upload chunking remains 1 GiB;
+manifest descriptors may describe positive chunks up to that size. Stored chunk
+limits must include crypt overhead and the future data identity envelope.
+
+The builder consumes descriptors incrementally and keeps at most one partial
+64-record group per level. It writes immutable children before parents, with
+no automatic request retries or cleanup. Its store port must persist allocation
+intent before any effect and enforce transaction/backlog limits; this library
+cannot supply provider durability or publication. Failures leave staged objects
+with that transaction owner. New page identities use cryptographic randomness.
+Lookup reads one root-to-leaf path, checks authenticated page identities and
+parent ranges, and has an explicit depth/read limit. Complete enumeration remains
+linear. The store returns bounded encrypted bytes; the library checks the page
+codec digest before decoding. No component is wired to a live mount or remote
+format until provider/publication gates pass.
+
+### Required local-control checkpoint component
+
+Add a bounded checkpoint facility to the Linux authority lease for future
+coordinator control state. It is separate from the disposable metadata cache and
+from remote publication. Explicit initialization creates the first checkpoint;
+opening or loading missing state never silently creates an empty vault. A load
+must succeed before replacement is allowed. Keep the stable writer lock held
+through every checkpoint and provider operation.
+
+The private checkpoint has an eight-byte `DGSAUTH1` marker, a big-endian uint64
+payload length, a SHA-256 payload checksum and opaque payload bytes (48-byte
+header). Cap the complete file at 64 KiB and use one fixed temporary file, so
+old plus temporary storage is at most 128 KiB. The checksum detects corruption;
+it neither authenticates against the trusted owner nor detects stale backups.
+The coordinator must validate its own payload schema and treat an old valid
+checkpoint as unsupported recovery, not proven fresh control state.
+
+Use relative descriptor operations in the validated authority directory, private
+single-link regular files, write/fsync, atomic rename and directory fsync. Reject
+symlinks, unsafe permissions, oversized/corrupt data and accidental file changes.
+Any ambiguous checkpoint I/O failure poisons the lease for further work until
+close and reopen; the reopened committed file may contain the old or new state.
+Never issue a provider request merely because a failed save returned. A leftover
+fixed temporary file is bounded and uncommitted; reconcile/remove only that
+private file under the same exclusive lease. Fault tests cover failure after
+rename and disk reopen without any remote request. This component supplies no
+allocation schema, root freshness, remote fence or registry rollback detection.
+
+### Shared encrypted-page repository port
+
+The inactive manifest and index components share a page reference containing
+an opaque locator (nonempty valid UTF-8, no NUL, at most 256 bytes), the expected
+page identity and a nonzero 32-byte encrypted digest. JSON field names are
+`locator`, `identity`, `digest`; identity fields are `role`, `logical_id`,
+`generation`. Page identity remains authenticated by the codec's binary envelope.
+References must come from trusted control state or authenticated parent pages.
+
+A repository validates references and context before invoking its store, checks
+bounded encrypted input and verifies the codec/digest before returning payload.
+It seals payload before a single create call, with no automatic retry or cleanup.
+The store contract requires durable allocation intent before effect, new
+immutable locators, confirmed stored bytes on success, retained unknown outcomes,
+and the shared cooldown/auth guards. This is an explicit adapter contract, not
+a Degoo guarantee; repository tests use generated memory stores. Failed create
+must remain in that store's transaction inventory even when no locator is known.
+
+### Immutable encrypted radix index component
+
+Implement the inactive generic index over the shared page repository. Keys are
+32-byte digests supplied by the future namespace layer (which must derive them
+with a keyed name digest); values are opaque encoded records of at most 8 KiB.
+All keys and values stay inside encrypted pages. A radix-16 node has a normalized
+key prefix and nibble depth 0..64. Leaves have at most 64 strictly sorted unique
+records and must fit the codec's encoded-byte budget. Branches contain exactly
+16 optional authenticated child references. Reject malformed prefixes, mixed
+leaf/branch shapes, invalid references and records outside their prefix.
+
+A point lookup traverses at most 65 pages regardless of sibling count. Updates
+copy only the requested path and newly split descendants; previous roots remain
+unchanged. Split on either record or encoded-byte overflow, with a hard depth
+limit and explicit refusal. Deletion may merge bounded child leaves when both
+record and byte budgets fit; inspect no more than 16 children per visited branch.
+Every create uses a new random logical page ID and immutable store locator;
+there is no mutable remote pointer, automatic retry, implicit empty-root recovery
+or garbage collection in this component. An explicit empty root is created only
+by the caller's initialization transaction.
+
+A streaming walk validates and traverses authenticated children with bounded
+stack depth; full enumeration is linear. The store/transaction owner remains
+responsible for staged-object inventory, split headroom, pending-write durability,
+reader pins and publication. Future multi-record rename applies to an unpublished
+root and publishes only the final complete tree; this generic index alone does
+not implement namespace semantics or make intermediate roots authoritative.
+Provider/bootstrap/publication and filesystem integration remain separate gates.
+
+### Stable-ID namespace component
+
+Build an inactive namespace layer over the immutable index. A snapshot contains
+an inode-index root and stable root-directory ID. Each directory inode holds its
+own child-index root; links hold the exact name bytes and child ID. The global
+inode index holds file/directory metadata and parent/name identity. This keeps
+known-path traversal bounded by path depth and page depth, with no whole-vault
+scan; full listing walks only the selected directory's child index and verifies
+each inode. Directory rename edits parent links and the moved inode, preserving
+all descendant IDs and data references.
+
+Use a nonzero 32-byte secret lookup key supplied by authenticated root state:
+HMAC-SHA256 over distinct `inode` and `child` domains, with fixed-width inode or
+parent ID before exact name bytes. Preserve Linux filename bytes (including
+invalid UTF-8) as JSON byte strings; reject NUL, slash, dot/dotdot, names over
+255 bytes, absolute/unclean paths and relative paths over 4,096 bytes. Case is
+significant. IDs are nonzero 16-byte random values. File inodes bind their own
+ID/size to a manifest reference; directories have child-index references and
+zero logical file size. Root has no parent/name. Values remain under the index's
+8 KiB record limit. Version each encoded inode/link and decode strictly.
+
+Operations consume an immutable snapshot and return a proposed new snapshot.
+No root is published or local pending data discarded here. Failed multi-record
+edits leave the old snapshot readable; staged pages remain transaction-owned.
+Support lookup/list, create file, mkdir, expected-ID file replacement, removal,
+and rename. Refuse root mutation, missing/type-conflicting objects, nonempty
+directory deletion/replacement, duplicate names/IDs and directory cycles. Rename
+may atomically replace a compatible file or empty directory within the proposed
+root. Check destination ancestry by stable parent IDs with explicit path/depth
+bounds. Preserve file modification time on rename; update affected directory
+metadata using a caller-supplied transaction time. Writer serialization, pins,
+provider publication and VFS pending-write recovery remain coordinator duties.
+
+Namespace inodes also carry a nonzero uint64 revision. Every inode change
+advances it with overflow refusal. File replacement, removal and rename require
+an expected ID/revision, so an old object handle cannot delete or replace a newer
+logical file version merely because its stable ID survived an overwrite.
+
+### Encrypted data-chunk component
+
+Implement an inactive streaming data codec using the same rclone crypt content
+cipher and password/salt representation as metadata pages. Encrypt a 55-byte
+inner identity header before each chunk: `DGSDAT02`, big-endian uint16 version
+2, role byte 5, vault ID (16 bytes), stable file ID (16 bytes), logical chunk
+offset (uint64), and logical chunk length (uint32). Cap logical chunks at 1 GiB;
+compute the exact stored size including the inner header and crypt framing.
+Each newly encrypted object gets a fresh crypt nonce. Record the complete
+32-byte crypt stream header and SHA-256 of stored bytes in its authenticated
+manifest descriptor. Encrypt into a caller-owned staging writer without holding
+an entire chunk in memory; reject short or overlong source input and propagate
+source/destination errors. Failed output is incomplete staging, never publishable.
+
+A range reader requires a trusted chunk descriptor and expected file ID. Before
+returning user data, verify the object's stream header against the manifest and
+decrypt/validate the inner identity envelope. Use crypt's authenticated block
+range reader for requested plaintext, binding every offset-zero reopen to the
+same expected crypt header. A trusted nonce plus authenticated blocks permits
+bounded partial reads without hashing the entire object. Full-object checksum
+verification remains required at create confirmation and reconciliation; a
+partial read cannot claim to have checked the complete SHA-256. The range-store
+port must enforce exact requested offsets/limits and total object size, honor
+cooldowns/cancellation, and never substitute a listing-based locator. This
+component neither uploads nor publishes, owns allocation intent, or claims a
+verified Degoo range/deletion/freshness primitive. Test boundary-crossing ranges,
+substituted valid same-key objects, corrupt/truncated streams and exact size
+limits before provider integration.
+
+### Bounded durable allocation-intent component
+
+Implement an inactive local allocation ledger over the actual authority lease's
+checkpoint port. Explicit initialization and reopen are distinct; a missing,
+corrupt or incompatible existing checkpoint never becomes an empty ledger.
+Persist a monotonically increasing attempt sequence and at most 32 unresolved
+or confirmed allocations, with a complete encoded checkpoint limit below the
+authority's 64 KiB envelope. Each record binds a random logical identity,
+expected stored length and SHA-256 before the caller may issue its one create.
+Persist the reservation before returning its attempt token. Reopen preserves
+all reservations as potentially accepted creates; there is no automatic replay.
+Positive exact-object confirmation can attach a bounded immutable locator only
+when the supplied verified digest and length equal the reservation. A conflicting
+confirmation is refused. Never reuse attempt sequences, even for confirmed
+records, and refuse overflow or capacity exhaustion before any provider effect.
+
+Checkpoint errors poison the ledger instance; reopen rereads actual committed
+state instead of guessing whether a failed replacement took effect. Check the
+lease before every operation, serialize ledger updates, and clone returned
+records so callers cannot mutate live state. This first component deliberately
+has no record removal, timeout expiry, negative-list reconciliation or delete
+retry. Transferring records to a bounded authenticated inventory and reclaiming
+objects requires a subsequent publication/closure protocol; until implemented,
+32 records is a safe refusal limit rather than a scalable allocator claim.
+Required local state remains outside disposable cache. This component alone
+cannot detect a restored stale but valid checkpoint or recover a lost writer
+computer; remote-authoritative recovery and provider safety remain open gates.
+
+### Bounded logical-file composition
+
+Add an inactive file composition layer over the manifest tree and caller-owned
+chunk staging/range ports. Build a known-length file from a streaming source,
+with chunk sizes in 1..1 GiB and exact source consumption. Every returned chunk
+must match the expected file offset/length; the manifest builder validates its
+bounded descriptor. Reject short/long input and leave all failed staged objects
+to the transaction owner. Empty files have an authenticated empty manifest and
+no data object. This layer never buffers the entire logical file.
+
+Implement ReadAt by locating only chunks overlapping the requested interval,
+opening the exact relative plaintext ranges through the authenticated data
+adapter, and closing each before advancing. Preserve ordinary partial-read/EOF
+semantics, propagate corruption/cancellation/close errors, and perform no reads
+for an empty buffer or offsets at/beyond EOF. Memory is bounded by the caller's
+buffer and manifest traversal; no directory-wide scan or implicit retry occurs.
+Use real encrypted manifest pages in tests and synthetic streaming ports to
+verify >20 GiB splitting without allocating that data. This is composition
+coverage, not live >20 GiB upload, range-read or mounted acceptance. Pending
+local VFS files, durable intents, publication and open-version pins are still
+integration responsibilities and are not weakened by these ports.
+
+### Password-only recovery gate
+
+The user's clarification makes recovery after loss of every local file a hard
+requirement: Degoo account login plus the encryption password must suffice for
+published data. Update bootstrap design to discover remote KDF salt, vault
+identity, descriptor and latest committed root without a saved local locator.
+A durable local checkpoint can preserve pending transactions through ordinary
+restarts, but cannot be the sole authority for published state. Do not wire the
+new components into a writable scalable mount until remote authority/freshness
+and password-only discovery are verified. No response to an optional question
+was inferred as approval for required local-state recovery; the explicit answer
+now rejects that alternative. The new data/file/index/namespace components are
+independent of this unresolved provider protocol and remain inactive.
+
+Local safety review adds conditional checkpoint replacement under the authority
+lease mutex and per-operation loaded-state comparison. Separate ledger instances
+sharing a lease must refuse stale state, including inventory reads, rather than
+lose another reservation. This is a local filesystem mechanism, not a verified
+remote conditional operation. Data range reopen must propagate header-body close
+errors before requesting the next extent; otherwise the crypt helper's ignored
+close error could hide a failed I/O boundary. Both refinements preserve the
+inactive format and do not change the unresolved publication protocol.

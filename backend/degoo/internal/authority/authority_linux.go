@@ -77,21 +77,25 @@ type fileIdentity struct {
 	ino uint64
 }
 
-// Lease holds exclusive local writer authority until Close. It is safe for
-// concurrent Check and Close calls.
+// Lease holds exclusive local writer authority until Close. Check, checkpoint
+// operations, and Close are serialized across concurrent callers.
 type Lease struct {
-	mu            sync.Mutex
-	path          string
-	ownerUID      uint32
-	machineID     string
-	vaultIdentity string
-	lockFD        int
-	dirFD         int
-	dirIdentity   fileIdentity
-	lockIdentity  fileIdentity
-	bindingID     fileIdentity
-	bindingDigest [32]byte
-	closed        bool
+	mu               sync.Mutex
+	path             string
+	ownerUID         uint32
+	machineID        string
+	vaultIdentity    string
+	lockFD           int
+	dirFD            int
+	dirIdentity      fileIdentity
+	lockIdentity     fileIdentity
+	bindingID        fileIdentity
+	bindingDigest    [32]byte
+	closed           bool
+	poisoned         error
+	checkpointLoaded bool
+	checkpointID     fileIdentity
+	checkpointDigest [32]byte
 }
 
 // Initialize creates a new owner-private authority at authorityPath and binds
@@ -283,25 +287,12 @@ func Open(ctx context.Context, authorityPath, vaultIdentity string) (*Lease, err
 }
 
 // Check verifies that the canonical authority directory and lock path still
-// name the same inodes acquired by Open. Call it before coordinator work.
+// name the same inodes acquired by Open and that any loaded checkpoint has not
+// changed. Call it before coordinator work.
 func (l *Lease) Check() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed {
-		return ErrClosed
-	}
-	if err := l.checkPaths(); err != nil {
-		return err
-	}
-	actual, raw, id, err := readBindingAt(l.dirFD, l.ownerUID)
-	if err != nil || id != l.bindingID || sha256.Sum256(raw) != l.bindingDigest {
-		return fmt.Errorf("authority binding changed: %w", ErrReplaced)
-	}
-	expected := binding{Version: 1, AuthorityPath: l.path, OwnerUID: l.ownerUID, MachineID: l.machineID, VaultIdentity: l.vaultIdentity, LockDevice: l.lockIdentity.dev, LockInode: l.lockIdentity.ino}
-	if actual != expected {
-		return fmt.Errorf("authority binding changed: %w", ErrBindingMismatch)
-	}
-	return nil
+	return l.checkLocked()
 }
 
 // Close releases the kernel lock and closes the lease descriptors. It is

@@ -1,7 +1,8 @@
 # Degoo scalable storage plan and progress
 
 **Plan date:** 2026-10-15; **Planning status:** complete; **Implementation
-status:** in progress (P2 directory bounds; inactive P3 page codec).
+status:** in progress (P2 directory bounds; inactive P3 encrypted trees,
+namespace, chunk I/O and local control components).
 
 This durable tracker records evidence, open decisions, validation gates, and
 next steps for large directories and logical files above Degoo's reported
@@ -256,15 +257,22 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   Specify the versioned encrypted object/index/manifest
   schema, key derivation and authenticated fields, shard addressing, maximum
   record size, chunk sizing after encryption overhead, and how a local cache
-  reconstructs from remote state. Do not add a single unbounded index.
-- **P3-PUBLISH** — Status: `not started`; dependencies: P3-FORMAT;
-  evidencePR: `TBD`. Implement staged upload and atomic logical-version
+  reconstructs from remote state. Password-only recovery must discover all
+  required bootstrap/KDF/control data remotely after account login. Do not add
+  a single unbounded index.
+- **P3-PUBLISH** — Status: `in progress`; dependencies: P3-FORMAT;
+  evidencePR: pending encrypted-component follow-up.
+  Local checkpoint/allocation intent components are inactive; remote publication
+  and authority remain blocked. Implement staged upload and atomic logical-version
   publication. Define idempotency, write authorization, version selection,
   overwrite behavior, and bounded temporary/backup/marker counts. Keep the
   last complete version readable until the new version is confirmed where
   supported.
-- **P3-SHARDS** — Status: `not started`; dependencies: P3-FORMAT;
-  evidencePR: `TBD`. Implement bounded index shards/buckets and their update,
+- **P3-SHARDS** — Status: `in progress`; dependencies: P3-FORMAT;
+  evidencePR: pending encrypted-component follow-up.
+  Inactive encrypted index/manifest trees and namespace are implemented;
+  physical allocation and mount integration remain open. Implement bounded
+  index shards/buckets and their update,
   split, merge, lookup, and invalidation rules. Prove that no single directory
   or index object grows without bound and that split headroom is sufficient
   for an interrupted update.
@@ -724,3 +732,41 @@ Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
 Targets `staging`.
 Source commit: `18bf74315`; integrated validation: `952acf6e3`. The user merges
 and removes the source branch. No merge was performed by the agent.
+
+### 2026-10-15 — encrypted component implementation and recovery clarification
+
+- Continued after PR #51's first validated cache/codec increment. Updated
+  [the plan](IMPLEMENTATION_PLAN.md) before implementing each component.
+  Added the real local checkpoint, bounded durable allocation ledger, shared
+  encrypted-page repository, compressed radix index, manifest tree, stable-ID
+  namespace, streaming data codec and logical-file composition. They remain
+  inactive: no new format, root publisher, runtime install or reset is enabled.
+- The user merged PR #51 at `5e945c0d7` while this follow-up was underway.
+  After fetching, preserved every pending edit on a new feature branch from
+  that current `origin/staging`. Its baseline tree equals PR #51's final head;
+  no reset, dropped work or source conflict was involved. Open a separate PR
+  for these components and leave merging/source-branch deletion to the user.
+- Focused component checks and an encrypted file/index/namespace integration
+  case pass. Known-snapshot graph traversal and synthetic >20 GiB splitting
+  are separate from cloud bootstrap/password-only recovery and live acceptance.
+  Detailed limits and failure coverage are in
+  [the evidence](SCALABILITY_EVIDENCE.md).
+- Delegated workers completed the checkpoint, index, manifest and namespace
+  tests. Subsequent worker usage limits interrupted final review/data/ledger
+  work; the coordinating agent preserved their partial files and completed
+  the remaining implementation, alias-regression correction and integration.
+- The user explicitly requires published-data recovery after Degoo login with
+  **the encryption password alone**, even after losing all local files. A
+  saved config/locator or intact local registry is not a prerequisite. The
+  local-only root registry experiment cannot be selected for production.
+  Requirements and decision now state that nonsecret KDF/bootstrap information
+  and the latest complete root must be recoverable remotely.
+- Read-only state inspection at 16:08 UTC still found the API hold expiring at
+  **21:30:29 UTC**, with no separate password-login hold. No live provider/auth
+  request, installed-runtime change, pending-data discard or reset occurred.
+- P3-SHARDS is active for the inactive trees/namespace, with physical placement
+  and filesystem integration unfinished. P3-PUBLISH is active for local intent
+  components only; remote publication/freshness remains unverified. No status
+  implies the full plan is complete. Provider identity/deletion evidence,
+  password-only bootstrap, remote publication/cleanup authority, persistent
+  inventory, reader pins, mounted fault/rebuild and live/soak gates remain open.

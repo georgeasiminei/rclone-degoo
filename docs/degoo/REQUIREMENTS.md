@@ -71,6 +71,31 @@ not a provider fence. Publication must still handle delayed remote effects,
 ambiguous acknowledgements and recovery. A future transfer must establish that
 the previous writer cannot resume; elapsed time alone is insufficient.
 
+### Recovery with the encryption password alone
+
+On 2026-10-15 the user made password-only vault recovery a hard requirement.
+After authenticating to the Degoo account, the encryption password alone must
+recover the complete remotely published vault even if the writer computer,
+all local configuration, cache, control files and their backups are lost.
+Account authentication remains separate; the encryption password is not a
+replacement for Degoo account credentials.
+
+All nonsecret KDF parameters, vault identity, format/bootstrap discovery and
+encrypted namespace/version metadata required for recovery must be available
+in Degoo. Do not require a saved local locator, configuration file, current-root
+reference or safety-registry backup. Recover the latest complete committed
+version using a verified authority/publication protocol; selecting a plausible
+older root from a stale listing is not sufficient. Missing or ambiguous state
+must be reported explicitly, never treated as a new empty vault. Pending bytes
+not yet uploaded cannot be reconstructed after loss of the only local copy;
+normal restarts and outages must still preserve those bytes locally.
+
+A local lock/journal may improve ordinary operation, but may not be the only
+authority needed for published-data recovery. No automatic cross-host writer
+takeover is added by this requirement: recovery and transfer must still ensure
+the previous writer cannot resume. Explain any unresolved provider constraint
+instead of weakening password-only recovery.
+
 ### Linux mount
 
 - Linux is the primary platform for the initial implementation and acceptance.

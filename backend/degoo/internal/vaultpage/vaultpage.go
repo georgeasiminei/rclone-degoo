@@ -62,9 +62,12 @@ const (
 
 // Identity identifies one immutable logical page generation.
 type Identity struct {
-	Role       Role
-	LogicalID  [16]byte
-	Generation uint64
+	// Role determines which payload schema may consume the page.
+	Role Role `json:"role"`
+	// LogicalID is a nonzero immutable logical page identifier.
+	LogicalID [16]byte `json:"logical_id"`
+	// Generation is the expected nonzero page generation.
+	Generation uint64 `json:"generation"`
 }
 
 // Codec encrypts metadata pages with rclone crypt's authenticated content cipher.
@@ -91,6 +94,7 @@ func New(password string, salt [32]byte, vaultID [16]byte) (*Codec, error) {
 	cipher, err := crypt.NewCipher(configmap.Simple{
 		"filename_encryption": "off",
 		"filename_encoding":   "base32",
+		"suffix":              ".bin",
 		"password":            obscuredPassword,
 		"password2":           obscuredSalt,
 	})
