@@ -34,10 +34,80 @@ authentication change, or remote mutation occurred in that investigation.
 The exact comparison matrix, retry headers, and unresolved causes are in the
 incident record; offline scalability fixtures remain separate evidence.
 
+## Durable allocation and adaptive placement — 2026-10-15
+
+Delivery: [PR #49](https://github.com/georgeasiminei/rclone-degoo/pull/49),
+targeting `staging`;
+merging and source-branch deletion remain with the user.
+
+This continuation starts from merged PR #48 at `773b9f8c3`, using a fresh
+isolated worktree. Fetch/ancestry and actual-change checks found the existing
+branches integrated; no previous worktree or branch was overwritten. The
+implementation plan was updated before adding the two Linux-only test models.
+No production source, mount format, installed runtime or data was changed.
+
+Local-only checks at 09:56 and 10:00 UTC still found the persisted provider
+hold through **2026-10-15 21:30:29 UTC**. No Degoo API request, authentication
+renewal/login, reset, pending-write discard or cache removal was attempted.
+Provider continuity/deletion and publication/fencing remain unverified.
+[SCALABILITY_DECISION.md](SCALABILITY_DECISION.md) records the reviewed public
+source scope and a future bounded live matrix; no speculative schema mutation
+or account-wide trash inventory was used.
+
+The eleven new tests exercise real temporary-file journal replacement,
+intent-before-simulated-create/delete ordering, disk reopen, checkpoint errors,
+unknown acknowledgements, pending bytes, incomplete graphs, protected file-data
+IDs, stale epochs, finite lifetime allocation and cleanup cursors. The separate
+adaptive fixture compares the physical directory tree and counts reservations,
+ghosts, skew/depth exhaustion and directory-prune work. Its saved state is a
+whole-map structural serializer after modeled faults; it does not establish
+durable ordering before remote effects. Exact counters and liveness limits are
+in [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md).
+
+The first repository-wide run passed 185 packages but failed three existing
+command socket tests: the private temporary prefix still exceeded their Unix
+socket length budget. All three passed with an eight-character private temporary
+root. The final repository-wide run passed all 186 test packages under that
+setup. No test timeout, cache lifetime or production deadline was increased.
+`CI=true` uses the existing unreliable-network-test policy, including self-update
+tests; it does not establish external download compatibility.
+
+An initial overlapping full-suite/race run passed backend and auth race tests,
+but the API populated-snapshot memory fixture took 6.74 seconds for its
+1,000-entry case. Its five-second cache expired during construction, retaining
+25 rather than the expected 32 parents. The isolated fixture rerun passed under
+race detection; the final sequential scoped race run also passed after the full
+suite. This is a resource-sensitive fixture limitation, not a provider result.
+
+Checks completed:
+
+- Fresh `go build -o` to a temporary binary, placed first on `PATH` for the
+  repository tests; runtime caches and temporary directories were isolated.
+- `CI=true RCLONE_CONFIG=/notfound go test -timeout 20m -count=1 ./...`:
+  all 186 test packages passed with short private `TMPDIR`/`GOTMPDIR`.
+- `RCLONE_CONFIG=/notfound go test ./backend/degoo -run
+  '^TestScalability(Durable|AdaptivePlacement)' -count=1 -v`: all eleven passed.
+- `RCLONE_CONFIG=/notfound go test ./backend/degoo/api -run '^TestGetItem'
+  -count=1 -v`: existing direct-ID failure/cooldown cases passed.
+- `go vet ./backend/degoo/...` and
+  `golangci-lint run ./backend/degoo/...`: passed with zero lint issues after
+  removing one unused initial store assignment in the new test.
+- `RCLONE_CONFIG=/notfound go test -race -p 1 ./backend/degoo/... -count=1`:
+  backend, API and authentication packages passed after isolated diagnosis.
+- Changed Markdown lint, 60 relative links, eighteen unique task IDs,
+  `gofmt` and staged diff checks passed.
+
+No live backend integration, new-format mount recovery, remote-only journal
+rebuild, provider fencing, encrypted logical file above 20 GiB or host power-loss
+exercise was run. Local graph completeness and remote authority/visibility are
+explicit fixture assumptions. Cleanup can retain safe orphans and unresolved
+present deletes; non-reused lifetime slot ordinals eventually stop allocation.
+P1-LOOKUP and P1-DECISION retain their live gates, and P3-FORMAT is unstarted.
+
 ## Scalable storage lookup and publication decision — 2026-10-15
 
 Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
-targeting `staging`; merging remains with the user.
+merged into `staging` on 2026-10-15 at `773b9f8c3`.
 
 The work starts from fetched `origin/staging` at `a4dcb1902`, after confirming
 PR #46 is merged and both its commits are integration ancestors. The shared

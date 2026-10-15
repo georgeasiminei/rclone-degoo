@@ -664,3 +664,130 @@ admission refusal during uncertain publication or incomplete inventory. This
 avoids claiming that distinguishable synthetic failures prove ambiguity, or
 that a publication-only hold bounds further staging. No provider request,
 selected-format production code, reset or installation is part of this work.
+
+## Durable allocation and adaptive-placement follow-up
+
+Delivery: [PR #49](https://github.com/georgeasiminei/rclone-degoo/pull/49),
+targeting `staging`;
+merging and source-branch deletion remain with the user.
+
+This continuation starts from merged PR #48 at `773b9f8c3`. A local-only
+cooldown check at 09:56 UTC on 2026-10-15, repeated at 10:00 UTC, still found
+expiry at **21:30:29 UTC**. No Degoo API/authentication request, runtime update,
+reset, cache deletion or pending-write discard is part of these experiments.
+P1-LOOKUP and P1-DECISION retain their provider gates. See the
+[reviewed contracts and live protocol](SCALABILITY_DECISION.md#reviewed-provider-contracts--pr-48-follow-up)
+for the pinned public reference, negative finding's scope, and future bounded
+continuity/deletion/fencing matrix. GetOverlay4 does not establish recycle state;
+account-wide trash enumeration cannot fill that scoped evidence gap.
+
+Reproduce the additional offline experiments:
+
+```sh
+RCLONE_CONFIG=/notfound go test ./backend/degoo \
+  -run '^TestScalability(Durable|AdaptivePlacement)' -count=1 -v
+```
+
+### Allocation intent, safety state and disk reopen
+
+The durable model uses real owner-private temporary files. It syncs pending
+bytes separately and writes a bounded allocation-intent journal before a
+simulated remote create/delete. Journal replacement syncs the new file,
+renames it, and syncs the containing directory. A reopened store reconstructs
+its high-water mark, unresolved intents, protected references and cleanup
+cursor from the file. Missing/corrupt safety state fails closed rather than
+following the disposable ID-cache prototype's rebuild/reset behavior.
+
+The fixture parameters are eight non-reused physical slots, at most sixteen
+combined object/intent entries, a 16 KiB journal and two candidate inspections
+per cleanup step. These are experiment limits, not a production transaction
+inventory or a provider cap. Exhaustion remains explicit even after an object
+is removed: freeing occupancy does not recycle its allocation ordinal.
+
+Create acknowledgements lost before or after apply retain the known slot and
+transaction identity across reopen. The same transaction cannot issue a blind
+replay. Discovery with unknown visibility retains the reservation; an explicit
+simulated authoritative discovery can resolve it. Lost delete acknowledgements
+retain the object and delete intent until authoritative absence is modeled.
+Cleanup checkpoints persist a cursor, and reachability protects modeled file-data
+IDs through current, previous and reader-pinned roots. An assumed epoch
+authority atomically checks allocation and deletion, extending PR #48's
+publication-only fencing experiment.
+
+A failed checkpoint stops the current store instance until reopen, including a
+failure after rename but before directory sync. A single fixed journal temp
+path bounds abandoned replacement files to one old plus one temporary journal
+(32 KiB of content); that is not filesystem-block or pending-data accounting.
+An injected incomplete-graph state and dangling references refuse cleanup.
+The eight failed-create attempts leave a 766-byte journal and eight reserved
+slots; the ninth attempt sends no simulated create. The cleanup fixture retains
+all six protected root/data IDs while reconciling two orphan deletions and
+finishing its eight-entry cursor across two-entry steps. A 4,096-byte pending
+local file survives reopen. Stale-epoch create/delete attempts send zero
+simulated side effects.
+
+Graph completeness/freshness is still supplied by the fixture, not established
+by authenticated provider reads. Cross-store concurrent local journal mutation
+is outside this single-coordinator experiment.
+
+The cleanup sweep conservatively skips objects referenced by any inventory
+record, including unreachable parents. Child-before-parent order can therefore
+retain an orphan after the parent is removed. A lost delete response with the
+object still present also remains held without automatic replay. These are
+explicit liveness limits: production GC needs repeatable inventory generations,
+progress scheduling and an authorized reconciliation/retry protocol. The finite
+non-reused slot limit eventually stops writes; this model does not claim that
+cleanup restores lifetime allocation capacity or account bytes.
+
+This proves local model behavior only. The simulated remote map survives store
+reconstruction in the same process; no host crash, torn filesystem, actual
+provider-ID discovery, remote inventory pagination, authenticated chunk tree,
+reader-pin registration/expiry or real provider fence is exercised. The test
+journal is local safety state, not the rebuildable metadata cache. Losing it
+cannot silently initialize an empty vault, and the experiment supplies no
+remote-only recovery path after its loss. Staging large logical files still
+requires paged remote intents and a bounded control/bootstrap protocol before
+P3 implementation.
+
+### Adaptive physical placement and cleanup cost
+
+The append-only model fills bounded direct-object slots and lazily creates
+binary routing children as needed, retaining stable locations for existing
+objects. It counts child folders, objects, pending creates, known ghost slots
+and reserved headroom. Allocation stops when visibility is unknown or the
+finite routing depth is exhausted; repeated versions consume physical slots.
+It does not rebalance/move existing immutable data to split a full container.
+
+The six-role, 576-object comparison uses the same generated IDs as PR #48's
+fixed-depth placement. Adaptive limits are fanout sixteen, two reserved slots
+per directory, twelve direct objects and depth sixteen. These are exploratory
+parameters, not selected format constants or live quota evidence.
+
+| Generated comparison | Adaptive | Fixed-depth PR #48 model |
+| --- | ---: | ---: |
+| Objects, six roles | 576 | 576 |
+| Physical directory records, including vault/role roots | 74 | 8,650 |
+| Reserved slots | 148 | Not modeled separately |
+| Maximum occupancy including adaptive reserve | 16 | 16 |
+| Observed routing depth | 3 | Fixed maximum sixteen-digit route |
+| Serialized placement checkpoint | 48,363 B | Not measured |
+
+This trades the fixed model's sparse deep directory tree for higher occupancy
+and a binary spill path with explicit twelve-object and headroom limits. It
+does not use the same branching policy or provide a general optimality result.
+Repeated-version, forced-skew and finite-depth exhaustion checks retain the
+bounds. Cleanup counts candidate inspection, object deletion and empty-directory
+removal separately; it preflights the full bounded ancestor chain. Insufficient
+work budget refuses mutation, and a deep three-directory prune needs five work
+units (one inspection, one object and three directories). This CPU preflight is
+bounded by route depth but is not included in the mutation-work counter.
+
+Structural save/reopen checks serialize the entire finite placement map after
+injected boundaries. They check reconstructed reservations and stable paths;
+they do not prove intent-before-network ordering. That ordering is exercised
+separately by the durable journal model. The serializer is not a scalable,
+paged allocator checkpoint, byte-bounded production record or remote authority.
+Pending folder states are resolved by an explicitly supplied outcome;
+Degoo visibility, uniqueness, folder placeholders and deletion acknowledgements
+remain unverified. Caller-selected generated IDs and in-memory folder paths are
+not proof that provider-assigned locators can be durably discovered or recovered.

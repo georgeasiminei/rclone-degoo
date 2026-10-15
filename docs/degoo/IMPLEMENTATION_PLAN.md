@@ -62,6 +62,33 @@ run for that follow-up. See [VALIDATION.md](VALIDATION.md).
 
 ## Implementation decisions and validation plan
 
+### Durable allocation and adaptive placement experiments (2026-10-15)
+
+Continue from merged PR #48 using test-only models before P3-FORMAT. Persist
+allocation intent before simulated remote side effects, reopen from disk at
+failure boundaries, and retain unknown creates/deletes without blind replay or
+slot reuse. Exercise missing/corrupt journals, lost acknowledgements, stale
+writers, protected data references, and bounded cleanup checkpoints. Local
+fsync/rename durability is an experiment boundary; remote discoverable intent,
+conditional revision/epoch authority, visibility, and deletion completion remain
+provider assumptions requiring separate evidence.
+
+Compare lazy, bounded physical-directory allocation with the fixed-depth model.
+Count objects, child folders, reserved slots and unresolved ghosts; reserve
+recovery headroom, cap depth and temporary backlog, and stop safely on unknown
+occupancy. Measure directory overhead and bounded cleanup work under restart.
+These experiments select neither a production schema nor numeric provider
+capacity. The coordinating agent owns documentation, review and integration;
+independent workers own separate durable-intent and adaptive-placement fixtures.
+
+Recheck persisted cooldowns before live traffic. The local read-only check at
+09:56 UTC found the existing hold through 21:30:29 UTC still active; no provider
+or authentication request is permitted during it. Review available API contracts
+and the public reference for a publication primitive, recording absence of
+verified evidence rather than claiming provider impossibility. P1-LOOKUP and
+P1-DECISION stay open until their live gates pass. No runtime update, cache
+reset, pending-write deletion, or remote format implementation is included.
+
 ### Scalability publication decision experiments (2026-10-15)
 
 Before selecting or implementing a new format, extend P1 with test-only
