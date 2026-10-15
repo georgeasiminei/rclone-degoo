@@ -8,7 +8,7 @@ not close P1-LOOKUP or P1-DECISION's live evidence gate. Requirements are in
 in [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md).
 
 Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
-targeting `staging`; merging remains with the user.
+merged into `staging` on 2026-10-15 at `773b9f8c3`.
 
 ## Decision and scenarios
 
@@ -209,9 +209,9 @@ live evidence required recycling before hard deletion and waiting for visibility
 Do not empty account trash as a vault cleanup implementation. Confirm the
 selected vault's exact generated IDs and two-stage delete semantics; retain
 cleanup inventory through ambiguous deletion. Remote orphan GC remains
-unimplemented. The model exercises only known, fully visible metadata-object
-deletion under a single actor; its allocation/cleanup operations have no
-writer fencing. Referenced file data and reader pins are not modeled.
+unimplemented. The PR #48 publication model exercises only known, fully visible
+metadata-object deletion under a single actor; its allocation/cleanup has no
+writer fencing. Its referenced file data and reader pins are not modeled.
 
 ## Provider evidence and remaining gates
 
@@ -241,6 +241,102 @@ Stop on the first new throttle/auth failure and record response class/counters
 only. Repeat direct reads in a later client/session and test generated rename,
 move, overwrite and delete separately. The current contracts do not provide a
 CAS experiment to run blindly; discover a supported primitive first.
+
+## Offline recovery refinement — PR #48 follow-up
+
+The follow-up [evidence](SCALABILITY_EVIDENCE.md#durable-allocation-and-adaptive-placement-follow-up)
+extends the conditional architecture with disk-persisted intent-before-effect,
+checkpoint-error refusal until reopen, fixed temporary-journal capacity,
+non-reused allocation ordinals and bounded cleanup checkpoints. A modeled
+complete graph protects current/previous/reader roots and their file-data IDs.
+Its epoch authority rejects allocation/deletion as well as the earlier root
+publication experiment. These remain local experiments with assumed authority
+and complete/fresh graph inputs, without remote-only recovery or a real fence.
+
+The adaptive comparison places the same 576 generated objects in 74 directory
+records versus 8,650 for the fixed-depth model, while counting 148 reserved
+slots and keeping maximum occupancy sixteen. This supports further lazy
+allocation experiments, not adoption of these parameters. Persisting the whole
+placement map is a fixture convenience; P3 must page allocator state and bound
+encoded bytes. Retained orphans, unresolved deletes and exhausted lifetime
+ordinals still stop work. Remote intent discovery, bootstrap/control reservation,
+fresh reachability, safe ordinal/namespace evolution and cleanup progress
+remain protocol gates. No new cipher, wire-format version or mount path is
+selected by these experiments.
+
+## Reviewed provider contracts — PR #48 follow-up
+
+Read-only source review reconfirmed the pinned public cligoo reference at
+[`444ae9c`](https://github.com/georgeasiminei/cligoo/tree/444ae9c54690a0e77d0ba148cc9921477b75cdff).
+Its [query/mutation definitions](https://github.com/georgeasiminei/cligoo/blob/444ae9c54690a0e77d0ba148cc9921477b75cdff/src/cligoo/queries.py)
+and [API methods](https://github.com/georgeasiminei/cligoo/blob/444ae9c54690a0e77d0ba148cc9921477b75cdff/src/cligoo/api.py)
+provide no expected-root/revision, enforced epoch, unique-create or idempotency
+argument in the reviewed operations. The Go client's corresponding requests in
+[api.go](../../backend/degoo/api/api.go) likewise have no such field.
+GetOverlay4 selects identity/location/size/URL/timestamps, without an
+authoritative revision or ETag. Acknowledgements from registration, rename,
+move and delete cannot establish the required conditional boundary from these
+contracts alone.
+
+This review does not discover the entire provider schema or prove that a
+suitable operation cannot exist. No authenticated introspection or speculative
+mutation was attempted. Publication/fencing is **unverified**, and direct-ID
+continuity/deletion remains **unmeasured live**. The persisted shared-client
+cooldown remains effective even though earlier browser controls sometimes
+succeeded.
+
+## Next live evidence protocol
+
+This protocol is pending while any persisted provider/auth hold is active.
+At 09:56 UTC on 2026-10-15, local state still held API access until 21:30:29 UTC.
+Do not infer availability from another browser's success or from this timestamp
+alone. Re-read deadlines immediately before a later experiment, use the shared
+client guard, and coordinate with the existing mount without discarding pending
+writes. Stop at the first new throttle/auth failure; keep private recovery
+locators outside git. Do not bypass the guard with raw GraphQL or token renewal.
+
+Use a new generated encrypted object beneath a dedicated test-vault parent.
+Bound the experiment in advance by operations, elapsed time, and fixture bytes;
+unresolved outcomes stop it rather than increase polling or replay mutations.
+Record aggregate calls, response class, identity equality and content hashes,
+never signed URLs, actual IDs, names, or tokens. A restart case uses a fresh
+process/client with no listing snapshot or ID hints; it must share cooldown/auth
+state rather than start with a clean deadline file. A private probe artifact
+retains known generated IDs and outcomes. This tests direct addressability,
+not proposed-format recovery from remote inventory or loss of all local state.
+The production transaction/cleanup journal remains unimplemented.
+
+| Stage | Evidence to retain | Failure/identity rule |
+| --- | --- | --- |
+| Create and direct read | Registration outcome, exact-ID comparison when available, parent/name/size and authenticated hash | SetUploadFile3 may acknowledge with a Boolean; resolve only in the isolated bounded parent, retaining uncertain outcomes without create replay |
+| Fresh-client direct read | Same identity checks and zero sibling-list requests | Positive read proves that object only; it does not prove latest pathname winner |
+| Rename | Separate direct reads of old/resulting IDs and bounded namespace reads of old/new names; payload checks | Classify preserved/replaced/rejected ID without assuming rename preserves identity |
+| Move to second generated parent | Direct-ID parent checks, separate bounded namespace reads, both IDs if different; payload hash | Limit reconciliation to the two known bounded test directories |
+| Overwrite | Old and new IDs plus version hashes; fresh-client path winner separately | Old-ID success may be historical data; never accept it as the current version merely because it exists |
+| Recycle exact generated ID | Boolean acknowledgement, bounded parent visibility, direct-ID response class after restart | GetOverlay4 lacks recycle-state evidence; null/error alone proves neither recycling nor reclaimed capacity |
+| Hard-delete that exact recycled ID | Two-stage outcome and bounded visibility checks retained in private probe artifact | Require scoped recycling evidence; otherwise defer. Never list/empty account trash; lost ack keeps outcome unresolved |
+
+GetDeletedFiles is account-wide and has no reviewed vault filter. It must not
+be used to fill the recycle-state evidence gap for this test. A successful
+recycle acknowledgement and disappearance from a parent are observations;
+if they cannot establish the required scoped prerequisite for hard deletion,
+record the gate as unresolved rather than broaden the inventory.
+
+The matrix measures observed continuity and deletion classes, not a consistency
+or visibility guarantee. Compare successful namespace readback separately from
+direct-ID readback. A provider error, stale view or unconfirmed absence cannot
+justify reclaiming a slot or deleting a referenced version.
+
+Publication verification is a separate gate. First identify a supported
+operation with an atomic expected-root/revision condition and an authority-issued
+epoch, or review a concrete alternative protocol. Then test two writers on
+generated state: stale revision, stale epoch with current revision, fabricated
+future epoch, pause/takeover/resume, lost acknowledgement before/after apply,
+and stale allocation/deletion as well as root publication. A successful serial
+rename/readback sequence cannot verify those properties. Do not add guessed
+conditional GraphQL arguments or probe schema mutations blindly. Until a real
+primitive/protocol meets this gate, P1-DECISION stays open and P3-FORMAT cannot
+activate the conditional model as a provider-backed filesystem.
 
 ## Evolution, reversal, and reset consequences
 

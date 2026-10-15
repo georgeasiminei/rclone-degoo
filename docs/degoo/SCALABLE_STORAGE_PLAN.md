@@ -542,3 +542,56 @@ For each future task:
   cleanup experiments if live access remains unavailable. Do not implement or
   activate a production format on the model's assumed CAS primitive. P2–P6
   remain unstarted; no reset/reseed was needed.
+
+### 2026-10-15 — durable allocation and adaptive-placement experiments
+
+- Owner: coordinating Codex agent with independent durable-intent,
+  adaptive-placement and provider-contract review workers. PR #48 is merged at
+  `773b9f8c3`. Fetch, ancestry and actual diffs show no unique commits in the
+  existing worktree branches; they remain preserved. This work uses a new
+  isolated worktree from that fetched `origin/staging`.
+- Local-only cooldown checks at 09:56 and 10:00 UTC found expiry still at
+  **21:30:29 UTC today**. No provider/authentication request, runtime change,
+  reset, cache removal or pending-write discard occurred. No rsync reseed is
+  needed. Re-read state before later live access.
+- The implementation plan was updated before the new test-only experiments.
+  Durable allocation intent now precedes simulated create/delete side effects,
+  with fsync/rename/directory-sync checkpoints, disk reopen, fixed temporary
+  capacity, failed-checkpoint refusal, reference/pin protection, incomplete-graph
+  refusal and persistent cleanup cursor. Eight failed creates exhaust eight
+  lifetime ordinals in a 766-byte journal; a ninth sends no create. Journal
+  content is capped at 16 KiB (32 KiB across old plus temporary replacement).
+- Lost create/delete acknowledgements retain reservations; unknown visibility
+  never proves absence. Epoch rejection now covers allocation and cleanup in
+  the assumed authority. Pending local bytes survive disk reopen. These tests
+  do not verify power loss, cross-process journals, a real provider fence or
+  remote-only inventory recovery.
+- Adaptive append-only placement uses 74 directories for 576 objects versus
+  8,650 in the fixed-depth model, with 148 reserved slots and maximum occupancy
+  sixteen. The 48,363-byte whole-map checkpoint is a finite fixture serializer,
+  not a paged production allocator. Skew/exhaustion, ghost-slot collisions,
+  folder-state reopen and deep-prune work budgets are exercised.
+- Cleanup remains deliberately conservative: one child-before-parent sweep can
+  retain safe orphans, and a lost delete still observed present has no automatic
+  retry path. Deleted occupancy does not recycle lifetime slot ordinals.
+  Production cleanup progress, fresh/authenticated reachability and namespace
+  evolution remain open. See [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md).
+- The reviewed Go and pinned cligoo operation contracts expose no conditional
+  revision/epoch/idempotency argument. This is not an exhaustive provider-schema
+  finding. [SCALABILITY_DECISION.md](SCALABILITY_DECISION.md) records the source
+  scope and bounded future live matrix; direct-ID readback must be separated
+  from namespace winner/recycle-state proof. Never list account trash to fill a
+  vault-scoped evidence gap.
+- Validation passed: fresh build, all 186 credential-free test packages under
+  the existing CI network-test policy, eleven new model cases, direct-ID failure
+  contracts, sequential scoped race, vet/lint, Markdown/links/task IDs and staged
+  diff checks. Initial long socket paths and a concurrent race fixture's cache
+  expiry were diagnosed and passed on corrected/isolated runs. Exact commands
+  and limits are in [VALIDATION.md](VALIDATION.md).
+- P1-LOOKUP and P1-DECISION stay `in progress`; P2–P6 remain unstarted. No
+  production format is selected or implemented. Next action: recheck holds and
+  coordinate with the existing mount, then finish generated-vault direct-ID
+  continuity/deletion across fresh processes and verify an actual publication/
+  fencing protocol. If blocked, experiment with paged remote intent/bootstrap,
+  authoritative graph freshness, repeatable cleanup generations and safe
+  allocation namespace evolution without assuming provider CAS.
