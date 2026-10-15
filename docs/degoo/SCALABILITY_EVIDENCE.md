@@ -887,6 +887,9 @@ afterward. The comparable final benchmark above includes this correction.
 
 ## Directory cache and local-authority implementation increment
 
+Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51), targeting `staging`;
+merging remains with the user.
+
 The directory cache now has an opt-in generic bounded constructor; existing
 backends retain the unbounded default. Degoo admits at most 4,096 path/ID pairs
 including the pinned root, with 4 MiB of non-root path/ID strings. These are

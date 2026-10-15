@@ -1736,6 +1736,9 @@ Validation passed:
 
 ## Directory bounds, local authority and inactive page codec — 2026-10-15
 
+Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51), targeting `staging`;
+merging remains with the user.
+
 This increment was developed in an isolated worktree after PR #49, then rebased
 onto PR #50 merged at `6bbe0374a` before integrated checks. The original worktrees
 and unrelated stash are preserved. Production code changes cap Degoo's directory

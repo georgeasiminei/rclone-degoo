@@ -238,7 +238,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   P3-SHARDS. Phase numbers do not require P2 to finish before P3 starts.
 - **P2-BOUNDS** — Status: `in progress`; dependencies: P2-HOTPATH;
   evidencePR:
-  [#50](https://github.com/georgeasiminei/rclone-degoo/pull/50).
+  [#50](https://github.com/georgeasiminei/rclone-degoo/pull/50),
+  [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
   Bound cache entries and memory, verify complete paginated
   listing above 1,000 children, and assert that a known-path lookup does not
   grow linearly with sibling count after cache warmup. For the selected indexed
@@ -251,7 +252,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 **Gate:** Bounded objects/shards and crash-safe publication.
 
 - **P3-FORMAT** — Status: `in progress`; dependencies: P1-DECISION;
-  evidencePR: `TBD`. Specify the versioned encrypted object/index/manifest
+  evidencePR: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+  Specify the versioned encrypted object/index/manifest
   schema, key derivation and authenticated fields, shard addressing, maximum
   record size, chunk sizing after encryption overhead, and how a local cache
   reconstructs from remote state. Do not add a single unbounded index.
@@ -717,3 +719,7 @@ targeting `staging`; merging remains with the user. Implementation commit:
   provider check must re-read persisted API and auth holds, coordinate with the
   mount, use generated scoped objects, and stop on throttle/auth failure.
   No installed runtime, cache, pending file or remote object was reset.
+
+Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51), targeting `staging`.
+Source commit: `18bf74315`; integrated validation: `952acf6e3`. The user merges
+and removes the source branch. No merge was performed by the agent.
