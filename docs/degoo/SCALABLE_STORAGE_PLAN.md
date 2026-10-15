@@ -720,6 +720,7 @@ targeting `staging`; merging remains with the user. Implementation commit:
   mount, use generated scoped objects, and stop on throttle/auth failure.
   No installed runtime, cache, pending file or remote object was reset.
 
-Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51), targeting `staging`.
+Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+Targets `staging`.
 Source commit: `18bf74315`; integrated validation: `952acf6e3`. The user merges
 and removes the source branch. No merge was performed by the agent.

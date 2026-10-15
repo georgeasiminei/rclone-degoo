@@ -887,7 +887,8 @@ afterward. The comparable final benchmark above includes this correction.
 
 ## Directory cache and local-authority implementation increment
 
-Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51), targeting `staging`;
+Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+Targets `staging`;
 merging remains with the user.
 
 The directory cache now has an opt-in generic bounded constructor; existing

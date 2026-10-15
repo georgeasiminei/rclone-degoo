@@ -405,7 +405,8 @@ explicit and requires the P4/P6 recovery and acceptance evidence.
 
 ## Single-host implementation boundary and delayed-effect refinement
 
-Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51), targeting `staging`;
+Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+Targets `staging`;
 merging remains with the user.
 
 The first writer scope selected in the independent PR #50 is one Linux host,
