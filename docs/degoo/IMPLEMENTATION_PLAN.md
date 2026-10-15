@@ -89,6 +89,30 @@ verified evidence rather than claiming provider impossibility. P1-LOOKUP and
 P1-DECISION stay open until their live gates pass. No runtime update, cache
 reset, pending-write deletion, or remote format implementation is included.
 
+### Existing-format metadata bounds and indexed warm lookup (2026-10-15)
+
+Start the format-independent part of P2 while live P1 provider gates remain
+open. Bound retained directory snapshots by total records and accounted bytes,
+including name-index storage, rather than parent count alone. Skip admission
+for an oversized snapshot without truncating the caller's complete listing.
+Release accounting on expiry, replacement, mutation and global invalidation.
+These are client resource budgets, never numeric provider quotas.
+
+Add an indexed snapshot selector for exact child names with backup-name-prefix
+fallback. Preserve duplicate-name resolution, promoted-directory placeholders,
+backup recovery, cooldown checks, cancellation, metadata deadlines and mutation
+generation protection. Copy only matching records on warm point access; cold
+misses still paginate the full existing-layout parent, and full enumeration
+remains O(N). Record warm lookup allocations and actual request counts at the
+existing generated scales. Production remote-index integration and cold bounded
+traversal remain gated on P3; do not mark the entire P2 phase complete from this
+incremental change.
+
+PR #49 was confirmed merged at `a0115f690` on the resumed inspection. Its
+worktree remains preserved. This production change now includes that fetched
+staging base. No runtime deployment, remote format change, provider call
+or data reset is part of this slice. The full plan remains active.
+
 ### Scalability publication decision experiments (2026-10-15)
 
 Before selecting or implementing a new format, extend P1 with test-only

@@ -208,31 +208,35 @@ func logScalabilityOccupancy(t *testing.T, evidence scalabilityOccupancyEvidence
 }
 
 type scalabilityPopulatedSnapshotEvidence struct {
-	EntriesPerParent             int    `json:"entries_per_parent"`
-	ParentsRequested             int    `json:"parents_requested"`
-	ConfiguredSnapshotBound      int    `json:"configured_snapshot_bound"`
-	RetainedSnapshotParents      int    `json:"retained_snapshot_parents"`
-	RetainedSnapshotItems        int    `json:"retained_snapshot_items"`
-	SnapshotItemArrayBytes       uint64 `json:"snapshot_item_array_logical_bytes"`
-	SnapshotStringBytes          uint64 `json:"snapshot_string_field_logical_bytes"`
-	RetainedSnapshotPayloadBytes uint64 `json:"retained_snapshot_logical_payload_bytes"`
-	RetainedItemParentHints      int    `json:"retained_item_parent_hints"`
-	RetainedHintOrderEntries     int    `json:"retained_hint_order_entries"`
-	FixtureChildrenGenerated     uint64 `json:"fixture_children_generated"`
-	FixturePages                 uint64 `json:"fixture_pages"`
-	InitialRequests              uint64 `json:"initial_requests"`
-	InitialCacheMisses           uint64 `json:"initial_cache_misses"`
-	WarmCacheHits                uint64 `json:"warm_cache_hits"`
-	WarmRequests                 uint64 `json:"warm_requests"`
-	EvictedParents               int    `json:"evicted_parents"`
-	EvictedParentRefetched       bool   `json:"evicted_parent_refetched"`
-	ReloadRequests               uint64 `json:"reload_requests"`
-	ReloadPages                  uint64 `json:"reload_pages"`
-	HeapAllocBaselineAfterGC     uint64 `json:"heap_alloc_baseline_after_gc_bytes"`
-	HeapAllocAfterGC             uint64 `json:"heap_alloc_after_gc_bytes"`
-	RetainedHeapDelta            int64  `json:"retained_heap_delta_bytes"`
-	CumulativeAllocDelta         uint64 `json:"cumulative_alloc_bytes"`
-	RetainedHeapScope            string `json:"retained_heap_scope"`
+	RetainedSnapshotAccountedBytes int64  `json:"retained_snapshot_accounted_bytes"`
+	ConfiguredSnapshotByteBound    int64  `json:"configured_snapshot_byte_bound"`
+	ConfiguredSnapshotItemBound    int    `json:"configured_snapshot_item_bound"`
+	RetainedParentHintStringBytes  int64  `json:"retained_parent_hint_string_bytes"`
+	EntriesPerParent               int    `json:"entries_per_parent"`
+	ParentsRequested               int    `json:"parents_requested"`
+	ConfiguredSnapshotBound        int    `json:"configured_snapshot_bound"`
+	RetainedSnapshotParents        int    `json:"retained_snapshot_parents"`
+	RetainedSnapshotItems          int    `json:"retained_snapshot_items"`
+	SnapshotItemArrayBytes         uint64 `json:"snapshot_item_array_logical_bytes"`
+	SnapshotStringBytes            uint64 `json:"snapshot_string_field_logical_bytes"`
+	RetainedSnapshotPayloadBytes   uint64 `json:"retained_snapshot_logical_payload_bytes"`
+	RetainedItemParentHints        int    `json:"retained_item_parent_hints"`
+	RetainedHintOrderEntries       int    `json:"retained_hint_order_entries"`
+	FixtureChildrenGenerated       uint64 `json:"fixture_children_generated"`
+	FixturePages                   uint64 `json:"fixture_pages"`
+	InitialRequests                uint64 `json:"initial_requests"`
+	InitialCacheMisses             uint64 `json:"initial_cache_misses"`
+	WarmCacheHits                  uint64 `json:"warm_cache_hits"`
+	WarmRequests                   uint64 `json:"warm_requests"`
+	EvictedParents                 int    `json:"evicted_parents"`
+	EvictedParentRefetched         bool   `json:"evicted_parent_refetched"`
+	ReloadRequests                 uint64 `json:"reload_requests"`
+	ReloadPages                    uint64 `json:"reload_pages"`
+	HeapAllocBaselineAfterGC       uint64 `json:"heap_alloc_baseline_after_gc_bytes"`
+	HeapAllocAfterGC               uint64 `json:"heap_alloc_after_gc_bytes"`
+	RetainedHeapDelta              int64  `json:"retained_heap_delta_bytes"`
+	CumulativeAllocDelta           uint64 `json:"cumulative_alloc_bytes"`
+	RetainedHeapScope              string `json:"retained_heap_scope"`
 }
 
 func checkScalabilitySnapshot(t *testing.T, client *Client, parent string, entries int) {
@@ -379,13 +383,22 @@ func TestScalabilityPopulatedMetadataSnapshots(t *testing.T) {
 					snapshotStringBytes += uint64(len(item.ID) + len(item.Name) + len(item.ParentID) + len(item.URL))
 				}
 			}
+			accountedBytes, accountedItems := client.metadataBytes, client.metadataItems
+			hintBytes := client.itemParentBytes
 			client.metadataMu.Unlock()
+			if accountedBytes > metadataCacheMaxBytes || accountedItems > metadataCacheMaxItems || accountedItems != finalItems || hintBytes > itemParentCacheMaxBytes {
+				t.Fatalf("retained metadata exceeds admission bounds: bytes=%d items=%d hint_bytes=%d", accountedBytes, accountedItems, hintBytes)
+			}
 			if finalParents != wantRetainedParents || finalItems != wantRetainedParents*testCase.entries {
 				t.Fatalf("final populated snapshot occupancy = %d parents/%d items, want %d/%d", finalParents, finalItems, wantRetainedParents, wantRetainedParents*testCase.entries)
 			}
 
 			evidence := scalabilityPopulatedSnapshotEvidence{
-				EntriesPerParent: testCase.entries, ParentsRequested: testCase.parents,
+				RetainedSnapshotAccountedBytes: accountedBytes,
+				ConfiguredSnapshotByteBound:    metadataCacheMaxBytes,
+				ConfiguredSnapshotItemBound:    metadataCacheMaxItems,
+				RetainedParentHintStringBytes:  hintBytes,
+				EntriesPerParent:               testCase.entries, ParentsRequested: testCase.parents,
 				ConfiguredSnapshotBound: metadataCacheMaxEntries,
 				RetainedSnapshotParents: finalParents, RetainedSnapshotItems: finalItems,
 				SnapshotItemArrayBytes:       snapshotItemArrayBytes,

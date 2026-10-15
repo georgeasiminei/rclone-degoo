@@ -619,7 +619,12 @@ func (f *Fs) waitForCreatedDirectory(ctx context.Context, parentID, name, placeh
 }
 
 func (f *Fs) lookupChild(ctx context.Context, parentID, name string) (*api.Item, bool, []api.Item, error) {
-	items, err := f.listDir(ctx, parentID)
+	var items []api.Item
+	err := f.metadataCall(ctx, func(callCtx context.Context) error {
+		var err error
+		items, err = f.api.ListDirMatches(callCtx, parentID, name, backupPrefix)
+		return err
+	})
 	if err != nil {
 		return nil, false, nil, err
 	}

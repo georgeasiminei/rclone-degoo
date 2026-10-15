@@ -10,12 +10,52 @@ in [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md).
 Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
 merged into `staging` on 2026-10-15 at `773b9f8c3`.
 
+## Writer scope and robustness priority — 2026-10-15
+
+The user selected the recommended first-release scope: one writable Linux host,
+normal restart on that host, no automatic cross-host takeover. Robustness is
+more important than performance. This resolves writer-scope preference; it does
+not establish a verified publication protocol or close P1-DECISION.
+
+| Scope | Upside | Cost / robustness condition |
+| --- | --- | --- |
+| One writable Linux host, selected | One owner and local recovery domain; no extra service | Writes wait when the host is unavailable; durable identity and a shared lock must cover different caches/config copies; no timed takeover |
+| Explicit handoff between hosts | Move the writer deliberately | Must establish that the old writer cannot resume, preserve pending state and transfer authority safely; excluded initially |
+| Concurrent writable hosts | Simultaneous access | Needs a verified authority for conditional publication, pins and destructive work; adds a service/recovery dependency if Degoo cannot supply it; excluded initially |
+
+A non-expiring kernel lock can reject a second cooperating local process and
+remains held while its owner is paused. [Linux flock semantics](https://man7.org/linux/man-pages/man2/flock.2.html)
+apply to an open file description, not a PID lease or remote account. All
+supported writers must share the same stable lock inode outside disposable
+metadata caches; machine/account binding must reject another host or isolated
+namespace that cannot establish that shared authority. The lock must not be
+unlinked/recreated for takeover. A copied local config must not create a second
+writer through a different cache path.
+
+Crucially, an in-flight provider request can finish after the old process dies
+and its local lock is released. A lock alone therefore does not make delayed
+rename/delete safe. The publication design still needs durable intent before
+side effects, immutable transaction/version identities, bounded reconciliation,
+protection of complete roots/readers, and refusal of unsafe destructive work.
+It must prove cache-loss/restart/bootstrap behavior without pretending a local
+bookmark is a verified fresh remote read. Missing/corrupt safety state fails
+closed; no automatic empty-vault initialization or pending-data discard.
+
+The previous CAS/epoch comparison below describes the distributed alternative
+and its missing provider primitive. Remote fencing is required before any
+future multi-host or automatic-takeover support. For the selected initial scope,
+P1-DECISION must instead verify a concrete single-host publication/recovery
+protocol, including delayed provider effects after process death. Existing
+mocked CAS is not its implementation. Keep format implementation/activation
+blocked until that protocol and its provider assumptions have evidence.
+
 ## Decision and scenarios
 
 Continue with an immutable encrypted sharded remote index, stable logical file
-and directory IDs, bounded physical allocation, and an explicitly fenced root
+and directory IDs, bounded physical allocation, and an explicit exclusive-writer
 publication boundary. A bounded local ID/page cache is an accelerator only.
-Keep the current mount format until the publication primitive is verified.
+Keep the current mount format until the selected publication/recovery protocol
+is verified.
 No new runtime, remote format identifier, cipher suite, or reset is introduced
 by this decision. P3-FORMAT must specify those before implementation.
 
@@ -78,8 +118,8 @@ rediscovery mechanism and
 identity checks are a P3-FORMAT gate. A missing or corrupt descriptor/control
 record fails; it must not silently initialize an empty vault.
 
-The desired publication operation compares the expected root revision and
-writer epoch, then atomically installs a bounded authenticated control value:
+The distributed alternative compares the expected root revision and writer
+epoch, then atomically installs a bounded authenticated control value:
 current root, previous root, transaction identity, allocation high-water mark,
 and cleanup-inventory root/cursor. Large inventories live in bounded encrypted
 pages referenced by this value. This is a **required abstract primitive, not
