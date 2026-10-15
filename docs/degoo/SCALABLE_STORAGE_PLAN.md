@@ -181,8 +181,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   count, bytes, cache hits, cold and warm lookup latency, full-list latency,
   and peak local index size. Do not use private vault names or account data.
 - **P1-RATELIMIT** — Status: `complete`; dependencies: P0-DOC; evidencePR:
-  [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43). Add controlled mock
-  cases for first-page success followed by later
+  [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43). Add controlled
+  mock cases for first-page success followed by later
   page 429, repeated 429, unaffected small-folder success, cancellation, and
   persisted global cooldown. Preserve exact `Retry-After` behavior. Live
   probes, if needed, use generated test state and record date, client platform,
