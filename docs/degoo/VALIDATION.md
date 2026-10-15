@@ -1423,11 +1423,13 @@ during package archive downloads instead of repeating elapsed time.
 
 Validation passed:
 
-- All 436 offline Python helper tests and the packaging self-check
+- All 444 offline Python helper tests and the packaging self-check
   (`bin/package-degoo.py --self-check`) passed.
 - Unit tests in `contrib/degoo/scripts/python/test_update.py` cover
   byte/rate/ETA formatting, column-width adaptivity (40, 60, 80, 100, 120
-  columns), non-TTY periodic milestone emissions, TTY carriage-return updates
-  and final line completion, clean exception unwinding, and
-  `ActionsSource.download` binding with artifact sizes and progress tracking.
+  columns), ETA retention at 80 columns, non-TTY periodic milestone emissions
+  and 10-second heartbeats, TTY carriage-return updates and final line completion,
+  clean exception unwinding, `ActionsSource._run` process attachment, timeout
+  kill, exception cleanup, non-zero exit handling, and `ActionsSource.download`
+  binding with validated artifact sizes and progress tracking.
 - Markdown check and `git diff --check` passed cleanly with zero whitespace issues.

@@ -89,6 +89,25 @@ def format_bytes(num_bytes: int | float) -> str:
     return f"{val:.1f} GiB"
 
 
+def format_sizes(current: int, total: int) -> str:
+    """Format current and total byte counts compactly (e.g. 28.6/63.6 MiB)."""
+    def _unit_val(b: int | float) -> tuple[float, str]:
+        val = float(max(0, b))
+        for u in ("B", "KiB", "MiB", "GiB"):
+            if val < 1024 or u == "GiB":
+                return val, u
+            val /= 1024
+        return val, "GiB"
+
+    v1, u1 = _unit_val(current)
+    v2, u2 = _unit_val(total)
+    s1 = f"{int(v1)}" if u1 == "B" else f"{v1:.1f}"
+    s2 = f"{int(v2)}" if u2 == "B" else f"{v2:.1f}"
+    if u1 == u2:
+        return f"{s1}/{s2} {u2}"
+    return f"{s1} {u1}/{s2} {u2}"
+
+
 def format_rate(bytes_per_sec: float) -> str:
     """Format byte rate per second."""
     if bytes_per_sec <= 0:
@@ -98,7 +117,7 @@ def format_rate(bytes_per_sec: float) -> str:
 
 def format_eta(seconds: float | None) -> str:
     """Format remaining seconds into a concise human-readable string."""
-    if seconds is None or seconds < 0 or math.isinf(seconds) or math.isnan(seconds):
+    if seconds is None or seconds <= 0 or math.isinf(seconds) or math.isnan(seconds):
         return "--"
     sec = int(round(seconds))
     if sec < 60:
@@ -118,15 +137,18 @@ def render_progress(label: str, current: int, total: int | None, rate: float, et
     if total and total > 0:
         fraction = min(1.0, max(0.0, current / total))
         pct_str = f"{int(fraction * 100):3d}%"
-        sizes_str = f"{format_bytes(current)}/{format_bytes(total)}"
+        sizes_str = format_sizes(current, total)
         rate_str = format_rate(rate)
-        eta_str = f"ETA {format_eta(eta)}" if eta is not None and fraction < 1.0 else ""
+        eta_str = f"ETA {format_eta(eta)}" if (eta is not None and fraction < 1.0) else ""
 
         candidates = []
         if eta_str:
             candidates.append(f"{pct_str}  {sizes_str}  {rate_str}  {eta_str}")
+            candidates.append(f"{pct_str} {sizes_str} {rate_str} {eta_str}")
         candidates.append(f"{pct_str}  {sizes_str}  {rate_str}")
+        candidates.append(f"{pct_str} {sizes_str} {rate_str}")
         candidates.append(f"{pct_str}  {sizes_str}")
+        candidates.append(f"{pct_str} {sizes_str}")
         candidates.append(f"{pct_str}")
 
         chosen_suffix = candidates[-1]
@@ -176,6 +198,7 @@ class DownloadProgressTracker:
         self.last_reported_pct = -1
         self.last_line_len = 0
         self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
+        self._samples: list[tuple[float, int]] = []
 
     def attach(self, proc: subprocess.Popen) -> None:
         """Attach a running subprocess to monitor."""
@@ -187,7 +210,7 @@ class DownloadProgressTracker:
             self.current_bytes = num_bytes
 
     def _find_bytes(self) -> int:
-        if self.process is not None:
+        if self.process is not None and self.process.pid:
             pid = self.process.pid
             fd_dir = f"/proc/{pid}/fd"
             if os.path.exists(fd_dir):
@@ -198,57 +221,73 @@ class DownloadProgressTracker:
                             return os.stat(link).st_size
                 except (OSError, FileNotFoundError):
                     pass
-        temp_dir = tempfile.gettempdir()
-        try:
-            candidates = [
-                os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
-                if f.startswith("gh-artifact") and f.endswith(".zip")
-            ]
-            if candidates:
-                newest = max(candidates, key=os.path.getmtime)
-                if os.path.getmtime(newest) >= self.started_at - 2.0:
-                    return os.stat(newest).st_size
-        except (OSError, FileNotFoundError, ValueError):
-            pass
 
         if self.destination is not None:
-            for item in self.destination.glob("*.tar.gz"):
-                try:
-                    return item.stat().st_size
-                except OSError:
-                    pass
+            archive = self.destination / ARCHIVE_NAME
+            try:
+                if archive.is_file():
+                    return self.total_bytes if self.total_bytes is not None else archive.stat().st_size
+            except OSError:
+                pass
         return self.current_bytes
+
+    def _rate(self, now: float) -> float:
+        self._samples.append((now, self.current_bytes))
+        cutoff = now - 3.0
+        while len(self._samples) > 1 and self._samples[0][0] < cutoff:
+            self._samples.pop(0)
+        if len(self._samples) >= 2:
+            dt = self._samples[-1][0] - self._samples[0][0]
+            db = self._samples[-1][1] - self._samples[0][1]
+            if dt > 0.1 and db >= 0:
+                return db / dt
+        elapsed = max(0.001, now - self.started_at)
+        return self.current_bytes / elapsed
+
+    def _tick(self, now: float | None = None) -> None:
+        """Execute one progress check and output tick."""
+        if now is None:
+            now = time.monotonic()
+        found = self._find_bytes()
+        if found > self.current_bytes:
+            self.current_bytes = found
+        if self.process is not None and self.process.poll() is not None:
+            if self.process.returncode == 0 and self.total_bytes is not None:
+                self.current_bytes = self.total_bytes
+
+        rate = self._rate(now)
+        remaining = (self.total_bytes - self.current_bytes) if self.total_bytes is not None else None
+        eta = (remaining / rate) if (rate > 0 and remaining is not None and remaining > 0) else None
+        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+        line = render_progress(self.label, self.current_bytes, self.total_bytes, rate, eta, columns)
+
+        if self.is_tty:
+            sys.stdout.write(f"\r{line.ljust(self.last_line_len)}")
+            sys.stdout.flush()
+            self.last_line_len = max(self.last_line_len, len(line))
+        else:
+            pct = int((self.current_bytes / self.total_bytes) * 100) if (self.total_bytes and self.total_bytes > 0) else None
+            milestone = pct is not None and pct >= self.last_reported_pct + 10 and pct > 0
+            heartbeat = (now - self.last_print_time) >= 10.0
+            if milestone:
+                self.last_reported_pct = pct
+                self.last_print_time = now
+                print(line, flush=True)
+            elif heartbeat:
+                self.last_print_time = now
+                if self.current_bytes > 0:
+                    print(line, flush=True)
+                else:
+                    elapsed = int(now - self.started_at)
+                    print(f"{self.label}: still working ({elapsed}s elapsed).", flush=True)
 
     def _run_loop(self) -> None:
         while not self.stop_event.wait(self.interval):
-            found = self._find_bytes()
-            if found > self.current_bytes:
-                self.current_bytes = found
-            if self.process is not None and self.process.poll() is not None:
-                if self.process.returncode == 0 and self.total_bytes:
-                    self.current_bytes = self.total_bytes
-
-            elapsed = max(0.001, time.monotonic() - self.started_at)
-            rate = self.current_bytes / elapsed
-            remaining = (self.total_bytes - self.current_bytes) if self.total_bytes else 0
-            eta = (remaining / rate) if rate > 0 and remaining > 0 else 0
-            columns = shutil.get_terminal_size(fallback=(80, 24)).columns
-            line = render_progress(self.label, self.current_bytes, self.total_bytes, rate, eta, columns)
-
-            if self.is_tty:
-                sys.stdout.write(f"\r{line.ljust(self.last_line_len)}")
-                sys.stdout.flush()
-                self.last_line_len = max(self.last_line_len, len(line))
-            else:
-                pct = int((self.current_bytes / self.total_bytes) * 100) if self.total_bytes else 0
-                now = time.monotonic()
-                if (pct >= self.last_reported_pct + 10 or now - self.last_print_time >= 10.0) and pct > 0:
-                    self.last_reported_pct = pct
-                    self.last_print_time = now
-                    print(line, flush=True)
+            self._tick()
 
     def __enter__(self) -> DownloadProgressTracker:
         self.started_at = time.monotonic()
+        self.last_print_time = self.started_at
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
         return self
@@ -258,13 +297,16 @@ class DownloadProgressTracker:
         if self.thread is not None:
             self.thread.join()
         if exc_type is None:
-            if self.is_tty and self.total_bytes and self.total_bytes > 0:
-                elapsed = max(0.001, time.monotonic() - self.started_at)
+            columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+            elapsed = max(0.001, time.monotonic() - self.started_at)
+            if self.total_bytes and self.total_bytes > 0:
                 rate = self.total_bytes / elapsed
-                columns = shutil.get_terminal_size(fallback=(80, 24)).columns
-                final_line = render_progress(self.label, self.total_bytes, self.total_bytes, rate, 0, columns)
-                sys.stdout.write(f"\r{final_line.ljust(self.last_line_len)}\n")
-                sys.stdout.flush()
+                final_line = render_progress(self.label, self.total_bytes, self.total_bytes, rate, None, columns)
+                if self.is_tty:
+                    sys.stdout.write(f"\r{final_line.ljust(self.last_line_len)}\n")
+                    sys.stdout.flush()
+                elif self.last_reported_pct < 100:
+                    print(final_line, flush=True)
         else:
             if self.is_tty and self.last_line_len > 0:
                 sys.stdout.write("\n")
@@ -470,8 +512,8 @@ class ActionsSource:
         self.manifest: dict[str, Any] | None = None
         self.artifact_size: int | None = None
 
-    @classmethod
-    def _run(cls, arguments: list[str], *, timeout: int = 60, tracker: Any | None = None) -> bytes:
+    @staticmethod
+    def _run(arguments: list[str], *, timeout: int = 60, tracker: Any | None = None) -> bytes:
         if not shutil.which("gh"):
             raise UpdateError("GitHub CLI (gh) is required; install gh, run gh auth login, then retry degoo-rc update")
         proc: subprocess.Popen | None = None
@@ -488,10 +530,11 @@ class ActionsSource:
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
-            if proc is not None:
+            raise UpdateError("GitHub package lookup/download timed out; retry degoo-rc update") from None
+        finally:
+            if proc is not None and proc.poll() is None:
                 proc.kill()
                 proc.wait()
-            raise UpdateError("GitHub package lookup/download timed out; retry degoo-rc update") from None
         if result.returncode != 0:
             raise UpdateError("GitHub package lookup/download failed; check gh auth status and connectivity, then retry degoo-rc update")
         return result.stdout
@@ -549,8 +592,10 @@ class ActionsSource:
             if matching and type(matching[0].get("expired")) is not bool:
                 raise ValueError
             package_match = [item for item in artifacts if item.get("name") == ARTIFACT_NAME]
-            if package_match and isinstance(package_match[0].get("size_in_bytes"), int):
-                self.artifact_size = package_match[0]["size_in_bytes"]
+            if package_match:
+                size = package_match[0].get("size_in_bytes")
+                if type(size) is int and 0 < size <= MAX_PACKAGE_BYTES:
+                    self.artifact_size = size
         except (KeyError, TypeError, ValueError, RecursionError):
             raise UpdateError("GitHub returned an invalid update artifact listing") from None
         if not matching or matching[0]["expired"]:
