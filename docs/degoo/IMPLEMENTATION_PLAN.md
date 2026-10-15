@@ -1,5 +1,17 @@
 # Degoo private vault implementation plan
 
+**Active work (2026-10-15):** Follow
+[SCALABLE_STORAGE_PLAN.md](SCALABLE_STORAGE_PLAN.md) for the storage and metadata
+redesign, stable task IDs, progress, and the next-session handoff. Its planning
+task authorizes documentation only; implementation has not started. The user has
+confirmed that current local pending uploads and remote Degoo contents are
+disposable pre-live tests. A necessary reset can replace legacy compatibility
+or migration work after advance notice; completing the existing upload queue
+is not a prerequisite. See the binding
+[pre-live policy](REQUIREMENTS.md#pre-live-redesign-and-disposable-test-data).
+The sections below retain the previous implementation and validation history;
+they do not establish that the proposed redesign is implemented or validated.
+
 **Status (2026-10-14):** The earlier core implementation passed offline
 validation, and limited live smoke checks passed against a dedicated
 disposable Degoo folder, as recorded below. Follow-up fixes for cross-process
@@ -740,11 +752,11 @@ API in [cligoo](https://github.com/georgeasiminei/cligoo) as a behavior and
 API-flow reference. Port the needed behavior to Go; do not invoke the Python
 CLI as a subprocess.
 
-Follow this fork's current default branch, `master`, from fetched
-`origin/master`. This rclone fork has no `development` branch. Use a feature
-branch based on the actual fetched default and target this fork unless a
-separate instruction asks for upstream contribution. Do not assume or invent
-an upstream PR target.
+Follow the fork's integration branch, `staging`, from freshly fetched
+`origin/staging`, as specified in [AGENTS.md](../../AGENTS.md). Use a new feature
+branch and open its PR against this fork's `staging`; the user merges it.
+This supersedes the original default-branch advice. Upstream contribution is
+a separate decision.
 
 ## API evidence to establish first
 
