@@ -5,6 +5,7 @@ package vfs
 import (
 	"fmt"
 	"os"
+	"syscall"
 )
 
 // Error describes low level errors in a cross platform way.
@@ -30,6 +31,7 @@ var (
 	EPERM   = os.ErrPermission
 	EINVAL  = os.ErrInvalid
 	ECLOSED = os.ErrClosed
+	EBUSY   = syscall.EBUSY
 )
 
 var errorNames = []string{

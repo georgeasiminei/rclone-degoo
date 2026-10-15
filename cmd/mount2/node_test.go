@@ -5,7 +5,15 @@ package mount2
 import (
 	"context"
 	"os"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfscommon"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDirStreamSeekdir checks that Seekdir repositions the snapshot directory
@@ -42,4 +50,48 @@ func TestDirStreamSeekdir(t *testing.T) {
 			t.Errorf("Seekdir(%d): HasNext() = %v, want %v", tc.off, got, tc.wantNext)
 		}
 	}
+}
+
+func TestOpendirHandleTracksMaintenanceUntilReleasedir(t *testing.T) {
+	ctx := context.Background()
+	r := fstest.NewRunIndividual(t)
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeOff
+	vfsys := vfs.New(ctx, r.Fremote, &opt)
+	t.Cleanup(vfsys.Shutdown)
+	root, err := vfsys.Root()
+	require.NoError(t, err)
+	node := &Node{node: root, fsys: NewFS(vfsys, &mountlib.Options{})}
+
+	rawHandle, flags, errno := node.OpendirHandle(ctx, uint32(os.O_RDONLY))
+	require.Zero(t, errno)
+	require.Zero(t, flags)
+	handle, ok := rawHandle.(*dirFileHandle)
+	require.True(t, ok)
+
+	entry, errno := handle.Readdirent(ctx)
+	require.Zero(t, errno)
+	require.NotNil(t, entry)
+	require.Equal(t, ".", entry.Name)
+	require.Zero(t, handle.Seekdir(ctx, 0))
+	entry, errno = handle.Readdirent(ctx)
+	require.Zero(t, errno)
+	require.NotNil(t, entry)
+	require.Equal(t, ".", entry.Name, "seeking to offset zero must rewind this open directory FD")
+
+	deadline, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	_, err = vfsys.PrepareMaintenance(deadline)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "maintenance must wait for the open directory FD")
+
+	handle.Releasedir(ctx, 0)
+	release, err := vfsys.PrepareMaintenance(ctx)
+	require.NoError(t, err, "maintenance should proceed after releasedir closes the tracked VFS handle")
+	_, _, errno = node.OpendirHandle(ctx, uint32(os.O_RDONLY))
+	require.Equal(t, syscall.EBUSY, errno, "maintenance must reject new directory opens")
+	release()
+
+	opened, _, errno := node.OpendirHandle(ctx, uint32(os.O_RDONLY))
+	require.Zero(t, errno, "directory opens should resume after maintenance is released")
+	opened.(*dirFileHandle).Releasedir(ctx, 0)
 }

@@ -178,19 +178,24 @@ var (
 
 // VFS represents the top level filing system
 type VFS struct {
-	f           fs.Fs
-	ctx         context.Context
-	root        *Dir
-	Opt         vfscommon.Options
-	cache       *vfscache.Cache
-	cancel      context.CancelFunc
-	cancelCache context.CancelFunc
-	usageMu     sync.Mutex
-	usageTime   time.Time
-	usage       *fs.Usage
-	pollMu      sync.Mutex
-	pollChan    chan time.Duration
-	inUse       atomic.Int32 // count of number of opens
+	f                  fs.Fs
+	ctx                context.Context
+	root               *Dir
+	Opt                vfscommon.Options
+	cache              *vfscache.Cache
+	cancel             context.CancelFunc
+	cancelCache        context.CancelFunc
+	usageMu            sync.Mutex
+	usageTime          time.Time
+	usage              *fs.Usage
+	pollMu             sync.Mutex
+	pollChan           chan time.Duration
+	inUse              atomic.Int32 // count of number of opens
+	maintenanceMu      sync.Mutex
+	maintenance        bool
+	maintenanceOps     int
+	maintenanceHandles int
+	maintenanceChanged chan struct{}
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
@@ -213,9 +218,10 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 	newCtx = filter.CopyConfig(newCtx, ctx)
 	ctx, cancel := context.WithCancel(newCtx)
 	vfs := &VFS{
-		f:      f,
-		ctx:    ctx,
-		cancel: cancel,
+		f:                  f,
+		ctx:                ctx,
+		cancel:             cancel,
+		maintenanceChanged: make(chan struct{}),
 	}
 	vfs.inUse.Store(1)
 
@@ -603,6 +609,15 @@ func decodeOpenFlags(flags int) string {
 
 // OpenFile a file according to the flags and perm provided
 func (vfs *VFS) OpenFile(name string, flags int, perm os.FileMode) (fd Handle, err error) {
+	done, err := vfs.beginMaintenanceOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	return vfs.openFile(name, flags, perm)
+}
+
+func (vfs *VFS) openFile(name string, flags int, perm os.FileMode) (fd Handle, err error) {
 	defer log.Trace(name, "flags=%s, perm=%v", decodeOpenFlags(flags), perm)("fd=%v, err=%v", &fd, &err)
 
 	// http://pubs.opengroup.org/onlinepubs/7908799/xsh/open.html
@@ -622,12 +637,19 @@ func (vfs *VFS) OpenFile(name string, flags int, perm os.FileMode) (fd Handle, e
 		if err != nil {
 			return nil, err
 		}
-		node, err = dir.Create(leaf, flags)
+		node, err = dir.create(leaf, flags)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return node.Open(flags)
+	switch n := node.(type) {
+	case *File:
+		return n.open(flags)
+	case *Dir:
+		return n.open(flags)
+	default:
+		return node.Open(flags)
+	}
 }
 
 // Open opens the named file for reading. If successful, methods on
@@ -647,6 +669,11 @@ func (vfs *VFS) Create(name string) (Handle, error) {
 
 // Rename oldName to newName
 func (vfs *VFS) Rename(oldName, newName string) error {
+	done, err := vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
 	// find the parent directories
 	oldDir, oldLeaf, err := vfs.StatParent(oldName)
 	if err != nil {
@@ -656,7 +683,7 @@ func (vfs *VFS) Rename(oldName, newName string) error {
 	if err != nil {
 		return err
 	}
-	err = oldDir.Rename(oldLeaf, newLeaf, newDir)
+	err = oldDir.renameEntry(oldLeaf, newLeaf, newDir)
 	if err != nil {
 		return err
 	}
@@ -757,11 +784,23 @@ func (vfs *VFS) Statfs() (total, used, free int64) {
 
 // Remove removes the named file or (empty) directory.
 func (vfs *VFS) Remove(name string) error {
+	done, err := vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
 	node, err := vfs.Stat(name)
 	if err != nil {
 		return err
 	}
-	err = node.Remove()
+	switch n := node.(type) {
+	case *File:
+		err = n.remove()
+	case *Dir:
+		err = n.remove()
+	default:
+		err = node.Remove()
+	}
 	if err != nil {
 		return err
 	}
@@ -774,11 +813,23 @@ func (vfs *VFS) Remove(name string) error {
 // The underlying filesystem may truncate or round the values to a less precise
 // time unit.
 func (vfs *VFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	done, err := vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
 	node, err := vfs.Stat(name)
 	if err != nil {
 		return err
 	}
-	err = node.SetModTime(mtime)
+	switch n := node.(type) {
+	case *File:
+		err = n.setModTime(mtime)
+	case *Dir:
+		err = n.setModTime(mtime)
+	default:
+		err = node.SetModTime(mtime)
+	}
 	if err != nil {
 		return err
 	}
@@ -837,13 +888,18 @@ func (vfs *VFS) mkdir(name string, perm os.FileMode) (*Dir, error) {
 	if err != nil {
 		return nil, err
 	}
-	return dir.Mkdir(leaf)
+	return dir.mkdir(leaf)
 }
 
 // Mkdir creates a new directory with the specified name and permission bits
 // (before umask).
 func (vfs *VFS) Mkdir(name string, perm os.FileMode) error {
-	_, err := vfs.mkdir(name, perm)
+	done, err := vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	_, err = vfs.mkdir(name, perm)
 	return err
 }
 
@@ -865,7 +921,7 @@ func (vfs *VFS) mkdirAll(name string, perm os.FileMode) (dir *Dir, err error) {
 	if err != nil {
 		return nil, err
 	}
-	dir, err = dir.Mkdir(leaf)
+	dir, err = dir.mkdir(leaf)
 	if err != nil {
 		return nil, err
 	}
@@ -876,7 +932,12 @@ func (vfs *VFS) mkdirAll(name string, perm os.FileMode) (dir *Dir, err error) {
 // permission bits (before umask) and all of its parent directories up
 // to the root.
 func (vfs *VFS) MkdirAll(name string, perm os.FileMode) error {
-	_, err := vfs.mkdirAll(name, perm)
+	done, err := vfs.beginMaintenanceOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	_, err = vfs.mkdirAll(name, perm)
 	return err
 }
 
@@ -981,13 +1042,19 @@ func (vfs *VFS) Readlink(name string) (s string, err error) {
 // if oldname is later created as a directory the symlink will not work.
 // It returns the node created
 func (vfs *VFS) CreateSymlink(oldname, newname string) (Node, error) {
+	done, err := vfs.beginMaintenanceOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	if !vfs.Opt.Links {
 		fs.Errorf(newname, "symlinks not supported without the --links flag")
 		return nil, ENOSYS
 	}
 
 	// Destination can't exist
-	_, err := vfs.Stat(newname)
+	_, err = vfs.Stat(newname)
 	if err == nil {
 		return nil, EEXIST
 	} else if err != ENOENT {
@@ -1002,7 +1069,7 @@ func (vfs *VFS) CreateSymlink(oldname, newname string) (Node, error) {
 
 	// Create the file node
 	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC | o_SYMLINK
-	file, err := dir.Create(leaf, flags)
+	file, err := dir.create(leaf, flags)
 	if err != nil {
 		return nil, err
 	}
@@ -1011,7 +1078,7 @@ func (vfs *VFS) CreateSymlink(oldname, newname string) (Node, error) {
 	file.setSymlink()
 
 	// Open the file
-	fh, err := file.Open(flags)
+	fh, err := file.open(flags)
 	if err != nil {
 		return nil, err
 	}

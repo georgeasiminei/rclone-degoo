@@ -21,6 +21,113 @@
 Rclone *("rsync for cloud storage")* is a command-line program to sync files and
 directories to and from different cloud storage providers.
 
+## Degoo encrypted mount for Linux
+
+This fork includes an encrypted, writable Degoo mount for Linux. Install it
+from the `staging` source branch or from the matching prebuilt Linux amd64
+archive. The archive is a distributable installer package that can be shared
+with other Linux amd64 users; it does not contain account credentials or a
+vault secret. No GitHub release archive has been uploaded yet.
+
+### Install from source
+
+```sh
+git clone --branch staging https://github.com/georgeasiminei/rclone-degoo.git
+cd rclone-degoo
+mkdir -p build
+go build -o build/rclone .
+./contrib/degoo/degoo-rc install
+```
+
+Go 1.26 or newer is needed to build from source. The wizard then installs the
+contained client, checks mount dependencies, logs into Degoo, and helps select
+or create a dedicated vault folder.
+
+### Install from the prebuilt archive
+
+If you have the matching `rclone-degoo-linux-amd64.tar.gz` archive, place it in
+`~/Downloads`. No archive is currently available as a GitHub release download.
+The checksum sidecar should be alongside the tarball. Verify it, then extract
+the tarball into a new temporary directory and start its wizard:
+
+```sh
+cd "$HOME/Downloads"
+sha256sum -c rclone-degoo-linux-amd64.tar.gz.sha256
+extract_dir=$(mktemp -d "$HOME/Downloads/rclone-degoo.XXXXXX")
+tar -xzf "$HOME/Downloads/rclone-degoo-linux-amd64.tar.gz" -C "$extract_dir"
+cd "$extract_dir/rclone-degoo"
+./degoo-rc install
+```
+
+The prebuilt archive does not need Go. Both install paths need Python 3.10 or
+newer for the installer. Mounting also needs FUSE 3 or a compatible
+`fusermount` helper, readable and writable `/dev/fuse`, and `mountpoint` from
+`util-linux`. The wizard can offer to install missing `fuse3` and `util-linux`
+packages using a detected package manager. A systemd user manager is optional;
+without it, mount in the foreground.
+
+To build the archive for distribution, follow
+[the archive packaging instructions](docs/degoo/INSTALLATION.md#build-the-distributable-archive).
+
+The installer puts `degoo-rc` at `~/.local/share/rclone-degoo/degoo-rc` and
+links `~/.local/bin/degoo-rc` to it. It does not edit shell profiles; if that
+directory is missing from `PATH`, it prints an export command. Use
+`degoo-rc help` for the command list and `degoo-rc COMMAND help` for detailed
+options. A fresh install has `degoo-rc` as its only root-level Degoo command.
+Upgrades may retain root-level `.sh` shims already present in an older install.
+The Degoo package in a source checkout and the extracted archive use
+`degoo-rc` as their sole installer and maintenance entrypoint. New examples use
+`degoo-rc`.
+
+### Use the installed vault
+
+The wizard finishes with the install directory, mount location, current mount
+state, helper commands, and log locations. The default mount is
+`~/.local/share/rclone-degoo/mount`. Open that folder in your file manager
+while it is mounted, or use it like any other directory from the terminal.
+Use the installed command, available on `PATH`:
+
+```sh
+degoo-rc info
+degoo-rc logs
+degoo-rc logs --follow
+degoo-rc update
+```
+
+Press Ctrl+C to stop following logs. `degoo-rc logs` is the viewer; `logs/` is a
+directory. New mounts log notices and errors by default. The upgrade wizard
+offers to stop the contained mount and waits briefly for it to start again.
+The updater checks a small checksum and payload manifest before downloading a
+full package, so an unchanged install needs no large download. Long phases
+report elapsed time every ten seconds. Run an update outside an active mount;
+if the command says the current shell is inside `/mnt/degoo`, run `cd /mnt` in
+that same terminal and retry. See the [update guide](docs/degoo/INSTALLATION.md#update-the-installed-client)
+for metadata validation and recovery details.
+To stop the user service manually:
+
+```sh
+degoo-rc service stop
+```
+
+`degoo-rc info` shows mount/service state and authentication warnings.
+`degoo-rc logs` shows recent mount, login, setup, and status logs; `--follow`
+watches new messages. If a token cannot be renewed, run `degoo-rc login` again.
+Keep the cache and vault
+configuration while uploads are pending.
+
+For a fresh reinstall, run the uninstall wizard from outside the install
+(`cd ~` first). Choose No for all three keep options to create no backup;
+confirm `DISCARD` (when a vault secret exists) and `REMOVE`. If you keep
+anything, the private backup
+prompt asks for an absolute directory path; press Enter for the default.
+Discarding the encryption settings requires creating a new vault afterward.
+The installation guide includes removal checks and fresh archive instructions.
+
+See [the Degoo installation guide](docs/degoo/INSTALLATION.md) and
+[the quick start](DEGOO.md). Live support above 20 GiB, long-term token renewal,
+and several recovery cases remain unverified; see
+[validation status](docs/degoo/VALIDATION.md) before relying on the vault.
+
 ## Storage providers
 
 - 1Fichier [:page_facing_up:](https://rclone.org/fichier/)

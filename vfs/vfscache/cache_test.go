@@ -14,6 +14,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/lib/diskusage"
+	"github.com/rclone/rclone/lib/ranges"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
@@ -117,6 +118,63 @@ func newTestCache(t *testing.T) (r *fstest.Run, c *Cache) {
 	opt.HandleCaching = 0
 
 	return newTestCacheOpt(t, opt)
+}
+
+func TestCacheSyncHonorsContextWhileSnapshotWaits(t *testing.T) {
+	_, c := newTestCache(t)
+
+	const name = "snapshot-wait"
+	c.Item(name)
+	require.NoError(t, os.WriteFile(c.toOSPath(name), []byte("cached"), 0o600))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	c.mu.Lock()
+	started := time.Now()
+	err := c.Sync(ctx)
+	elapsed := time.Since(started)
+	c.mu.Unlock()
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, time.Second, "cache snapshot should honor its context")
+	_, err = os.Stat(c.toOSPathMeta(name))
+	assert.ErrorIs(t, err, os.ErrNotExist, "a canceled snapshot must not sync items")
+}
+
+func TestCacheHasDirtyAfterWritebackEntryRemoved(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.HandleCaching = 0
+	opt.WriteBack = fs.Duration(time.Hour)
+	_, c := newTestCacheOpt(t, opt)
+
+	item := c.Item("orphaned-dirty")
+	require.NoError(t, item.Open(nil))
+	_, err := item.WriteAt([]byte("local data"), 0)
+	require.NoError(t, err)
+	require.NoError(t, item.Close(nil))
+	assert.Len(t, c.writeback.Queue(), 1)
+	require.True(t, c.writeback.Remove(item.writeBackID))
+	assert.Empty(t, c.writeback.Queue())
+
+	dirty, err := c.HasDirty(context.Background())
+	require.NoError(t, err)
+	assert.True(t, dirty, "dirty local data must remain visible without a queue entry")
+}
+
+func TestCacheHasDirtyHonorsContextWhileItemLocked(t *testing.T) {
+	_, c := newTestCache(t)
+	item := c.Item("locked-item")
+	item.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	dirty, err := c.HasDirty(ctx)
+	item.mu.Unlock()
+
+	assert.False(t, dirty)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(started), time.Second, "dirty scan should honor its context")
 }
 
 func TestCacheNew(t *testing.T) {
@@ -760,6 +818,55 @@ func TestCacheStats(t *testing.T) {
 	assert.Equal(t, 0, out["files"])
 	assert.Equal(t, 0, out["uploadsInProgress"])
 	assert.Equal(t, 0, out["uploadsQueued"])
+}
+
+func TestCacheStatsUsage(t *testing.T) {
+	_, c := newTestCache(t)
+	// Sparse ranges, rather than the logical file length, consume cache quota.
+	for _, test := range []struct {
+		name  string
+		size  int64
+		dirty bool
+		opens int
+		grace bool
+	}{
+		{"evictable", 10, false, 0, false},
+		{"dirty", 20, true, 0, false},
+		{"open dirty", 30, true, 1, false},
+		{"open clean", 40, false, 1, false},
+		{"grace", 50, false, 0, true},
+	} {
+		item := c.Item(test.name)
+		item.mu.Lock()
+		item.info.Size = 1000
+		item.info.Rs = ranges.Ranges{{Pos: 100, Size: test.size}}
+		item.info.Dirty = test.dirty
+		item.opens = test.opens
+		if test.grace {
+			item.graceTimer = &time.Timer{}
+		}
+		item.mu.Unlock()
+	}
+	out := c.Stats()
+	assert.Equal(t, int64(150), out["bytesUsed"])
+	assert.Equal(t, int64(50), out["bytesDirty"])
+	assert.Equal(t, int64(100), out["bytesClean"])
+	assert.Equal(t, int64(10), out["bytesEvictable"])
+	assert.Equal(t, int64(90), out["bytesPinned"])
+	assert.Equal(t, 2, out["filesDirty"])
+	assert.Equal(t, 3, out["filesClean"])
+	assert.Equal(t, 1, out["filesEvictable"])
+	assert.Equal(t, 2, out["filesPinned"])
+	// Stats reflects writes between cleaner passes and never evicts entries.
+	assert.Equal(t, 5, out["files"])
+	assert.Zero(t, c.used)
+	for _, item := range c.item {
+		item.mu.Lock()
+		item.graceTimer = nil
+		item.opens = 0
+		item.info.Dirty = false
+		item.mu.Unlock()
+	}
 }
 
 func TestCacheQueue(t *testing.T) {

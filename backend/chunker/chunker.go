@@ -1132,15 +1132,21 @@ func (o *Object) readXactID(ctx context.Context) (xactID string, err error) {
 		if len(data) > maxMetadataSizeWritten {
 			return "", nil // this was likely not a metadata object, return empty xactID but don't throw error
 		}
-		var metadata metaSimpleJSON
-		err = json.Unmarshal(data, &metadata)
-		if err != nil {
+		metadata, madeByChunker, err := unmarshalSimpleJSON(ctx, o.main, data)
+		if !madeByChunker {
 			return "", nil // this was likely not a metadata object, return empty xactID but don't throw error
 		}
-		xactID = metadata.XactID
+		if err != nil {
+			return "", err
+		}
+		xactID = metadata.xactID
 	}
 	o.xactID = xactID
 	o.xIDCached = true
+	if xactID != "" {
+		// Transaction metadata must be checked even when no data chunks remain.
+		o.unsure = true
+	}
 	return xactID, nil
 }
 
@@ -1166,6 +1172,17 @@ func (f *Fs) put(
 		if err := obj.readMetadata(ctx); err == ErrMetaUnknown {
 			// refuse to update a file of unsupported format
 			return nil, fmt.Errorf("refusing to %s: %w", action, err)
+		}
+	}
+	var oldChunks []fs.Object
+	if f.useNoRename && target != nil {
+		oldChunks = append(oldChunks, target.(*Object).chunks...)
+	}
+	removePreviousChunks := func() {
+		for _, chunk := range oldChunks {
+			if err := chunk.Remove(ctx); err != nil {
+				fs.Errorf(chunk, "Failed to remove old chunk: %v", err)
+			}
 		}
 	}
 
@@ -1265,7 +1282,9 @@ func (f *Fs) put(
 	// created if forced by consistent hashing or due to unsafe input.
 	if !needMeta && !f.hashAll && f.useMeta {
 		// If previous object was chunked, remove its chunks
-		f.removeOldChunks(ctx, baseRemote)
+		if !f.useNoRename {
+			f.removeOldChunks(ctx, baseRemote)
+		}
 
 		// Rename single data chunk in place
 		chunk := c.chunks[0]
@@ -1277,6 +1296,7 @@ func (f *Fs) put(
 			}
 			chunk = chunkMoved
 		}
+		removePreviousChunks()
 
 		return f.newObject("", chunk, nil), nil
 	}
@@ -1290,8 +1310,10 @@ func (f *Fs) put(
 		return nil, fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, c.readCount)
 	}
 
-	// If previous object was chunked, remove its chunks
-	f.removeOldChunks(ctx, baseRemote)
+	// Rename transactions reuse chunk names, so retire the prior chunks first.
+	if !f.useNoRename {
+		f.removeOldChunks(ctx, baseRemote)
+	}
 
 	if !f.useNoRename {
 		// The transaction suffix will be removed for backends with quick rename operations
@@ -1332,6 +1354,8 @@ func (f *Fs) put(
 	if err != nil {
 		return nil, err
 	}
+	// No-rename chunks remain readable until the replacement metadata is published.
+	removePreviousChunks()
 
 	o := f.newObject("", metaObject, c.chunks)
 	o.size = sizeTotal
@@ -2033,6 +2057,9 @@ func (o *Object) addChunk(chunk fs.Object, chunkNo int) error {
 
 // validate verifies the object internals and updates total size
 func (o *Object) validate() error {
+	if o.f.useNoRename && o.xactID != "" && len(o.chunks) == 0 {
+		return fmt.Errorf("%q has missing chunks", o)
+	}
 	if !o.isComposite() {
 		_ = o.mainChunk() // verify that single wrapped chunk exists
 		return nil

@@ -12,11 +12,12 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
 const (
-	maxUploadDelay = 5 * time.Minute // max delay between upload attempts
+	maxUploadDelay = 5 * time.Minute // max exponential delay between upload attempts
 )
 
 // PutFn is the interface that item provides to store the data
@@ -73,7 +74,7 @@ type writeBackItem struct {
 	done      chan struct{}      // closed when the cancellation completes
 	putFn     PutFn              // To write the object data
 	tries     int                // number of times we have tried to upload
-	delay     time.Duration      // delay between upload attempts
+	delay     time.Duration      // ordinary exponential delay between upload attempts
 }
 
 // A writeBackItems implements a priority queue by implementing
@@ -368,16 +369,21 @@ func (wb *WriteBack) upload(ctx context.Context, wbItem *writeBackItem) {
 		if wbItem.delay > maxUploadDelay {
 			wbItem.delay = maxUploadDelay
 		}
+		retryAt := time.Now().Add(wbItem.delay)
 		if errors.Is(err, context.Canceled) {
 			fs.Infof(wbItem.name, "vfs cache: upload canceled")
 			// Upload was cancelled so reset timer
 			wbItem.delay = time.Duration(wb.opt.WriteBack)
+			retryAt = time.Now().Add(wbItem.delay)
 		} else {
-			fs.Errorf(wbItem.name, "vfs cache: failed to upload try #%d, will retry in %v: %v", wbItem.tries, wbItem.delay, err)
+			if serverRetryAt := fserrors.RetryAfterErrorTime(err); serverRetryAt.After(retryAt) {
+				retryAt = serverRetryAt
+			}
+			fs.Errorf(wbItem.name, "vfs cache: failed to upload try #%d, will retry in %v: %v", wbItem.tries, time.Until(retryAt), err)
 		}
 		// push the item back on the queue for retry
 		wb._pushItem(wbItem)
-		wb.items._update(wbItem, time.Now().Add(wbItem.delay))
+		wb.items._update(wbItem, retryAt)
 	} else {
 		fs.Infof(wbItem.name, "vfs cache: upload succeeded try #%d", wbItem.tries)
 		// show that we are done with the item
@@ -480,7 +486,7 @@ type QueueInfo struct {
 	Size      int64   `json:"size"`      // integer size of the file in bytes
 	Expiry    float64 `json:"expiry"`    // seconds from now which the file is eligible for transfer, oldest goes first
 	Tries     int     `json:"tries"`     // number of times we have tried to upload
-	Delay     float64 `json:"delay"`     // delay between upload attempts (s)
+	Delay     float64 `json:"delay"`     // ordinary exponential delay between upload attempts (s)
 	Uploading bool    `json:"uploading"` // true if item is being uploaded
 }
 
