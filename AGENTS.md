@@ -15,13 +15,35 @@ Read these documents before starting Degoo work:
    behavior, scope, and acceptance criteria.
 2. [Implementation plan](docs/degoo/IMPLEMENTATION_PLAN.md): advisory design,
    discovery work, and suggested delivery stages.
-3. The upstream rclone guidance below and [CONTRIBUTING.md](CONTRIBUTING.md).
+3. [Scalable storage plan](docs/degoo/SCALABLE_STORAGE_PLAN.md): the active
+   redesign backlog, progress, evidence gates, and cross-session handoff.
+4. The upstream rclone guidance below and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The requirements record the user's intent. The plan is advice, not a binding
 architecture or fixed task sequence. Future agents may change libraries,
 interfaces, layering, defaults, and sequencing when evidence supports a better
 approach. Explain material tradeoffs and update the plan. Ask the user about
 changes to required behavior rather than quietly weakening it.
+
+### Pre-live development policy
+
+As of 2026-10-15, this project is not live. The user has identified all current
+Degoo data and pending uploads as disposable tests. Future implementation may
+redesign the format, discard pending test uploads, reset the test cache, and
+remove Degoo test data when necessary. Preserving the current format, draining
+the current queue, and migrating existing test data are not delivery gates.
+Notify the user before a reset, naming its scope, what will be lost, and what
+must be copied again with rsync. This is standing authorization for announced
+pre-live resets, not a requirement to ask for the same approval again.
+
+Keep resets scoped to the intended test vault by default. If an account-wide
+test-data reset is necessary, announce that broader scope explicitly. Protect
+source files outside the mount, unrelated local data, and credentials. The
+ordinary filesystem must still preserve pending writes through failures and
+restarts; an intentional test reset is a separate maintenance action. End this
+exception when the user explicitly declares go-live, and update the requirements
+and active tracker together. The initial planning task on 2026-10-15 authorizes
+documentation only; implementation and resets belong to later tasks.
 
 ### Project priorities
 

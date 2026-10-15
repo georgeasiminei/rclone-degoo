@@ -1,8 +1,10 @@
 # Degoo backend requirements handoff
 
-Status: requirements recorded on 2026-10-09; implemented operational behavior
-and current validation are tracked in
+Status: requirements recorded on 2026-10-09, with the pre-live reset policy
+updated on 2026-10-15; implemented operational behavior and validation are in
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) and [VALIDATION.md](VALIDATION.md).
+The active redesign and progress tracker is
+[SCALABLE_STORAGE_PLAN.md](SCALABLE_STORAGE_PLAN.md).
 
 This document gives a future implementation agent the user’s requirements for
 a Degoo filesystem in the `rclone-degoo` fork. It separates those requirements
@@ -21,6 +23,37 @@ from design ideas proposed earlier in the project discussion.
 ## User requirements
 
 These points are the binding product requirements recorded from the user.
+
+### Pre-live redesign and disposable test data
+
+The user confirmed on 2026-10-15 that the project is not live and all current
+Degoo data, including remaining pending uploads, is test data that may be
+discarded. Until the user explicitly declares go-live:
+
+- Libraries, layering, remote formats, chunking, indexes, and defaults may be
+  redesigned to meet the required writable, encrypted mount behavior.
+- Backward compatibility or migration of the existing test vault is optional.
+  Finishing the current upload queue is not a prerequisite for redesign or
+  deployment. The user can repopulate the mount with rsync.
+- A necessary reset may discard pending test uploads, their local test cache,
+  and remote Degoo test data. Limit the reset to the intended vault by default;
+  an account-wide test-data reset is also authorized if necessary.
+- Notify the user before a reset, identifying the exact target, pending and
+  remote data being discarded, expected downtime, and rsync reseeding needed.
+  This standing authorization does not require repeated confirmation for an
+  announced reset within that scope. Protect source data outside the mount,
+  unrelated local files, and credentials.
+- Announced resets are intentional maintenance. Automatic upload failures,
+  authentication outages, crashes, and normal restarts must continue to preserve
+  pending writes, and must never trigger an automatic destructive reset.
+- Record the reset and resulting vault/format identity in the active progress
+  tracker without recording secrets or private account listings. At go-live,
+  remove this exception from the handoff and adopt the production preservation
+  and compatibility policy before storing production data.
+
+The initial request on 2026-10-15 is for the persistent plan only.
+Implementation and resets belong to later tasks; this planning task must not
+discard any data.
 
 ### Linux mount
 
