@@ -253,7 +253,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 **Gate:** Bounded objects/shards and crash-safe publication.
 
 - **P3-FORMAT** — Status: `in progress`; dependencies: P1-DECISION;
-  evidencePR: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+  evidencePR: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51),
+  [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
   Specify the versioned encrypted object/index/manifest
   schema, key derivation and authenticated fields, shard addressing, maximum
   record size, chunk sizing after encryption overhead, and how a local cache
@@ -261,7 +262,7 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   required bootstrap/KDF/control data remotely after account login. Do not add
   a single unbounded index.
 - **P3-PUBLISH** — Status: `in progress`; dependencies: P3-FORMAT;
-  evidencePR: pending encrypted-component follow-up.
+  evidencePR: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
   Local checkpoint/allocation intent components are inactive; remote publication
   and authority remain blocked. Implement staged upload and atomic logical-version
   publication. Define idempotency, write authorization, version selection,
@@ -269,7 +270,7 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   last complete version readable until the new version is confirmed where
   supported.
 - **P3-SHARDS** — Status: `in progress`; dependencies: P3-FORMAT;
-  evidencePR: pending encrypted-component follow-up.
+  evidencePR: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
   Inactive encrypted index/manifest trees and namespace are implemented;
   physical allocation and mount integration remain open. Implement bounded
   index shards/buckets and their update,
@@ -770,3 +771,12 @@ and removes the source branch. No merge was performed by the agent.
   implies the full plan is complete. Provider identity/deletion evidence,
   password-only bootstrap, remote publication/cleanup authority, persistent
   inventory, reader pins, mounted fault/rebuild and live/soak gates remain open.
+
+Delivery: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52),
+implementation commit `f743fde44`. The final credential-free full suite passes
+all 195 test packages; scoped race/vet/lint, Markdown and link/task/diff checks
+pass. At 20:00 UTC, persisted API access was still held through 21:30:29 UTC;
+no password-login hold was recorded. No provider/auth or installed-runtime
+operation was attempted. PR #52 remains for the user to merge. Further activation
+requires verified remote publication and password-only bootstrap/recovery;
+shipping local-only authority would violate the explicit recovery requirement.

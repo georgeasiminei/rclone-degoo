@@ -977,6 +977,8 @@ latest-root claim follows from this experiment.
 
 ### Inactive encrypted trees, namespace and streaming file composition
 
+Delivery: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
+
 The follow-up to merged PR #51 implements the authenticated page-reference/store
 port, compressed radix-16 index, manifest tree and stable-ID namespace. None
 is connected to the installed mount or a new provider-backed format. The store

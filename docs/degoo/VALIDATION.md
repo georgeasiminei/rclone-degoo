@@ -1803,6 +1803,10 @@ The integrated build/full suite/scoped race/vet/lint all passed after that rebas
 
 ## Encrypted component follow-up and password-only recovery — 2026-10-15
 
+Delivery: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
+Implementation commit: `f743fde44`; targets `staging`, merging remains with
+the user.
+
 The user merged PR #51 at `5e945c0d7` while the follow-up was in progress.
 After fetching, all pending changes were preserved on a fresh feature branch
 from that `origin/staging`. The baseline source trees matched, so no source
@@ -1849,8 +1853,9 @@ The full suite uses `CI=true`, `RCLONE_CONFIG=/notfound`, short private
 link first on `PATH`, as in the prior validation increment. No cloud credentials
 are used by these checks.
 
-Markdown lint, relative-link/task-ID checks and `git diff --check` are recorded
-with the delivery update. Live API access remains held by the persisted deadline
+Markdown lint passes on all six handoff documents; 69 relative links, 18 unique
+task IDs and `git diff --check` pass too. A final read-only check at 20:00 UTC
+still finds live API access held by the persisted deadline
 through **2026-10-15 21:30:29 UTC**. No provider/auth request, service or mount
 change, reset, data discard or reseed occurred. Direct-ID continuity/deletion,
 password-only bootstrap, remote publication/fencing, sustainable allocator/
