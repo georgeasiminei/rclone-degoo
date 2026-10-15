@@ -10,6 +10,9 @@ See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 
 ## Scalable storage lookup and publication decision — 2026-10-15
 
+Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
+targeting `staging`; merging remains with the user.
+
 The work starts from fetched `origin/staging` at `a4dcb1902`, after confirming
 PR #46 is merged and both its commits are integration ancestors. The shared
 checkout's update-progress commits are also merged. Implementation uses a new

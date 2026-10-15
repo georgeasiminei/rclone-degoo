@@ -7,6 +7,9 @@ not close P1-LOOKUP or P1-DECISION's live evidence gate. Requirements are in
 [REQUIREMENTS.md](REQUIREMENTS.md); measurements and executable experiments are
 in [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md).
 
+Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
+targeting `staging`; merging remains with the user.
+
 ## Decision and scenarios
 
 Continue with an immutable encrypted sharded remote index, stable logical file

@@ -194,7 +194,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   operation, page, and response class without secrets or private IDs.
 - **P1-LOOKUP** — Status: `in progress`; dependencies: P1-FIXTURES;
   evidencePR: [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43),
-  [#44](https://github.com/georgeasiminei/rclone-degoo/pull/44).
+  [#44](https://github.com/georgeasiminei/rclone-degoo/pull/44),
+  [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48).
   Trace `NewObject`, chunk/manifest sibling discovery,
   create, overwrite, rename, and delete. Count listings and invalidations per
   operation. Verify direct provider lookup by opaque ID and establish its
@@ -202,9 +203,11 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   identity continuity remains unverified during the persisted hold until
   2026-10-15 21:30:29 UTC. Re-read state before any later probe.
 - **P1-DECISION** — Status: `in progress`; dependencies: P1-FIXTURES,
-  P1-RATELIMIT, P1-LOOKUP; evidencePR: `TBD`. Compare smaller pages, a bounded
-  persistent local ID cache, and adaptive ciphertext buckets with an encrypted
-  sharded remote index. Record the selected design, measured tradeoffs,
+  P1-RATELIMIT, P1-LOOKUP; evidencePR:
+  [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48).
+  Compare smaller pages, a bounded persistent local ID cache, and adaptive
+  ciphertext buckets with an encrypted sharded remote index. Record the
+  selected design, measured tradeoffs,
   encryption boundaries, object-count bounds, index rebuild, publication
   protocol, writer/concurrency and conflict policy, and pre-go-live reset/reseed
   impact. Evaluate stable logical IDs so a directory rename need not rename or
@@ -521,8 +524,10 @@ For each future task:
   links, task IDs and staged diff checks. Earlier full attempts required a
   shorter socket-test temporary path and encountered an upstream self-update
   beta-download 404. See [VALIDATION.md](VALIDATION.md) for exact scope.
-- Delivery: this feature branch targets `staging`; the PR link is recorded
-  after opening. The user merges and removes its source branch.
+- Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
+  targeting `staging` and left open for the user to merge and remove its source
+  branch. Implementation commit: `53ff01148`; the final documentation commit
+  records the delivery reference.
 - Next action: after re-reading the provider hold, run bounded generated-vault
   direct-ID continuity/deletion checks across fresh sessions. Discover and
   verify a real authoritative publication/fencing mechanism, or revise the

@@ -556,6 +556,9 @@ counter snapshot remains local-only.
 
 ## P1 lookup contracts and publication decision
 
+Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
+targeting `staging`.
+
 The [decision record](SCALABILITY_DECISION.md) compares root publication,
 writer fencing, physical placement, stable directory identity and cleanup.
 The conditional target is immutable encrypted remote pages with stable logical
