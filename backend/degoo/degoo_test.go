@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +43,7 @@ type mockDegoo struct {
 	items                        map[string]mockItem
 	uploads                      map[string][]byte
 	downloadCalls                int
+	rangeDownloadCalls           int
 	expireNextDownload           bool
 	nextID                       int
 	failRegister                 bool
@@ -73,6 +75,7 @@ type mockDegoo struct {
 	listRetryAfter               string
 	listStatusCode               int
 	listCalls                    int
+	listPageSize                 int
 	getItemCalls                 int
 	failInitialMkdirAck          bool
 	corruptUpload                bool
@@ -182,8 +185,12 @@ func (mock *mockDegoo) upload(writer http.ResponseWriter, request *http.Request)
 
 func (mock *mockDegoo) download(writer http.ResponseWriter, request *http.Request) {
 	id := strings.TrimPrefix(request.URL.Path, "/download/")
+	rangeHeader := request.Header.Get("Range")
 	mock.mu.Lock()
 	mock.downloadCalls++
+	if rangeHeader != "" {
+		mock.rangeDownloadCalls++
+	}
 	if mock.expireNextDownload {
 		mock.expireNextDownload = false
 		mock.mu.Unlock()
@@ -202,6 +209,28 @@ func (mock *mockDegoo) download(writer http.ResponseWriter, request *http.Reques
 	mock.mu.Unlock()
 	if !ok {
 		http.NotFound(writer, request)
+		return
+	}
+	if rangeHeader != "" {
+		rangeOption, err := fs.ParseRangeOption(rangeHeader)
+		if err != nil {
+			http.Error(writer, "invalid range", http.StatusBadRequest)
+			return
+		}
+		offset, limit := rangeOption.Decode(int64(len(content)))
+		if offset < 0 || offset >= int64(len(content)) || limit == 0 {
+			writer.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(content)))
+			writer.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if limit < 0 || offset+limit > int64(len(content)) {
+			limit = int64(len(content)) - offset
+		}
+		end := offset + limit - 1
+		writer.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, end, len(content)))
+		writer.Header().Set("Content-Length", strconv.FormatInt(limit, 10))
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write(content[offset : end+1])
 		return
 	}
 	writer.Header().Set("Content-Length", strconv.Itoa(len(content)))
@@ -281,7 +310,28 @@ func (mock *mockDegoo) graphql(writer http.ResponseWriter, request *http.Request
 			}
 		}
 		responseNextToken := ""
-		if nextToken == "" {
+		if mock.listPageSize > 0 {
+			sort.Slice(items, func(i, j int) bool {
+				return items[i]["ID"].(string) < items[j]["ID"].(string)
+			})
+			offset := 0
+			if nextToken != "" {
+				var err error
+				offset, err = strconv.Atoi(nextToken)
+				if err != nil || offset < 0 || offset > len(items) {
+					writer.WriteHeader(http.StatusBadRequest)
+					return
+				}
+			}
+			end := offset + mock.listPageSize
+			if end > len(items) {
+				end = len(items)
+			}
+			if end < len(items) {
+				responseNextToken = strconv.Itoa(end)
+			}
+			items = items[offset:end]
+		} else if nextToken == "" {
 			responseNextToken = mock.listNextToken
 		}
 		data = map[string]any{"getFileChildren5": map[string]any{"Items": items, "NextToken": responseNextToken}}
