@@ -1800,3 +1800,65 @@ Final documentation checks passed: Markdown lint on all five changed documents,
 issue, corrected before final lint. Rebase conflicts were append-only evidence
 and tracker sections; both PR #50 history and this increment were retained.
 The integrated build/full suite/scoped race/vet/lint all passed after that rebase.
+
+## Encrypted component follow-up and password-only recovery — 2026-10-15
+
+Delivery: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
+Implementation commit: `f743fde44`; targets `staging`, merging remains with
+the user.
+
+The user merged PR #51 at `5e945c0d7` while the follow-up was in progress.
+After fetching, all pending changes were preserved on a fresh feature branch
+from that `origin/staging`. The baseline source trees matched, so no source
+reset/replay was needed; older worktrees and the unrelated stash remain intact.
+This follow-up has its own PR; the user retains merge control.
+
+Implemented inactive components include the actual authority checkpoint and
+bounded allocation ledger, authenticated page references/store port, compressed
+radix index, bounded manifest tree, stable-ID namespace, streaming chunk codec
+and logical-file composition. They do not change the installed mount or activate
+a new remote format. Detailed bounds are in
+[SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md). The user explicitly requires
+published-data recovery with the encryption password alone after account login;
+no saved local config/locator/control file is a recovery prerequisite. Bootstrap
+discovery and safe latest-root selection remain unimplemented provider gates.
+
+Passed:
+
+- Fresh full `go build` to a private temporary binary, with no runtime install.
+- Credential-free repository-wide `go test -timeout 20m -count=1 ./...`:
+  all **195** test packages pass, exit zero. Two earlier full runs also passed;
+  the final run includes the subsequent checkpoint-conditional/stale-ledger
+  and range-close corrections. Source comments added during validation do not
+  change tested behavior.
+- Scoped race tests pass across backend, API, auth, allocation, authority,
+  data codec, file composition, index, manifest, namespace, page codec and
+  dircache. Final changed safety/codec packages were rerun after review fixes.
+- `go vet ./backend/degoo/... ./lib/dircache` and matching `golangci-lint`:
+  zero issues.
+- Real encrypted file/index/namespace graph read after recreating instances,
+  synthetic 21 GiB + 17-byte splitting into 22 chunks, 262,145-descriptor
+  manifest retained-memory bound, maximum index/manifest lookup depths,
+  old-root preservation, malformed data, callback cancellation and fault cases.
+- A real authority-file subprocess reopens a durable allocation reservation.
+  Stale independent ledgers cannot overwrite that reservation or return an
+  incomplete inventory. Local checkpoint comparison is not remote fencing.
+- Allocation locator-alias and ignored range-header close-error regressions
+  each failed before their correction and pass afterward. An initially
+  incomplete real-authority test needed an explicitly private temporary parent;
+  production privacy checks were retained.
+
+The full suite uses `CI=true`, `RCLONE_CONFIG=/notfound`, short private
+`TMPDIR`/`GOTMPDIR`, a private runtime cache and the fresh binary/FUSE compatibility
+link first on `PATH`, as in the prior validation increment. No cloud credentials
+are used by these checks.
+
+Markdown lint passes on all six handoff documents; 69 relative links, 18 unique
+task IDs and `git diff --check` pass too. A final read-only check at 20:00 UTC
+still finds live API access held by the persisted deadline
+through **2026-10-15 21:30:29 UTC**. No provider/auth request, service or mount
+change, reset, data discard or reseed occurred. Direct-ID continuity/deletion,
+password-only bootstrap, remote publication/fencing, sustainable allocator/
+inventory/cleanup, reader pins, mount integration, mounted faults/rebuild and
+live/soak acceptance remain open. The complete implementation goal is unfinished;
+this validation does not turn those gates into passed requirements.

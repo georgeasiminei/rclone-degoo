@@ -109,8 +109,9 @@ occupancy under skew or repeated versions.
 ## Authority, root discovery, and writer fencing
 
 Remote encrypted state is authoritative. A portable vault descriptor binds the
-vault identity, format, KDF parameters, and bootstrap locator; it is retained
-with the vault configuration, never solely in the disposable metadata cache.
+vault identity, format, KDF parameters, and bootstrap locator. It must be
+discoverable from Degoo with the encryption password after account login;
+an optional local copy is an optimization, not a recovery prerequisite.
 It must locate a bounded remote control namespace without a full-vault scan.
 Creation must use a discovered device folder; earlier live setup rejected
 account root ID `0`. If a bootstrap provider ID can change, its bounded
@@ -440,3 +441,28 @@ provider activation. P3 still needs its payload schemas, allocator, publication,
 shards/manifests, rebuild and mount wiring. No provider request, runtime update,
 reset or reseed was performed. The persisted hold must be rechecked before any
 later live direct-ID or deletion experiment.
+
+### Password-only recovery clarification — 2026-10-15
+
+The user explicitly requires recovery of published data with the encryption
+password alone, after Degoo account authentication. Saved local configuration,
+bootstrap locators and control-registry backups are not recovery prerequisites.
+This supersedes any alternative requiring an intact local registry. The earlier
+single-host experiment remains useful delayed-effect/refusal evidence, but its
+required current-root registry is not an acceptable production recovery design.
+The local checkpoint/allocation components are inactive operational building
+blocks; they cannot become the sole durable authority for published versions.
+
+Random KDF salt, vault identity, format and a discoverable bootstrap must be
+recoverable from remote state. Existing page/data codec constructors accepting
+salt and vault identity do not yet implement that discovery. Root selection
+must establish the latest complete commit; maximum generation from an ordinary
+possibly stale listing is still rejected. Account login is a separate secret.
+Only already published data can survive loss of all local pending bytes.
+
+This requirement strengthens the provider gate: without a verified remote
+publication/recovery mechanism, wiring the components into a writable scalable
+mount would silently weaken required behavior. Continue independent bounded
+format/read/write/failure implementation and controlled evidence work, but
+leave activation blocked rather than assume local-only authority or guessed
+conditional API arguments. No external coordinator has been authorized.
