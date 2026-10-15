@@ -8,13 +8,70 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Scalable storage P1 memory and candidate prototypes — 2026-10-15
+
+This slice completes generated P1-FIXTURES measurements and adds test-only
+persistent-ID and encrypted radix-index candidates. It changes no production
+mount format. [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) records the
+measurements, reproduction commands, and model/provider distinction; the
+active task state and exact next action are in
+[SCALABLE_STORAGE_PLAN.md](SCALABLE_STORAGE_PLAN.md).
+
+The opt-in fixtures passed at 1,000, 10,000, and 100,000 records: sampled cold-list
+process heap, multiple populated API snapshots, persistent-ID cache/reopen,
+and encrypted-node lookup/update/rename/rebuild. Additional checks cover disk
+entry/byte eviction, missing/corrupt cache recovery, in-flight invalidation,
+all write boundaries of a generated leaf split, overwrite staging failures,
+ciphertext tampering/substitution, and missing nodes. The largest memory and
+lookup measurements ran separately from repository-wide validation.
+
+The first race-suite attempt hit the existing delete operation-trace assertion:
+three parent invalidations were counted instead of four, with the expected
+requests and other counters. Ten isolated repetitions passed. The fresh-list
+worker closed its completion channel before recording the final invalidation.
+A deterministic regression holds post-completion cleanup and failed before
+the fix with zero end-invalidation events. Recording the event alongside the
+invalidation, before waking callers, makes completed-operation counters reliable.
+It retains the existing metadata-to-statistics mutex order and does not change
+request, cache-invalidation, or cooldown behavior.
+
+The initial full repository run passed all Degoo backend packages but failed
+one existing command socket fixture because the temporary prefix still made
+its Unix-socket path too long. Final validation uses a shorter owner-private
+disk-backed temporary directory. No production socket-path behavior is changed.
+
+Final checks passed against the restored scalability sources in an isolated
+worktree, leaving concurrent work on the shared checkout untouched:
+
+- Fresh `go build -o` and the credential-free repository-wide
+  `go test -timeout 20m ./...`, using the fresh binary on `PATH`, an isolated
+  runtime cache, and short private `TMPDIR`/`GOTMPDIR` paths.
+- `RCLONE_CONFIG=/notfound go test -race ./backend/degoo/... -count=1`,
+  `go vet ./backend/degoo/...`, and
+  `golangci-lint run ./backend/degoo/...` (zero issues).
+- The opt-in generated 100,000-entry backend/API memory, persistent-ID,
+  and encrypted radix-node fixtures, including the default smaller cases.
+- Changed-document Markdown lint, 39 relative file-link targets, and staged
+  diff checks.
+
+The interrupted validation run in the shared checkout is not used as final
+source validation. No live backend integration suite or mounted large-file
+acceptance was run; those require a dedicated generated-data vault and remain
+separate acceptance gates.
+
+No live Degoo requests, installed-runtime changes, vault resets, pending-write
+deletion, or production-format changes occurred. Remote direct-ID stability,
+root publication, physical placement bounds, orphan cleanup, and mounted large
+files remain unverified. The encrypted model assumes an atomic root swap and
+a direct-ID store; it is not evidence of remote crash-safe publication.
+
 ## Scalable storage P1 follow-up — 2026-10-15
 
 The follow-up replaces full-table parent-hint eviction with ordered eviction,
 rejects direct-ID metadata with a different response identity, and adds
 retained-heap/occupancy measurements plus paginated and encrypted-stack traces.
 Delivery: [PR #44](https://github.com/georgeasiminei/rclone-degoo/pull/44),
-targeting `staging` and awaiting the user's merge.
+targeting `staging` and merged on 2026-10-15.
 See [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for measured counters,
 reproduction commands, and memory-measurement limits.
 

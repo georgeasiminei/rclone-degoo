@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 )
 
 type scalabilityOccupancyTokens struct{}
@@ -24,6 +27,15 @@ type scalabilityOccupancyFixture struct {
 	entries  int
 	pageSize int
 	pages    atomic.Uint64
+	children atomic.Uint64
+}
+
+func scalabilityOccupancyID(parent string, index int) string {
+	return fmt.Sprintf("memory-id-%s-%08d", parent, index)
+}
+
+func scalabilityOccupancyName(parent string, index int) string {
+	return fmt.Sprintf("memory-name-%s-%08d", parent, index)
 }
 
 func (fixture *scalabilityOccupancyFixture) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -56,7 +68,7 @@ func (fixture *scalabilityOccupancyFixture) ServeHTTP(writer http.ResponseWriter
 	items := make([]map[string]any, 0, end-offset)
 	for index := offset; index < end; index++ {
 		items = append(items, map[string]any{
-			"ID": fmt.Sprintf("memory-id-%08d", index), "Name": fmt.Sprintf("memory-name-%08d", index),
+			"ID": scalabilityOccupancyID(input.Variables.ParentID, index), "Name": scalabilityOccupancyName(input.Variables.ParentID, index),
 			"ParentID": input.Variables.ParentID, "Category": 6, "Size": "4096",
 			"CreationTime": "1700000000000", "LastModificationTime": "1700000000000",
 		})
@@ -66,6 +78,7 @@ func (fixture *scalabilityOccupancyFixture) ServeHTTP(writer http.ResponseWriter
 		next = strconv.Itoa(end)
 	}
 	fixture.pages.Add(1)
+	fixture.children.Add(uint64(len(items)))
 	writer.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(writer).Encode(map[string]any{
 		"data": map[string]any{
@@ -165,8 +178,8 @@ func TestScalabilityMetadataOccupancyBounds(t *testing.T) {
 		client.metadataMu.Lock()
 		retained := len(client.itemParents)
 		retainedOrder := client.itemParentOrder.Len()
-		_, oldestExists := client.itemParents["memory-id-00000000"]
-		_, newestExists := client.itemParents[fmt.Sprintf("memory-id-%08d", generated-1)]
+		_, oldestExists := client.itemParents[scalabilityOccupancyID("generated-parent", 0)]
+		_, newestExists := client.itemParents[scalabilityOccupancyID("generated-parent", generated-1)]
 		client.metadataMu.Unlock()
 		if retained != itemParentCacheMaxEntries || retainedOrder != itemParentCacheMaxEntries {
 			t.Fatalf("hint map/order occupancy = %d/%d, want configured bound %d", retained, retainedOrder, itemParentCacheMaxEntries)
@@ -192,4 +205,210 @@ func logScalabilityOccupancy(t *testing.T, evidence scalabilityOccupancyEvidence
 		t.Fatal(err)
 	}
 	t.Log(string(encoded))
+}
+
+type scalabilityPopulatedSnapshotEvidence struct {
+	EntriesPerParent             int    `json:"entries_per_parent"`
+	ParentsRequested             int    `json:"parents_requested"`
+	ConfiguredSnapshotBound      int    `json:"configured_snapshot_bound"`
+	RetainedSnapshotParents      int    `json:"retained_snapshot_parents"`
+	RetainedSnapshotItems        int    `json:"retained_snapshot_items"`
+	SnapshotItemArrayBytes       uint64 `json:"snapshot_item_array_logical_bytes"`
+	SnapshotStringBytes          uint64 `json:"snapshot_string_field_logical_bytes"`
+	RetainedSnapshotPayloadBytes uint64 `json:"retained_snapshot_logical_payload_bytes"`
+	RetainedItemParentHints      int    `json:"retained_item_parent_hints"`
+	RetainedHintOrderEntries     int    `json:"retained_hint_order_entries"`
+	FixtureChildrenGenerated     uint64 `json:"fixture_children_generated"`
+	FixturePages                 uint64 `json:"fixture_pages"`
+	InitialRequests              uint64 `json:"initial_requests"`
+	InitialCacheMisses           uint64 `json:"initial_cache_misses"`
+	WarmCacheHits                uint64 `json:"warm_cache_hits"`
+	WarmRequests                 uint64 `json:"warm_requests"`
+	EvictedParents               int    `json:"evicted_parents"`
+	EvictedParentRefetched       bool   `json:"evicted_parent_refetched"`
+	ReloadRequests               uint64 `json:"reload_requests"`
+	ReloadPages                  uint64 `json:"reload_pages"`
+	HeapAllocBaselineAfterGC     uint64 `json:"heap_alloc_baseline_after_gc_bytes"`
+	HeapAllocAfterGC             uint64 `json:"heap_alloc_after_gc_bytes"`
+	RetainedHeapDelta            int64  `json:"retained_heap_delta_bytes"`
+	CumulativeAllocDelta         uint64 `json:"cumulative_alloc_bytes"`
+	RetainedHeapScope            string `json:"retained_heap_scope"`
+}
+
+func checkScalabilitySnapshot(t *testing.T, client *Client, parent string, entries int) {
+	t.Helper()
+	items, err := client.ListDir(context.Background(), parent)
+	if err != nil {
+		t.Fatalf("ListDir(%q): %v", parent, err)
+	}
+	if len(items) != entries {
+		t.Fatalf("ListDir(%q) returned %d entries, want %d", parent, len(items), entries)
+	}
+	if entries > 0 && (items[0].ID != scalabilityOccupancyID(parent, 0) || items[0].Name != scalabilityOccupancyName(parent, 0) || items[0].ParentID != parent || items[entries-1].ID != scalabilityOccupancyID(parent, entries-1) || items[entries-1].ParentID != parent) {
+		t.Fatalf("ListDir(%q) returned unexpected boundary metadata", parent)
+	}
+}
+
+func TestScalabilityPopulatedMetadataSnapshots(t *testing.T) {
+	cases := []struct {
+		entries   int
+		parents   int
+		optIn100k bool
+	}{
+		{entries: 1000, parents: metadataCacheMaxEntries + 1},
+		{entries: 10000, parents: 3},
+		{entries: 100000, parents: 2, optIn100k: true},
+	}
+	for _, testCase := range cases {
+		t.Run(strconv.Itoa(testCase.entries), func(t *testing.T) {
+			if testCase.optIn100k && os.Getenv("RCLONE_DEGOO_SCALE_TESTS") != "1" {
+				t.Skip("set RCLONE_DEGOO_SCALE_TESTS=1 for the 100,000-entry populated-snapshot measurement")
+			}
+
+			client, fixture := newScalabilityOccupancyClient(t, testCase.entries)
+			runtime.GC()
+			var baseline runtime.MemStats
+			runtime.ReadMemStats(&baseline)
+			before := client.RequestStats()
+			beforePages := fixture.pages.Load()
+			beforeChildren := fixture.children.Load()
+
+			for index := 0; index < testCase.parents; index++ {
+				parent := fmt.Sprintf("generated-parent-%03d", index)
+				checkScalabilitySnapshot(t, client, parent, testCase.entries)
+			}
+			afterInitial := client.RequestStats()
+			pagesPerSnapshot := uint64((testCase.entries + fixture.pageSize - 1) / fixture.pageSize)
+			wantInitialPages := uint64(testCase.parents) * pagesPerSnapshot
+			if got := afterInitial.HTTPRequests - before.HTTPRequests; got != wantInitialPages {
+				t.Fatalf("initial requests = %d, want %d", got, wantInitialPages)
+			}
+			if got := afterInitial.MetadataCacheMisses - before.MetadataCacheMisses; got != uint64(testCase.parents) {
+				t.Fatalf("initial cache misses = %d, want %d", got, testCase.parents)
+			}
+			if got := afterInitial.MetadataPages - before.MetadataPages; got != wantInitialPages || fixture.pages.Load()-beforePages != wantInitialPages {
+				t.Fatalf("initial metadata/fixture pages = %d/%d, want %d", afterInitial.MetadataPages-before.MetadataPages, fixture.pages.Load()-beforePages, wantInitialPages)
+			}
+			if got := fixture.children.Load() - beforeChildren; got != uint64(testCase.entries*testCase.parents) {
+				t.Fatalf("generated fixture children = %d, want %d", got, testCase.entries*testCase.parents)
+			}
+
+			client.metadataMu.Lock()
+			retainedParents := len(client.metadataCache)
+			retainedItems := 0
+			retainedIDs := make([]string, 0, retainedParents)
+			for parent, snapshot := range client.metadataCache {
+				retainedIDs = append(retainedIDs, parent)
+				if len(snapshot.items) != testCase.entries {
+					client.metadataMu.Unlock()
+					t.Fatalf("snapshot %q contains %d entries, want %d", parent, len(snapshot.items), testCase.entries)
+				}
+				retainedItems += len(snapshot.items)
+			}
+			retainedHints := len(client.itemParents)
+			retainedHintOrder := client.itemParentOrder.Len()
+			client.metadataMu.Unlock()
+			wantRetainedParents := min(testCase.parents, metadataCacheMaxEntries)
+			if retainedParents != wantRetainedParents || retainedItems != wantRetainedParents*testCase.entries {
+				t.Fatalf("populated snapshot occupancy = %d parents/%d items, want %d/%d", retainedParents, retainedItems, wantRetainedParents, wantRetainedParents*testCase.entries)
+			}
+			if retainedHints != min(testCase.entries*testCase.parents, itemParentCacheMaxEntries) || retainedHintOrder != retainedHints {
+				t.Fatalf("parent hint occupancy = %d/%d, want %d entries and order nodes", retainedHints, retainedHintOrder, min(testCase.entries*testCase.parents, itemParentCacheMaxEntries))
+			}
+
+			beforeWarm := client.RequestStats()
+			for _, parent := range retainedIDs {
+				checkScalabilitySnapshot(t, client, parent, testCase.entries)
+			}
+			afterWarm := client.RequestStats()
+			warmHits := afterWarm.MetadataCacheHits - beforeWarm.MetadataCacheHits
+			warmRequests := afterWarm.HTTPRequests - beforeWarm.HTTPRequests
+			if warmHits != uint64(retainedParents) || warmRequests != 0 || afterWarm.MetadataPages != beforeWarm.MetadataPages {
+				t.Fatalf("warm populated snapshots: hits=%d requests=%d pages=%d, want %d hits and no remote work", warmHits, warmRequests, afterWarm.MetadataPages-beforeWarm.MetadataPages, retainedParents)
+			}
+
+			evictedParents := testCase.parents - retainedParents
+			refetched := false
+			var reloadRequests, reloadPages uint64
+			if evictedParents > 0 {
+				retainedSet := make(map[string]struct{}, len(retainedIDs))
+				for _, parent := range retainedIDs {
+					retainedSet[parent] = struct{}{}
+				}
+				evictedParent := ""
+				for index := 0; index < testCase.parents; index++ {
+					candidate := fmt.Sprintf("generated-parent-%03d", index)
+					if _, ok := retainedSet[candidate]; !ok {
+						evictedParent = candidate
+						break
+					}
+				}
+				if evictedParent == "" {
+					t.Fatal("cache was over capacity but no requested parent was evicted")
+				}
+				beforeReload := client.RequestStats()
+				beforeReloadPages := fixture.pages.Load()
+				checkScalabilitySnapshot(t, client, evictedParent, testCase.entries)
+				afterReload := client.RequestStats()
+				reloadRequests = afterReload.HTTPRequests - beforeReload.HTTPRequests
+				reloadPages = afterReload.MetadataPages - beforeReload.MetadataPages
+				if afterReload.MetadataCacheMisses-beforeReload.MetadataCacheMisses != 1 || reloadRequests != pagesPerSnapshot || reloadPages != pagesPerSnapshot || fixture.pages.Load()-beforeReloadPages != pagesPerSnapshot {
+					t.Fatalf("evicted snapshot reload: misses=%d requests=%d pages=%d fixture_pages=%d, want one miss and %d requests/pages", afterReload.MetadataCacheMisses-beforeReload.MetadataCacheMisses, reloadRequests, reloadPages, fixture.pages.Load()-beforeReloadPages, pagesPerSnapshot)
+				}
+				checkScalabilitySnapshot(t, client, evictedParent, testCase.entries)
+				afterReloadWarm := client.RequestStats()
+				if afterReloadWarm.HTTPRequests != afterReload.HTTPRequests || afterReloadWarm.MetadataCacheHits-afterReload.MetadataCacheHits != 1 {
+					t.Fatal("reloaded populated snapshot did not produce a warm cache hit")
+				}
+				refetched = true
+			}
+
+			runtime.GC()
+			var afterGC runtime.MemStats
+			runtime.ReadMemStats(&afterGC)
+			runtime.KeepAlive(client)
+			runtime.KeepAlive(fixture)
+			client.metadataMu.Lock()
+			finalParents := len(client.metadataCache)
+			finalItems := 0
+			var snapshotItemArrayBytes, snapshotStringBytes uint64
+			for _, snapshot := range client.metadataCache {
+				finalItems += len(snapshot.items)
+				snapshotItemArrayBytes += uint64(cap(snapshot.items)) * uint64(unsafe.Sizeof(Item{}))
+				for _, item := range snapshot.items {
+					snapshotStringBytes += uint64(len(item.ID) + len(item.Name) + len(item.ParentID) + len(item.URL))
+				}
+			}
+			client.metadataMu.Unlock()
+			if finalParents != wantRetainedParents || finalItems != wantRetainedParents*testCase.entries {
+				t.Fatalf("final populated snapshot occupancy = %d parents/%d items, want %d/%d", finalParents, finalItems, wantRetainedParents, wantRetainedParents*testCase.entries)
+			}
+
+			evidence := scalabilityPopulatedSnapshotEvidence{
+				EntriesPerParent: testCase.entries, ParentsRequested: testCase.parents,
+				ConfiguredSnapshotBound: metadataCacheMaxEntries,
+				RetainedSnapshotParents: finalParents, RetainedSnapshotItems: finalItems,
+				SnapshotItemArrayBytes:       snapshotItemArrayBytes,
+				SnapshotStringBytes:          snapshotStringBytes,
+				RetainedSnapshotPayloadBytes: snapshotItemArrayBytes + snapshotStringBytes,
+				RetainedItemParentHints:      retainedHints, RetainedHintOrderEntries: retainedHintOrder,
+				FixtureChildrenGenerated: fixture.children.Load() - beforeChildren,
+				FixturePages:             fixture.pages.Load() - beforePages,
+				InitialRequests:          afterInitial.HTTPRequests - before.HTTPRequests,
+				InitialCacheMisses:       afterInitial.MetadataCacheMisses - before.MetadataCacheMisses,
+				WarmCacheHits:            warmHits, WarmRequests: warmRequests,
+				EvictedParents: evictedParents, EvictedParentRefetched: refetched,
+				ReloadRequests: reloadRequests, ReloadPages: reloadPages,
+				HeapAllocBaselineAfterGC: baseline.HeapAlloc, HeapAllocAfterGC: afterGC.HeapAlloc,
+				RetainedHeapDelta:    int64(afterGC.HeapAlloc) - int64(baseline.HeapAlloc),
+				CumulativeAllocDelta: afterGC.TotalAlloc - baseline.TotalAlloc,
+				RetainedHeapScope:    "whole API test-process heap delta after GC; includes cached snapshots, bounded parent hints, httptest server/transport, and test bookkeeping; not a cache-only size. Logical snapshot payload is separately computed as Item slice capacity times sizeof(Item), plus ID/Name/ParentID/URL string lengths; it is not exact allocated bytes and excludes size-class rounding, map overhead, and possible shared string backing.",
+			}
+			encoded, err := json.Marshal(evidence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Log(string(encoded))
+		})
+	}
 }

@@ -91,11 +91,12 @@ sequence. This adds repeated table walks during a large listing while holding
 the metadata mutex. It is a candidate for a focused bounded-cache improvement;
 this slice records the baseline without changing eviction behavior.
 
-No persistent path-to-ID index exists in this layout. The follow-up below
-measures post-GC retained heap and snapshot/hint occupancy. Peak metadata
-memory, memory with many populated parent snapshots, and persistent-index
-size for candidate designs remain unmeasured. Allocation counts cannot close
-that part of P1-FIXTURES.
+No production persistent path-to-ID index exists in this layout. The follow-up
+below
+measures post-GC retained heap and snapshot/hint occupancy. At that stage, peak
+metadata memory, populated-parent memory, and candidate
+persistent-index sizes were unmeasured. The later candidate and memory
+sections close the generated-fixture gap; allocation counts alone cannot do so.
 
 ## Operation tracing
 
@@ -172,16 +173,16 @@ repeat/duplicate cursor failures remain covered by the existing API tests.
 
 ## Remaining decision evidence
 
-P1-FIXTURES and P1-LOOKUP remain in progress. The follow-up below supplies
-retained-heap and occupancy measurements, paginated mutations, encrypted-stack
-traces, and direct-ID identity/error regressions. Peak metadata footprint,
-multiple populated parent snapshots, and live direct-ID failure/stability
-semantics remain unverified. Bounded local-index and remote-shard prototypes
-still need publication/rebuild counters. P1-RATELIMIT's controlled mock cases
-are complete. Live quota scope and numeric thresholds remain unknown.
-P1-DECISION must compare all three alternatives and record the format,
-writer/conflict policy, exposure, and reset consequences before P2/P3 format
-implementation.
+P1-FIXTURES is complete for generated evidence. The follow-ups below supply
+retained/sampled-peak heap, populated-snapshot occupancy, paginated and
+encrypted-stack traces, direct-ID regressions, and executable bounded
+persistent-ID/encrypted-node candidates. P1-LOOKUP remains in progress for live
+ID stability, deletion, and failure semantics. P1-RATELIMIT's controlled mock
+cases are complete; live quota scope and numeric thresholds remain unknown.
+P1-DECISION must settle provider publication/root discovery, physical placement,
+writer/conflict policy, retention/cleanup, stable directory IDs, and the format
+and reset consequences before P2/P3 format implementation. Test-model counters
+cannot establish provider guarantees.
 
 ## P1 follow-up: bounded parent-hint eviction and identity checks
 
@@ -204,7 +205,8 @@ On Linux amd64 / Go 1.26.0, cycling through 4,097 generated IDs with the table
 full measured 25,569 ns/op before and 202.4 ns/op after, in single local runs.
 The ordered implementation measured about 63 B/op and one allocation/op in
 that workload; the scan implementation measured zero. The unsaturated 65-ID
-refresh control measured 45.00 versus 48.84 ns/op and zero allocations. These are
+refresh control measured 45.00 versus 48.84 ns/op and zero allocations. These
+are
 local microbenchmarks, not provider latency claims. Tests cover eviction,
 refresh, removal/reinsertion, global clear, and stale mutation epochs.
 
@@ -255,9 +257,10 @@ snapshots, then observes 32 warm hits with zero requests. Accessing the oldest
 evicted parent makes one request and keeps occupancy at 32. A separate
 5,000-child paginated listing retains exactly 4,096 parent hints and 4,096
 order nodes; the oldest hint is evicted and the newest remains. This verifies
-entry-count bounds and eviction without claiming a total byte bound. Memory
-for 32 populated snapshots and peak local-index footprint remain unmeasured;
-P1-FIXTURES stays in progress.
+entry-count bounds and eviction without claiming a total byte bound. At that
+stage, memory for 32 populated snapshots and sampled peak
+footprint remained unmeasured. The later memory section supplies those
+measurements and closes P1-FIXTURES for generated data.
 
 ## P1 follow-up: paginated mutations and encrypted stack
 
@@ -332,3 +335,216 @@ ten-second metadata deadline. Cold full list measured 1.15 seconds, compared
 with 5.69 seconds in the first baseline. It still used 100 requests and
 16,606,086 JSON bytes. These single samples demonstrate the removed local CPU
 cost, not a bounded metadata hot path or a provider latency guarantee.
+
+## P1 candidate prototypes: persistent IDs and encrypted radix pages
+
+These are executable test-only experiments, not a new mount format. The
+persistent-ID prototype uses the actual generated GraphQL client. The remote
+index prototype uses a local encrypted object map with direct ID addressing;
+its counters are model object operations, not HTTP requests or measured Degoo
+behavior. Neither prototype is enabled by configuration or installed helpers.
+
+Reproduce the encrypted model, including the largest generated case:
+
+```sh
+RCLONE_CONFIG=/notfound RCLONE_DEGOO_SCALE_TESTS=1 \
+  go test ./backend/degoo \
+  -run
+'^TestScalability(EncryptedShardModel|ShardModelSplit|ShardModelFailure)$' \
+  -count=1 -v
+```
+
+The remote candidate uses HMAC-SHA256 logical keys, a radix of 16, at most
+64 records per leaf, at most 16 references per branch, and a 128 KiB encrypted
+node ceiling. AES-GCM encrypts the complete node, including names, keys, data
+IDs, and child references, with the model object ID authenticated as associated
+data. This is a generated-key experiment; production KDF, key separation,
+format headers, version/parent authentication, and rollback protection remain
+P3-FORMAT work. Its ID allocator is synthetic. Real opaque object names,
+placement, and provider-ID allocation are not modeled.
+
+The model bulk-builds the index once. Cold point access starts from a trusted
+root handle with no local metadata. An overwrite copies the leaf and its
+ancestors, leaving the previous root readable. Rename stages removal and
+insertion and keeps the data ID stable. A full rebuild starts with an empty
+result map and reads every reachable encrypted node, validating every recovered
+name-to-key mapping and the expected records. Rebuild reads exclude unreachable
+old or staged nodes. Root bootstrap and authentication are excluded.
+
+| Logical records | Initial nodes / encrypted bytes | Cold point reads / bytes | Overwrite reads / writes | Rename reads / writes | Full rebuild reads |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 126 / 152,182 | 2 / 8,734 | 2 / 2 | 4 / 4 | 126 |
+| 10,000 | 273 / 1,442,089 | 3 / 7,613 | 3 / 3 | 6 / 6 | 273 |
+| 100,000 | 4,369 / 14,553,865 | 4 / 4,220 | 4 / 4 | 8 / 8 | 4,369 |
+
+The maximum encrypted node in these three runs was 9,145 bytes. The
+1,000-record case splits some leaves at the threshold, so occupancy and object
+counts are not proportional to record count between these particular samples.
+Missing point lookup required 2/3/4 reads. The largest model lookup did not
+scan 100,000 siblings or rebuild the complete index. These are deterministic
+fixture counts; they establish no network latency or provider quota.
+
+A 64-to-65-record split used one read and 17 new objects totaling 9,545
+encrypted
+bytes for the generated key distribution. Failure is injected before every
+one of those writes and each ancestor write of a separate overwrite. The old
+root stays readable, and the number of unreachable successful staged writes
+is asserted. Tampered ciphertext, cross-ID ciphertext substitution, a missing
+node, an oversized record, and an overfull fully colliding hash path fail.
+These checks exercise local model ordering and authentication only.
+
+### Comparison and decision limits
+
+| Alternative | Evidence | Remaining limitation |
+| --- | --- | --- |
+| Smaller listing pages | Current layout needs 100 versus 1,000 calls at 100,000 siblings for ceilings of 1,000 versus 100 | Every cold point lookup still scans siblings; no live rate-limit improvement demonstrated |
+| Bounded persistent local IDs | Actual temporary files and generated direct-ID requests; see the local-index measurements below | Cache misses and refresh still need complete current-layout enumeration; cached IDs require freshness and identity checks |
+| Encrypted bounded radix pages | Cold point reads of 2/3/4 nodes and ancestor-only overwrite in this model | Trusted root discovery, remote atomic publication, data chunk/version records, physical bucket placement, cleanup, and concurrency remain unimplemented |
+
+The model supports investigating encrypted remote shards further: it bounds
+each metadata read and avoids a mandatory full rebuild on cold access. It
+also adds remote objects and write fan-out, and its bounded nodes do not bound
+physical provider-directory populations. Adaptive physical placement must
+bound all index, data, temporary, and marker directories separately. A plain
+map of all model objects is deliberately not evidence for P3-SHARDS.
+
+The root assignment is an in-process atomic operation assumed by the model.
+There is no tested Degoo compare-and-swap, atomic pointer replacement,
+cross-client lock, or publication marker protocol behind it. A future design
+must establish publication and conflict semantics using available provider
+operations, define a single-writer fencing policy if required, and handle
+ambiguous registration and root-update responses before exposing a complete
+version. A local process lock alone cannot exclude a second machine.
+
+The prototype retains old/staged objects. One interrupted attempt has bounded
+fan-out in these tests; repeated retries and historical roots grow the store
+without bound. A transaction inventory, retry identity, retention limit,
+split headroom under skewed keys, and remote garbage collection remain required.
+No claim of bounded orphan accumulation or crash-safe remote publication follows
+from these tests. No chunk data is uploaded or validated by the index model.
+Its simplified
+records contain only name, keyed lookup digest, and data ID; file sizes, times,
+version/chunk references, and transaction records are absent. Its byte totals
+cannot be compared as equivalent metadata coverage against full API listings.
+
+Names and index contents are encrypted. Object sizes/counts, access timing,
+and node traversal patterns remain observable; bucket topology could also be
+visible in a production placement scheme. Stable logical directory IDs are
+still to be evaluated so directory rename can change metadata without moving
+all descendant data. No production encryption format, reset, reseed, or
+migration policy is selected here. P1-DECISION remains open pending provider
+identity/publication evidence and a complete protocol comparison.
+
+### Sampled peak and populated-snapshot memory
+
+Reproduce in isolation, since concurrent heavy validation changes timing:
+
+```sh
+RCLONE_CONFIG=/notfound RCLONE_DEGOO_SCALE_TESTS=1 \
+  go test ./backend/degoo -run '^TestScalabilityRetainedMetadataMemory$' \
+  -count=1 -v
+RCLONE_CONFIG=/notfound RCLONE_DEGOO_SCALE_TESTS=1 \
+  go test ./backend/degoo/api -run
+'^TestScalabilityPopulatedMetadataSnapshots$' \
+  -count=1 -v
+```
+
+The cold-list sampler requests a process `HeapAlloc` sample every 500
+microseconds, including samples before and after the listing. Scheduling and
+`ReadMemStats` overhead affect the measurement. Observed maxima are lower
+bounds on a true instantaneous peak, not RSS or cache-only measurements. The
+fixture reports sample count, baseline, cumulative allocation, and retained
+heap separately. The post-GC measurements keep the client reachable and discard
+caller-owned result slices.
+
+| Children per parent | Sampled peak process heap | Post-GC process heap delta | Cold pages |
+| ---: | ---: | ---: | ---: |
+| 1,000 | about 4.00 MB | +0.25 MB | 1 |
+| 10,000 | about 9.94 MB | +2.44 MB | 10 |
+| 100,000 | about 66.98 MB | +19.01 MB | 100 |
+
+The populated-snapshot fixture uses distinct generated IDs per parent, so
+parent hints do not alias across snapshots. It asserts every snapshot's child
+count, exact pagination counters, warm reuse, and the 32-parent count limit.
+The 33-parent case also re-fetches an evicted populated snapshot. Production
+cache expiry and operation deadlines are preserved.
+
+| Children per parent | Requested / retained parents | Retained child records | Logical snapshot payload | Post-GC process heap delta |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 33 / 32 | 32,000 | 7.55 MB | +9.32 MB |
+| 10,000 | 3 / 3 | 30,000 | 7.08 MB | +8.37 MB |
+| 100,000 | 2 / 2 | 200,000 | 47.2 MB | +51.89 MB |
+
+MB here is decimal and rounded. Logical payload sums slice capacity times
+`sizeof(Item)` and the lengths of ID/name/parent/URL strings. It excludes
+allocator rounding, maps, hint/order nodes, and possible shared string backing;
+it must not be presented as exact allocated bytes. Process deltas include the
+HTTP fixture, transport, and test bookkeeping. The largest populated case made
+200 initial page requests and cumulatively allocated approximately 1.02 GB;
+that allocation count is neither a peak nor a retained amount.
+
+These measurements close the generated P1 memory-fixture gap. They demonstrate
+that a parent-count limit alone does not bound memory by bytes or child count.
+A production byte limit and selected-format index footprint remain P2-BOUNDS
+and P3 work. Results establish no live provider behavior.
+
+### Bounded persistent local-ID cache measurements
+
+```sh
+RCLONE_CONFIG=/notfound RCLONE_DEGOO_SCALE_TESTS=1 \
+  go test ./backend/degoo -run '^TestScalabilityPersistentLocalIndex' \
+  -count=1 -v
+```
+
+The test-only cache writes generated parent/name/ID records as JSONL beneath a
+private temporary directory, with a 512-entry and 16 KiB file-content bound.
+Byte eviction retains the last 192 fixture records in a 16,348-byte file at
+all three scales. It stores no download URL. Restart reparses that bounded
+file into memory. A hit makes one real generated `GetOverlay4` request and
+checks the returned ID, parent, and name; it does not scan siblings. The
+bounded cache rewrites its file on rebuild/invalidation, not on read hits.
+The old disposable file is removed before writing its replacement so a
+simultaneous old-plus-temporary file does not exceed the content-byte budget;
+this does not claim crash durability, filesystem-block accounting, or production
+cache path hardening.
+
+| Siblings | Cold pages / response bytes | Cold rebuild | Restart hit pages / direct reads / response bytes |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 1 / 166,056 | 13.7 ms | 0 / 1 / 190 |
+| 10,000 | 10 / 1,660,596 | 126.0 ms | 0 / 1 / 190 |
+| 100,000 | 100 / 16,606,086 | 1.159 s | 0 / 1 / 190 |
+
+Restart hit duration was approximately 0.23–0.27 ms in these isolated samples.
+Reopen parsing time is outside lookup timing. Cold rebuild includes the full
+paginated listing and bounded file rewrite. Peak transient memory still
+includes the backend's complete listing, even though the retained local ID
+cache is small. A cache size bound necessarily evicts other paths: the hit
+result cannot generalize to every path in an arbitrarily large vault.
+
+Regressions independently force entry eviction and byte eviction, verify
+mutation/refresh generation changes, and rebuild after missing
+or corrupt records. Deterministic concurrent-list/direct-read cases ensure an
+invalidation crossing an in-flight lookup returns a clear failure and cannot
+repopulate or return stale state. This is an explicit prototype invalidation
+hook, not production wiring to backend mutations. It invalidates the whole
+prototype cache, not a narrowly scoped production namespace.
+
+A direct-ID read cannot establish that a cached name is still the authoritative
+winner if another client replaces it under a different provider ID. No remote
+revision check or freshness lease is modeled. Direct-ID failures propagate;
+they do not silently trigger a fallback sibling scan. Provider stability,
+conflicts, ambiguous errors, and external mutation freshness remain decision
+inputs. This alternative speeds retained keys after a restart while leaving
+the current layout's O(N) cold enumeration and remote sibling growth intact.
+
+### Completed-operation counter ordering
+
+The final race run of the first attempt exposed an existing sampling race:
+`ListDirFresh` signaled its shared flight complete before recording its final
+parent-invalidation counter. A caller sampling immediately after delete could
+therefore observe three events instead of four. A deterministic API regression
+blocks post-completion cancellation; it failed before the fix with zero final
+invalidation events recorded. The worker now records that event before closing
+the completion channel, preserving exact operation-trace assertions. Cache
+invalidation itself, request counts, and cooldown policy are unchanged. The
+counter snapshot remains local-only.
