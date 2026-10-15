@@ -1,7 +1,7 @@
 # Degoo scalable storage plan and progress
 
 **Plan date:** 2026-10-15; **Planning status:** complete; **Implementation
-status:** in progress (P1 baseline fixtures and failure tests).
+status:** in progress (P1 evidence and backend correctness fixes).
 
 This durable tracker records evidence, open decisions, validation gates, and
 next steps for large directories and logical files above Degoo's reported
@@ -347,7 +347,7 @@ For each future task:
 - Owner: coordinating Codex agent, with delegated API-failure and lookup-trace
   test work. Delivery:
   [PR #43](https://github.com/georgeasiminei/rclone-degoo/pull/43), targeting
-  `staging` and awaiting the user's merge. No installed runtime or vault was
+  `staging` and merged on 2026-10-15. No installed runtime or vault was
   reset or modified; all requests went to generated localhost fixtures.
 - P1-FIXTURES now has generated 1,000-, 10,000-, and opt-in 100,000-entry
   correctness cases plus cold/warm lookup/list and direct-ID benchmarks.
@@ -380,3 +380,43 @@ For each future task:
   remote-index prototypes. P1-DECISION and all format/publication work remain
   unstarted. A local CPU cost also merits a focused follow-up: parent-hint
   eviction scans its full 4,096-entry table for every new item after saturation.
+
+### 2026-10-15 — P1 memory and encrypted-operation follow-up
+
+- Owner: coordinating Codex agent, with delegated retained-memory and
+  encrypted-operation test work. Delivery: evidencePR `TBD`, targeting
+  `staging` for the user's review and merge. This slice starts from merged
+  PR #43; no installed runtime, pending cache, or remote vault is modified.
+- P1-FIXTURES now records post-GC process heap deltas at 1,000/10,000/100,000
+  entries (about 0.28/2.45/19.0 MB), separately from cumulative allocation.
+  Occupancy checks retain 32 snapshots after 40 empty parents and 4,096
+  hints/order nodes after 5,000 children. Peak index memory and memory for
+  multiple populated snapshots remain unmeasured; this task stays in progress.
+- P1-LOOKUP now includes paginated create/overwrite/rename/delete with 1,005
+  siblings, and real chunker → crypt → Degoo full/range reads, overwrite,
+  rename, and delete. Direct-ID regressions reject empty/mismatched response
+  identities; missing and forbidden responses use no fallback listing.
+  Live opaque-ID stability/deletion/failure semantics remain unverified, so
+  the task stays in progress. See [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md)
+  for exact aggregate counters and the encrypted fixture's small tested scale.
+- Parent-hint eviction uses constant-time ordered map/list updates instead of
+  scanning 4,096 entries per insertion. The saturated insertion microbenchmark
+  measured 25,569 versus 202.4 ns/op. The 100,000-entry backend correctness
+  fixture passes under the existing deadline; cold full list measured 1.15 s
+  versus the recorded 5.69 s baseline, with the same 100 page requests.
+- The encrypted rename test exposed stale metadata on an updated object.
+  `Object.Update` now adopts confirmed publication metadata on success.
+  Operations pin synchronized version snapshots so a remove waiting on an
+  update cannot delete the replacement. Repeated-update, failed-update,
+  encrypted rename readback, and concurrent update/remove regressions pass.
+  Move revalidates its pinned source after acquiring path locks; a stale
+  source cannot issue move/rename mutations against a replaced object.
+- Validation passed: fresh build, credential-free repository-wide Go tests,
+  scoped race/vet/lint, 100,000-entry correctness and retained-memory fixtures,
+  occupancy and encrypted/paginated lifecycle tests, Markdown/links, and diff
+  checks. See [VALIDATION.md](VALIDATION.md) for commands and initial failures.
+- Next action: measure peak metadata/index footprint and multiple populated
+  snapshots; establish live direct-ID assumptions without probing through an
+  active cooldown; compare bounded persistent local-index and encrypted
+  remote-shard prototypes with lookup/update/publication/rebuild counters.
+  P1-DECISION and P2–P6 remain unstarted. No new format or reset is selected.

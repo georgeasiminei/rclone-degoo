@@ -385,7 +385,7 @@ func TestMetadataCacheRangesReuseFullObjectAcrossCacheInstances(t *testing.T) {
 	if len(changedContent) != len(content) {
 		t.Fatalf("test content lengths differ: %d and %d", len(changedContent), len(content))
 	}
-	changedObject := *obj.(*Object)
+	changedObject := obj.(*Object).snapshot()
 	changedObject.modTime = changedObject.modTime.Add(time.Second)
 	changedObject.createdTime = changedObject.createdTime.Add(time.Second)
 	mock.mu.Lock()

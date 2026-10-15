@@ -136,6 +136,7 @@ type Fs struct {
 
 // Object describes a file stored in Degoo.
 type Object struct {
+	mu          sync.RWMutex
 	fs          *Fs
 	remote      string
 	id          string
@@ -1334,6 +1335,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if !ok || !f.sameVault(srcObj.fs) {
 		return nil, fs.ErrorCantMove
 	}
+	srcObj = srcObj.snapshot()
 	if err := validateRemote(srcObj.remote); err != nil {
 		return nil, err
 	}
@@ -1354,6 +1356,13 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 	defer releasePaths()
+	current, err := f.NewObject(ctx, srcObj.remote)
+	if err != nil {
+		return nil, fmt.Errorf("degoo: inspect source before move: %w", err)
+	}
+	if current.(*Object).id != srcObj.id || current.(*Object).parentID != srcObj.parentID {
+		return nil, errors.New("degoo: move source changed; refusing to move a different version")
+	}
 	parentPath, dstLeaf := dircache.SplitPath(remote)
 	dstParentID, err := f.findDir(ctx, parentPath, true)
 	if err != nil {
@@ -1428,7 +1437,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 // Open opens the object, validating any requested byte range.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	return o.openCached(ctx, options...)
+	return o.snapshot().openCached(ctx, options...)
 }
 
 func (o *Object) openRemote(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
@@ -1528,6 +1537,7 @@ func (r *verifiedReadCloser) Read(p []byte) (int, error) {
 
 // Remove moves the object to Degoo's recycle bin.
 func (o *Object) Remove(ctx context.Context) error {
+	o = o.snapshot()
 	if err := validateRemote(o.remote); err != nil {
 		return err
 	}
@@ -1714,17 +1724,36 @@ func (f *Fs) waitForIDsGoneInDirs(ctx context.Context, parentIDs, ids []string, 
 
 // Update replaces the object only after its new encrypted bytes are uploaded and verified.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	if err := validateRemote(o.remote); err != nil {
+	previous := o.snapshot()
+	if err := validateRemote(previous.remote); err != nil {
 		return err
 	}
-	if o.remote == "" || o.id == o.fs.opt.RootFolderID {
+	if previous.remote == "" || previous.id == previous.fs.opt.RootFolderID {
 		return errors.New("degoo: refusing to replace the configured vault root")
 	}
-	if src.Remote() != o.remote {
+	if src.Remote() != previous.remote {
 		return errors.New("degoo: object update path does not match source path")
 	}
-	_, err := o.fs.uploadAndCommit(ctx, o.remote, o, in, src.Size())
-	return err
+	published, err := previous.fs.uploadAndCommit(ctx, previous.remote, previous, in, src.Size())
+	if err != nil {
+		return err
+	}
+	o.mu.Lock()
+	o.id, o.parentID, o.name = published.id, published.parentID, published.name
+	o.size, o.modTime, o.createdTime = published.size, published.modTime, published.createdTime
+	o.url, o.urlAt = published.url, published.urlAt
+	o.mu.Unlock()
+	return nil
+}
+
+// snapshot pins the observed version before waiting for path serialization.
+func (o *Object) snapshot() *Object {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return &Object{
+		fs: o.fs, remote: o.remote, id: o.id, parentID: o.parentID, name: o.name,
+		size: o.size, modTime: o.modTime, createdTime: o.createdTime, url: o.url, urlAt: o.urlAt,
+	}
 }
 
 func (f *Fs) uploadAndCommit(ctx context.Context, remote string, old *Object, in io.Reader, expectedSize int64) (*Object, error) {
@@ -2148,10 +2177,18 @@ func (o *Object) String() string { return o.remote }
 func (o *Object) Remote() string { return o.remote }
 
 // ModTime returns the provider modification time.
-func (o *Object) ModTime(context.Context) time.Time { return o.modTime }
+func (o *Object) ModTime(context.Context) time.Time {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.modTime
+}
 
 // Size returns the object size in bytes.
-func (o *Object) Size() int64 { return o.size }
+func (o *Object) Size() int64 {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.size
+}
 
 // Hash returns an error because Degoo's seeded prefix checksum is not an rclone hash.
 func (o *Object) Hash(context.Context, hash.Type) (string, error) { return "", hash.ErrUnsupported }
@@ -2160,10 +2197,18 @@ func (o *Object) Hash(context.Context, hash.Type) (string, error) { return "", h
 func (o *Object) Storable() bool { return true }
 
 // ID returns the provider ID of the object.
-func (o *Object) ID() string { return o.id }
+func (o *Object) ID() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.id
+}
 
 // ParentID returns the provider ID of the parent directory.
-func (o *Object) ParentID() string { return o.parentID }
+func (o *Object) ParentID() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.parentID
+}
 
 func (f *Fs) listDir(ctx context.Context, parentID string) ([]api.Item, error) {
 	var items []api.Item

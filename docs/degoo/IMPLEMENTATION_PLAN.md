@@ -6,7 +6,13 @@ redesign, stable task IDs, progress, and the next-session handoff. Its planning
 task authorized documentation only; the follow-up implementation request
 started P1 baseline fixtures, operation traces, and failure regressions. See
 [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for measurements and gaps.
-No new remote format has been selected or implemented. The user has
+The P1 follow-up measures retained heap and cache occupancy, traces paginated
+and encrypted operations, and removes the parent-hint eviction table scan.
+Direct-ID reads reject mismatched response identities. Successful object
+updates refresh their handles through synchronized metadata snapshots, fixing
+chunked rename readback while retaining concurrent stale-remove protection.
+These improvements
+do not select or implement a new remote format. The user has
 confirmed that current local pending uploads and remote Degoo contents are
 disposable pre-live tests. A necessary reset can replace legacy compatibility
 or migration work after advance notice; completing the existing upload queue

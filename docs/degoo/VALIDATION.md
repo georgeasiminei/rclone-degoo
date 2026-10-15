@@ -8,10 +8,66 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Scalable storage P1 follow-up — 2026-10-15
+
+The follow-up replaces full-table parent-hint eviction with ordered eviction,
+rejects direct-ID metadata with a different response identity, and adds
+retained-heap/occupancy measurements plus paginated and encrypted-stack traces.
+Delivery: evidencePR `TBD`, targeting `staging` for the user's review and merge.
+See [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for measured counters,
+reproduction commands, and memory-measurement limits.
+
+The initial full-suite attempt failed only the existing `cmd/degoo` socket
+fixtures: the private temporary prefix still made their Unix socket paths too
+long. That package passed with a shorter private disk-backed temporary path.
+Initial lint reported ineffective nil assignments in the memory fixture; they
+were removed because the result slices are unused before GC. Scoped vet and
+lint subsequently passed. An initial race run used the encrypted fixture's
+bare `128` chunk-size setting (128 KiB), which did not split its small input;
+the fixture uses explicit `128B` to exercise multiple encrypted chunks.
+The encrypted rename readback then exposed stale receiver metadata after a
+successful `Object.Update`. Refreshing that metadata also required preserving
+version snapshots for concurrent operations: the existing update/remove
+regression caught a race and replacement deletion in the initial fix. The
+final implementation synchronizes metadata access and pins each operation's
+observed version before path serialization. Review also identified that Move
+needed a post-lock source-version check: its regression failed before the
+check with stale-ID move/rename requests and passes with zero such mutations,
+retaining the replacement at its original path.
+
+Final validation passed:
+
+- Fresh `go build -o` to a temporary binary, with that binary on `PATH` for
+  the credential-free repository-wide `go test -timeout 20m ./...` run.
+  Both `TMPDIR` and `GOTMPDIR` used the short private disk-backed directory.
+- `RCLONE_CONFIG=/notfound go test -race ./backend/degoo/... -count=1`,
+  `go vet ./backend/degoo/...`, and
+  `golangci-lint run ./backend/degoo/...` (zero issues).
+- The opt-in `TestScalabilityDirectory` and
+  `TestScalabilityRetainedMetadataMemory` fixtures at 1,000, 10,000, and
+  100,000 entries; API snapshot/hint occupancy bounds; the saturated hint
+  insertion microbenchmark before and after the eviction change.
+- Paginated mutation traces with 1,005 siblings and the encrypted
+  chunker/crypt lifecycle with full and ranged reads, overwrite, rename
+  through its returned object, and deletion.
+- Direct-ID identity regressions (failed before the fix), repeated
+  object-update readback (failed before the fix), failed-update preservation,
+  stale-source Move rejection (failed before the check), and the existing
+  concurrent update/remove regression under the race detector.
+- Changed-document Markdown lint, 36 relative file links, and diff checks.
+
+P1-FIXTURES and P1-LOOKUP remain in progress for peak index/multi-parent memory
+and live direct-ID behavior. The design comparison and new remote format
+remain unstarted.
+
+No live Degoo requests, mount installation, data resets, pending-write deletion,
+or remote-format changes are part of this follow-up. The measurements do not
+establish live scalability, quotas, the object cap, or new-format readiness.
+
 ## Scalable storage P1 baseline — 2026-10-15
 
 Delivery: [PR #43](https://github.com/georgeasiminei/rclone-degoo/pull/43),
-targeting `staging` and awaiting the user's merge.
+targeting `staging` and merged on 2026-10-15.
 
 The first implementation slice adds generated directory fixtures at 1,000,
 10,000, and opt-in 100,000 entries, API-call/invalidation traces for file

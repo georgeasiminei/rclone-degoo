@@ -3,6 +3,7 @@ package api
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -178,7 +179,7 @@ type Client struct {
 	metadataParents    map[string]*metadataParentState
 	metadataFlights    map[metadataFlightKey]*metadataListCall
 	itemParents        map[string]itemParentEntry
-	itemParentSequence uint64
+	itemParentOrder    list.List
 	mutationEpoch      uint64
 
 	statsMu sync.Mutex
@@ -220,7 +221,7 @@ type metadataListCall struct {
 
 type itemParentEntry struct {
 	parentID string
-	sequence uint64
+	order    *list.Element
 }
 
 // UploadInfo describes one file for which Degoo should authorize storage upload.
@@ -475,7 +476,7 @@ func (c *Client) clearMetadataCacheLocked() {
 		}
 	}
 	c.itemParents = nil
-	c.itemParentSequence = 0
+	c.itemParentOrder.Init()
 	c.statsMu.Lock()
 	c.stats.MetadataGlobalInvalidations++
 	c.statsMu.Unlock()
@@ -702,19 +703,18 @@ func (c *Client) rememberItemParentLocked(item Item) {
 	if c.itemParents == nil {
 		c.itemParents = make(map[string]itemParentEntry)
 	}
-	c.itemParentSequence++
-	if _, exists := c.itemParents[item.ID]; !exists && len(c.itemParents) >= itemParentCacheMaxEntries {
-		oldestID := ""
-		oldestSequence := uint64(0)
-		for id, entry := range c.itemParents {
-			if oldestID == "" || entry.sequence < oldestSequence {
-				oldestID = id
-				oldestSequence = entry.sequence
-			}
-		}
-		delete(c.itemParents, oldestID)
+	if entry, exists := c.itemParents[item.ID]; exists {
+		entry.parentID = item.ParentID
+		c.itemParentOrder.MoveToBack(entry.order)
+		c.itemParents[item.ID] = entry
+		return
 	}
-	c.itemParents[item.ID] = itemParentEntry{parentID: item.ParentID, sequence: c.itemParentSequence}
+	if len(c.itemParents) >= itemParentCacheMaxEntries {
+		oldest := c.itemParentOrder.Front()
+		delete(c.itemParents, oldest.Value.(string))
+		c.itemParentOrder.Remove(oldest)
+	}
+	c.itemParents[item.ID] = itemParentEntry{parentID: item.ParentID, order: c.itemParentOrder.PushBack(item.ID)}
 }
 
 func (c *Client) rememberItemParent(item Item) {
@@ -755,7 +755,10 @@ func (c *Client) advanceMutationEpoch() {
 func (c *Client) forgetItemParents(ids []string) {
 	c.metadataMu.Lock()
 	for _, id := range ids {
-		delete(c.itemParents, id)
+		if entry, exists := c.itemParents[id]; exists {
+			c.itemParentOrder.Remove(entry.order)
+			delete(c.itemParents, id)
+		}
 	}
 	c.metadataMu.Unlock()
 }
@@ -1644,6 +1647,7 @@ func (c *Client) ListTrash(ctx context.Context, limit int) ([]Item, error) {
 }
 
 // GetItem returns fresh metadata for an item, including its short-lived URL.
+// Missing items and responses with a different ID return an Error.
 func (c *Client) GetItem(ctx context.Context, id string) (Item, error) {
 	mutationEpoch := c.mutationEpochSnapshot()
 	var response struct {
@@ -1655,6 +1659,9 @@ func (c *Client) GetItem(ctx context.Context, id string) (Item, error) {
 	}
 	if response.GetOverlay4 == nil {
 		return Item{}, &Error{operation: "GetOverlay4", message: fmt.Sprintf("item %q was not found", id)}
+	}
+	if response.GetOverlay4.ID == "" || response.GetOverlay4.ID != id {
+		return Item{}, &Error{operation: "GetOverlay4", message: "response item ID does not match the requested ID"}
 	}
 	c.rememberItemParentAtMutationEpoch(*response.GetOverlay4, mutationEpoch)
 	return *response.GetOverlay4, nil

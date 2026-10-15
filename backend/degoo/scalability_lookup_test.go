@@ -250,7 +250,7 @@ func TestScalabilityLookupTraceCreateOverwriteRenameDelete(t *testing.T) {
 		assertLookupTrace(t, trace, lookupTrace{
 			listCalls: 1,
 			stats: api.RequestStats{
-				MetadataCacheHits:             1,
+				MetadataCacheHits:             2,
 				MetadataCacheMisses:           1,
 				MetadataPages:                 1,
 				MetadataMutationInvalidations: 1,
