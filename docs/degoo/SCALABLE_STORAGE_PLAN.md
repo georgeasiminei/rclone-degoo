@@ -1,7 +1,7 @@
 # Degoo scalable storage plan and progress
 
 **Plan date:** 2026-10-15; **Planning status:** complete; **Implementation
-status:** in progress (P1 memory evidence and index candidate prototypes).
+status:** in progress (P1 lookup contracts and conditional publication decision).
 
 This durable tracker records evidence, open decisions, validation gates, and
 next steps for large directories and logical files above Degoo's reported
@@ -198,8 +198,10 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   Trace `NewObject`, chunk/manifest sibling discovery,
   create, overwrite, rename, and delete. Count listings and invalidations per
   operation. Verify direct provider lookup by opaque ID and establish its
-  failure semantics.
-- **P1-DECISION** — Status: `not started`; dependencies: P1-FIXTURES,
+  failure semantics. Offline error/cooldown contracts are covered; live
+  identity continuity remains unverified during the persisted hold until
+  2026-10-15 21:30:29 UTC. Re-read state before any later probe.
+- **P1-DECISION** — Status: `in progress`; dependencies: P1-FIXTURES,
   P1-RATELIMIT, P1-LOOKUP; evidencePR: `TBD`. Compare smaller pages, a bounded
   persistent local ID cache, and adaptive ciphertext buckets with an encrypted
   sharded remote index. Record the selected design, measured tradeoffs,
@@ -207,7 +209,10 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   protocol, writer/concurrency and conflict policy, and pre-go-live reset/reseed
   impact. Evaluate stable logical IDs so a directory rename need not rename or
   relocate every encrypted data object beneath it. Update
-  IMPLEMENTATION_PLAN.md before coding the selected format.
+  IMPLEMENTATION_PLAN.md before coding the selected format. The offline
+  comparison and conditional architecture are recorded in
+  [SCALABILITY_DECISION.md](SCALABILITY_DECISION.md); activation remains gated
+  on live direct-ID and authoritative root/fencing evidence.
 
 ### P2 — bound metadata hot paths
 
@@ -433,7 +438,7 @@ For each future task:
 - Owner: coordinating Codex agent, with delegated memory and persistent-ID
   fixtures. Branch: `feat/degoo-scalability-prototypes`, based on merged PR #44.
   Delivery: [PR #46](https://github.com/georgeasiminei/rclone-degoo/pull/46),
-  targeting `staging` and awaiting the user's merge. No installed runtime,
+  targeting `staging` and merged on 2026-10-15. No installed runtime,
   cache, credentials, or remote test state was changed.
 - P1-FIXTURES is complete for generated evidence: cold-list sampled heap peaks,
   populated snapshots, bounded persistent-ID disk occupancy, and encrypted
@@ -474,3 +479,54 @@ For each future task:
   [VALIDATION.md](VALIDATION.md) for exact commands and scope.
 - No reset/reseed was necessary. P2–P6 remain unstarted. The user merges this
   PR and removes its source branch under the fork's workflow.
+
+### 2026-10-15 — lookup contracts and conditional publication decision
+
+- Owner: coordinating Codex agent; delegated API-contract and publication-model
+  work. PR #46 is merged at `a4dcb1902`; both its commits and the shared
+  checkout's update-progress commits are ancestors of the fetched `staging`.
+  Work uses a separate worktree based on that integration commit; other
+  checkouts and branches are preserved.
+- P1-FIXTURES is complete for generated evidence from PR #46. P1-LOOKUP and
+  P1-DECISION are active. Inspect persisted provider cooldowns locally before
+  live access. Do not renew credentials or issue probes during a hold.
+- The implementation plan was updated before adding further test-only
+  publication experiments. They evaluate missing provider primitives and
+  bounded placement/cleanup, without selecting a production wire format.
+- Read-only local inspection found a persisted hold until 2026-10-15
+  21:30:29 UTC. No API request, token renewal/login, runtime installation,
+  cache change or reset was attempted. Re-read state in the next session;
+  another client may extend the deadline.
+- The offline comparison is complete in
+  [SCALABILITY_DECISION.md](SCALABILITY_DECISION.md). The conditional direction
+  is immutable encrypted remote shards, stable logical directory/file IDs,
+  recursive bounded allocation and an authoritative conditional root/fence.
+  The existing provider contracts do not establish that publication primitive.
+  P1-LOOKUP and P1-DECISION remain `in progress` for their provider gates;
+  a conditional decision is not permission to activate a new format.
+- Generated API tests cover cancellation/timeout, malformed/503, successful and
+  repeated HTTP 401, and persisted/reloaded direct-ID 429 without fallback
+  listings. Publication models distinguish identical lost-acknowledgement
+  traces, show why readback or CAS alone cannot fence a paused writer, retain
+  stable IDs across rename, and enforce finite staging/physical/cleanup bounds.
+  Metadata pins and cleanup are single-actor models, not remote GC evidence.
+- Placement measured 576 objects across 8,650 directory records with maximum
+  occupancy 16. This cost argues for further adaptive-placement experiments;
+  it does not select a production folder topology. Seven known metadata
+  orphans were deleted over seven bounded steps without removing pinned roots.
+- Validation passed: fresh build; credential-free repository-wide Go suite
+  (186 test packages, using the existing CI unreliable-network-test policy);
+  scoped backend/API/auth race, vet and lint; direct-ID/publication fixtures;
+  the opt-in 100,000-record encrypted index comparison; Markdown, relative
+  links, task IDs and staged diff checks. Earlier full attempts required a
+  shorter socket-test temporary path and encountered an upstream self-update
+  beta-download 404. See [VALIDATION.md](VALIDATION.md) for exact scope.
+- Delivery: this feature branch targets `staging`; the PR link is recorded
+  after opening. The user merges and removes its source branch.
+- Next action: after re-reading the provider hold, run bounded generated-vault
+  direct-ID continuity/deletion checks across fresh sessions. Discover and
+  verify a real authoritative publication/fencing mechanism, or revise the
+  conditional architecture. Continue offline allocator/intent/restart and
+  cleanup experiments if live access remains unavailable. Do not implement or
+  activate a production format on the model's assumed CAS primitive. P2–P6
+  remain unstarted; no reset/reseed was needed.

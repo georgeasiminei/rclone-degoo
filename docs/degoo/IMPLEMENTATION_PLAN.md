@@ -17,7 +17,9 @@ node traversal and copy-on-write fan-out; its root swap and direct-ID store
 are explicit model assumptions, not a provider publication protocol. Fresh-list
 completion records its final invalidation counter before waking callers so
 completed-operation traces cannot miss that event. These
-improvements do not select or implement a new remote format. The user has
+improvements do not implement a new remote format. The conditional architecture
+and its provider activation gates are recorded in
+[SCALABILITY_DECISION.md](SCALABILITY_DECISION.md). The user has
 confirmed that current local pending uploads and remote Degoo contents are
 disposable pre-live tests. A necessary reset can replace legacy compatibility
 or migration work after advance notice; completing the existing upload queue
@@ -59,6 +61,26 @@ lint checks, plus a localhost FUSE fixture; no live Degoo request or write was
 run for that follow-up. See [VALIDATION.md](VALIDATION.md).
 
 ## Implementation decisions and validation plan
+
+### Scalability publication decision experiments (2026-10-15)
+
+Before selecting or implementing a new format, extend P1 with test-only
+publication and placement experiments. Model immutable encrypted index roots,
+ambiguous publication acknowledgements, stale readback, writer epochs/CAS,
+stable logical directory IDs, recursive bounded placement, and inventory-based
+orphan cleanup. A modeled atomic or conditional root operation is an explicit
+assumption; the current Degoo API has no verified equivalent. Failure must
+preserve the previous complete root and pending local data. Cleanup must stop
+when publication or ownership is uncertain, and allocation must stop at its
+configured bound rather than silently grow a control directory or retry log.
+
+The existing mount and remote format remain unchanged during P1. Record the
+comparison, required provider primitives, activation gates, and reset/reseed
+consequences before any P3 production-format implementation. Offline evidence
+may support a conditional architecture choice; it cannot close live identity,
+publication, or fencing gates. The coordinating agent owns this decision and
+integration; delegated workers own independent API-contract and publication
+model fixtures. No runtime installation or reset is part of these experiments.
 
 ### Payload inventories across updater versions (2026-10-14)
 
@@ -294,12 +316,12 @@ while an indeterminate phase remains active. For package archive downloads where
 expected artifact or manifest sizes are known, the updater renders an adaptive
 real-time progress bar (or periodic progress milestones in non-interactive
 environments) showing percentage, transferred bytes, transfer rate, and ETA.
-Before downloading a changed full archive, it refuses an active-mount update when the
-updater or its calling shell is working inside the mount. The same check runs
-before mount preparation for local archives. A no-op remains allowed from the
-mount. The child process cannot change its parent shell's current directory, so
-the user must `cd` to the path named in the error, then retry. No prompt or
-forced/lazy unmount is used.
+Before downloading a changed full archive, it refuses an active-mount update
+when the updater or its calling shell is working inside the mount. The same
+check runs before mount preparation for local archives. A no-op remains
+allowed from the mount. The child process cannot change its parent shell's
+current directory, so the user must `cd` to the path named in the error, then
+retry. No prompt or forced/lazy unmount is used.
 
 For a mounted vault, the updater first calls the running client through its
 owner-private control socket to enter generic VFS maintenance. The barrier

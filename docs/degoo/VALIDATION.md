@@ -1,4 +1,4 @@
-# Degoo validation status — 2026-10-13
+# Degoo validation status — 2026-10-15
 
 Offline implementation checks are recorded separately from live acceptance.
 Live smoke checks passed against a dedicated disposable Degoo folder. A full
@@ -8,10 +8,75 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Scalable storage lookup and publication decision — 2026-10-15
+
+The work starts from fetched `origin/staging` at `a4dcb1902`, after confirming
+PR #46 is merged and both its commits are integration ancestors. The shared
+checkout's update-progress commits are also merged. Implementation uses a new
+isolated worktree; the shared checkout and other worktrees remain untouched.
+
+The implementation plan was updated before new test-only publication
+experiments. [SCALABILITY_DECISION.md](SCALABILITY_DECISION.md) records the
+conditional architecture, alternatives, observable metadata, publication and
+fencing assumptions, recursive placement, stable directory identity, cleanup,
+and exact provider activation gates. It selects no production wire format.
+The current mount and encryption stack are unchanged.
+
+Local read-only inspection found a persisted provider cooldown until
+**2026-10-15 21:30:29 UTC**. No live Degoo API call, authentication renewal/login,
+installed-runtime change, cache deletion, or test-vault reset occurred. No
+provider direct-ID stability, atomic root replacement, fencing, physical cap,
+or garbage-collection guarantee follows from the localhost/model fixtures.
+P1-LOOKUP and P1-DECISION remain open for their provider evidence gates.
+
+The new API tests cover direct-ID cancellation/transport timeout, malformed
+JSON, 503 with Retry-After, successful single HTTP 401 refresh, bounded repeated
+401, and persisted/reloaded 429 with zero token/API work while held. Existing
+null, forbidden, identity-mismatch and GraphQL-auth fixtures remain in use.
+Publication fixtures test identical lost acknowledgements before/after apply,
+CAS versus epoch fencing, bounded snapshot/staging admission, stable directory
+IDs, finite physical placement, and single-actor metadata orphan cleanup.
+[SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) records counters and limits.
+
+The first full-suite attempt failed four existing `cmd/degoo` socket fixtures
+because the temporary path was too long. Those tests passed with an eight-byte
+private temporary root. The next unrestricted full run passed `cmd/degoo` but
+failed the existing `cmd/selfupdate/TestInstallOnLinux`: the latest upstream
+beta archive returned HTTP 404. No updater code was changed. Final offline
+repository validation uses `CI=true`, the repository's existing
+`testy.SkipUnreliable` policy for network-dependent tests. This skips the
+unreliable self-update tests; it is not a successful external-download test.
+
+Final checks passed:
+
+- Fresh `go build -o` to a temporary binary, used on `PATH` for repository
+  tests. Runtime caches were isolated and temporary directories owner-private.
+- `CI=true RCLONE_CONFIG=/notfound go test -timeout 20m -count=1 ./...`:
+  186 test packages passed, using the short private `TMPDIR`/`GOTMPDIR`.
+- `RCLONE_CONFIG=/notfound go test -race ./backend/degoo/... -count=1`:
+  backend, API and authentication packages passed.
+- `go vet ./backend/degoo/...` and
+  `golangci-lint run ./backend/degoo/...`: passed with zero lint issues.
+- `RCLONE_CONFIG=/notfound go test ./backend/degoo/api -run '^TestGetItem'
+  -count=1 -v` and the three `TestScalabilityPublication` cases: passed.
+- `RCLONE_CONFIG=/notfound RCLONE_DEGOO_SCALE_TESTS=1 go test ./backend/degoo
+  -run '^TestScalabilityEncryptedShardModel$' -count=1 -v`: passed at
+  1,000, 10,000 and 100,000 records. This repeats the earlier index comparison;
+  no new provider or peak-memory measurement is claimed.
+- Changed-document Markdown lint, relative links, unique task IDs, and staged
+  diff checks passed.
+
+The first publication-model attempt found a nil placement-parent map;
+preflight was corrected. Review then added truly identical unapplied/applied
+lost-acknowledgement errors, staging refusal under unknown state, independent
+CAS/fence checks, and retention of orphan reservations with unknown paths.
+All final checks above include these corrections. No live backend integration,
+new-format mounted recovery, or live large-file acceptance was run.
+
 ## Scalable storage P1 memory and candidate prototypes — 2026-10-15
 
 Delivery: [PR #46](https://github.com/georgeasiminei/rclone-degoo/pull/46),
-targeting `staging` and awaiting the user's merge.
+targeting `staging` and merged on 2026-10-15.
 
 This slice completes generated P1-FIXTURES measurements and adds test-only
 persistent-ID and encrypted radix-index candidates. It changes no production
