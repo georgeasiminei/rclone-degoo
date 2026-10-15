@@ -8,6 +8,32 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Live selective rate-limit investigation — 2026-10-15
+
+The [incident record](RATE_LIMIT_INVESTIGATION.md) preserves the earlier live
+diagnostics and their limits; this documentation update makes no new provider
+requests and does not rerun the incident. At inspection, the mounted service
+was active but native `ls` returned `EIO`; 78 local writes totaling
+33,286,847,218 bytes (about 31.0 GiB) were queued for retry with no active
+uploads. Cache-volume space was available. A saved global API cooldown held
+the client until `2026-10-15 21:30:29 UTC` (`2026-10-16 00:30:29 EEST`).
+
+The user reported working Windows-browser listing, download, and test upload
+on the same LAN during that hold. Independent same-account listing replays
+from Linux returned HTTP 200 before the deadline, including HTTP/1.1 and
+minimal-header controls. Other listing requests returned 429, including a
+second page after a successful 1,000-entry page. Smaller browser-style pages
+also failed on a later attempt. Linux web requests additionally exposed the
+service-worker/CORS path that can mask a network failure as an empty 504.
+
+This establishes selective request outcomes and the client's broader local
+hold, not an account-wide ban, a reliable page-size remedy, or a known quota.
+No complete affected-directory listing, independent cloud audit, or resumed
+upload was established. No mount restart, cache reset, installed-account
+authentication change, or remote mutation occurred in that investigation.
+The exact comparison matrix, retry headers, and unresolved causes are in the
+incident record; offline scalability fixtures remain separate evidence.
+
 ## Scalable storage lookup and publication decision — 2026-10-15
 
 Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
