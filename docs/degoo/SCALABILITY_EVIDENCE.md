@@ -794,6 +794,10 @@ not proof that provider-assigned locators can be durably discovered or recovered
 
 ## Production snapshot admission and indexed warm lookup
 
+Delivery: [PR #50](https://github.com/georgeasiminei/rclone-degoo/pull/50),
+targeting `staging`; merging remains with the user. Implementation commit:
+`be976e776`.
+
 This P2 increment starts from merged PR #49 at `a0115f690`. It changes the
 existing backend without introducing a remote format, provider operation or
 runtime deployment. The full scalable-storage plan remains active. Cooldown

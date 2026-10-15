@@ -228,14 +228,18 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 ### P2 — bound metadata hot paths
 
 - **P2-HOTPATH** — Status: `in progress`; dependencies: P1-DECISION;
-  evidencePR: `TBD`. Implement the selected lookup path, including direct ID
+  evidencePR:
+  [#50](https://github.com/georgeasiminei/rclone-degoo/pull/50).
+  Implement the selected lookup path, including direct ID
   reads where available and narrowly scoped cache invalidation. Compare
   before/after API-call counters for stat, open, create, overwrite, rename,
   delete, and refresh. Existing-format lookup improvements may start here;
   integration using the new remote index also depends on P3-FORMAT and
   P3-SHARDS. Phase numbers do not require P2 to finish before P3 starts.
 - **P2-BOUNDS** — Status: `in progress`; dependencies: P2-HOTPATH;
-  evidencePR: `TBD`. Bound cache entries and memory, verify complete paginated
+  evidencePR:
+  [#50](https://github.com/georgeasiminei/rclone-degoo/pull/50).
+  Bound cache entries and memory, verify complete paginated
   listing above 1,000 children, and assert that a known-path lookup does not
   grow linearly with sibling count after cache warmup. For the selected indexed
   format, also verify cold point lookup traverses bounded index pages without
@@ -602,6 +606,10 @@ implementation commit `4af0011c8`. The user merges and removes the source branch
   allocation namespace evolution without assuming provider CAS.
 
 ### 2026-10-15 — full-plan goal and existing-format P2 implementation
+
+Delivery: [PR #50](https://github.com/georgeasiminei/rclone-degoo/pull/50),
+targeting `staging`; merging remains with the user. Implementation commit:
+`be976e776`.
 
 - The user set the active goal to finish the full scalable storage plan. This
   is not a go-live statement or permission to merge PRs on the user's behalf.

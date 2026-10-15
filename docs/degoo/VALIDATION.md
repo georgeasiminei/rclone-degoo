@@ -36,6 +36,10 @@ incident record; offline scalability fixtures remain separate evidence.
 
 ## Production metadata bounds and indexed warm lookup — 2026-10-15
 
+Delivery: [PR #50](https://github.com/georgeasiminei/rclone-degoo/pull/50),
+targeting `staging`; merging remains with the user. Implementation commit:
+`be976e776`.
+
 This increment rebases the preserved partial P2 work onto merged PR #49 at
 `a0115f690`. It changes the existing backend's snapshot admission and warm name
 lookup, without a new provider operation, remote format, installed-runtime
