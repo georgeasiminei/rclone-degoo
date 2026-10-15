@@ -1,7 +1,7 @@
 # Degoo scalable storage plan and progress
 
 **Plan date:** 2026-10-15; **Planning status:** complete; **Implementation
-status:** in progress (P1 evidence and backend correctness fixes).
+status:** in progress (P1 memory evidence and index candidate prototypes).
 
 This durable tracker records evidence, open decisions, validation gates, and
 next steps for large directories and logical files above Degoo's reported
@@ -174,13 +174,17 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 
 **Gate:** Reproducible counters and a written design comparison.
 
-- **P1-FIXTURES** — Status: `in progress`; dependencies: P0-DOC; evidencePR:
+- **P1-FIXTURES** — Status: `complete`; dependencies: P0-DOC; evidencePR:
   [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43),
-  [#44](https://github.com/georgeasiminei/rclone-degoo/pull/44). Add generated
+  [#44](https://github.com/georgeasiminei/rclone-degoo/pull/44),
+  [#46](https://github.com/georgeasiminei/rclone-degoo/pull/46). Add generated
   directory/object fixtures at increasing sizes,
   including 1,000, 10,000, and 100,000 entries. Record remote/API calls, page
   count, bytes, cache hits, cold and warm lookup latency, full-list latency,
-  and peak local index size. Do not use private vault names or account data.
+  and peak local index size. Generated sampled-peak/multiple-parent memory
+  and bounded persistent-ID/encrypted-node prototypes now supply these
+  measurements; sampled heap peaks are lower bounds, not strict memory caps.
+  Do not use private vault names or account data.
 - **P1-RATELIMIT** — Status: `complete`; dependencies: P0-DOC; evidencePR:
   [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43). Add controlled
   mock cases for first-page success followed by later
@@ -388,7 +392,7 @@ For each future task:
 - Owner: coordinating Codex agent, with delegated retained-memory and
   encrypted-operation test work. Delivery:
   [PR #44](https://github.com/georgeasiminei/rclone-degoo/pull/44), targeting
-  `staging` and awaiting the user's merge. This slice starts from merged
+  `staging` and merged on 2026-10-15. This slice starts from merged
   PR #43; no installed runtime, pending cache, or remote vault is modified.
 - P1-FIXTURES now records post-GC process heap deltas at 1,000/10,000/100,000
   entries (about 0.28/2.45/19.0 MB), separately from cumulative allocation.
@@ -423,3 +427,50 @@ For each future task:
   active cooldown; compare bounded persistent local-index and encrypted
   remote-shard prototypes with lookup/update/publication/rebuild counters.
   P1-DECISION and P2–P6 remain unstarted. No new format or reset is selected.
+
+### 2026-10-15 — P1 memory completion and executable index candidates
+
+- Owner: coordinating Codex agent, with delegated memory and persistent-ID
+  fixtures. Branch: `feat/degoo-scalability-prototypes`, based on merged PR #44.
+  Delivery: [PR #46](https://github.com/georgeasiminei/rclone-degoo/pull/46),
+  targeting `staging` and awaiting the user's merge. No installed runtime,
+  cache, credentials, or remote test state was changed.
+- P1-FIXTURES is complete for generated evidence: cold-list sampled heap peaks,
+  populated snapshots, bounded persistent-ID disk occupancy, and encrypted
+  radix-node lookup/update/rebuild counters are reproducible. Samples are
+  qualified lower bounds; no strict production memory ceiling is established.
+- At 100,000 siblings, two populated API snapshots retain 200,000 records,
+  about 47.2 MB logical payload and a +51.89 MB post-GC process heap delta.
+  The backend cold-list sample reaches about 66.98 MB process heap. The
+  parent-count bound therefore remains insufficient as a byte bound.
+- The test-only encrypted radix model uses 4 cold node reads and 4 copied
+  nodes for an overwrite at 100,000 records; full rebuild reads 4,369 nodes.
+  Encryption/integrity and interrupted split/overwrite checks pass locally.
+  The assumed root swap and direct-ID map do not prove provider publication,
+  fencing, root discovery, physical directory bounds, or orphan cleanup.
+- The persistent-ID prototype provides an actual bounded on-disk cache with
+  restart hits, direct-ID revalidation, eviction, invalidation, and recovery
+  from missing/corrupt cache state. Cold misses still enumerate all siblings.
+  See [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for the comparison,
+  measurements, assumptions, and exact reproduction commands.
+- P1-LOOKUP stays in progress for live direct-ID stability, deletion, and
+  failure semantics. P1-DECISION stays open; no production format is selected.
+  Next action: establish provider direct-ID and publication/root-selection
+  behavior with bounded generated-vault probes after checking the persisted
+  cooldown, then complete the decision record. If live access is unavailable,
+  continue offline root-publication and bounded physical-placement experiments
+  without representing their assumptions as provider guarantees. Define writer
+  fencing, recovery/cleanup limits, and stable directory IDs before P3.
+- A deterministic regression reproduces an invalidation-counter ordering race:
+  fresh-list completion woke callers before its final counter update. The
+  event is recorded before completion, retaining exact trace assertions.
+- Validation passed: fresh build, credential-free repository-wide Go suite,
+  scoped race/vet/lint, isolated opt-in 100,000-entry candidate and memory
+  fixtures, Markdown lint, 39 relative links, and staged diff checks. The
+  initial race attempt exposed the counter-ordering regression above; the
+  initial full-suite attempt required a shorter Unix-socket temporary path.
+  Final build/full/race/vet/lint ran against restored sources in an isolated
+  worktree after concurrent work changed the shared checkout. See
+  [VALIDATION.md](VALIDATION.md) for exact commands and scope.
+- No reset/reseed was necessary. P2–P6 remain unstarted. The user merges this
+  PR and removes its source branch under the fork's workflow.

@@ -29,9 +29,55 @@ type scalabilityMemoryEvidence struct {
 	CumulativeMallocs             uint64 `json:"cumulative_mallocs_during_cold_list"`
 	RetainedHeapObjectsDelta      int64  `json:"retained_heap_objects_delta"`
 	RetainedHeapScope             string `json:"retained_heap_scope"`
-	PeakHeapMeasured              bool   `json:"peak_heap_measured"`
+	SampledPeakHeapAllocBytes     uint64 `json:"sampled_peak_heap_alloc_bytes_during_cold_list"`
+	SampledPeakHeapDeltaBytes     int64  `json:"sampled_peak_heap_delta_bytes_during_cold_list"`
+	HeapSamples                   uint64 `json:"heap_samples_during_cold_list"`
+	HeapSampleIntervalNS          int64  `json:"heap_sample_interval_ns"`
+	SampledPeakHeapScope          string `json:"sampled_peak_heap_scope"`
 	WarmCacheHits                 uint64 `json:"warm_cache_hits"`
 	WarmRequests                  uint64 `json:"warm_requests"`
+}
+
+type sampledHeapPeak struct {
+	allocBytes uint64
+	samples    uint64
+}
+
+// startSampledHeapPeak records process HeapAlloc periodically until stopped.
+func startSampledHeapPeak(interval time.Duration) func() sampledHeapPeak {
+	stop := make(chan struct{})
+	ready := make(chan struct{})
+	done := make(chan sampledHeapPeak, 1)
+	go func() {
+		var peak sampledHeapPeak
+		sample := func() {
+			var stats runtime.MemStats
+			runtime.ReadMemStats(&stats)
+			if stats.HeapAlloc > peak.allocBytes {
+				peak.allocBytes = stats.HeapAlloc
+			}
+			peak.samples++
+		}
+		sample()
+		close(ready)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sample()
+			case <-stop:
+				sample()
+				done <- peak
+				return
+			}
+		}
+	}()
+	<-ready
+	return func() sampledHeapPeak {
+		close(stop)
+		return <-done
+	}
 }
 
 func TestScalabilityRetainedMetadataMemory(t *testing.T) {
@@ -56,9 +102,12 @@ func TestScalabilityRetainedMetadataMemory(t *testing.T) {
 			bytesBefore := fixture.bytes.Load()
 			pagesBefore := fixture.pages.Load()
 
+			const sampleInterval = 500 * time.Microsecond
+			stopHeapSampler := startSampledHeapPeak(sampleInterval)
 			started := time.Now()
 			items, err := f.api.ListDir(ctx, "vault")
 			elapsed := time.Since(started)
+			sampledPeak := stopHeapSampler()
 			if err != nil {
 				t.Fatalf("cold directory listing: %v", err)
 			}
@@ -103,10 +152,17 @@ func TestScalabilityRetainedMetadataMemory(t *testing.T) {
 				HeapAllocAfterGCBytes:  afterGC.HeapAlloc,
 				RetainedHeapDeltaBytes: int64(afterGC.HeapAlloc) - int64(before.HeapAlloc),
 				CumulativeAllocBytes:   allocBytes, CumulativeMallocs: allocs,
-				RetainedHeapObjectsDelta: int64(afterGC.HeapObjects) - int64(before.HeapObjects),
-				RetainedHeapScope:        "whole test-process heap delta after GC; includes the live fixture, HTTP transport, and test bookkeeping",
-				PeakHeapMeasured:         false,
-				WarmCacheHits:            warmHits, WarmRequests: warmRequests,
+				RetainedHeapObjectsDelta:  int64(afterGC.HeapObjects) - int64(before.HeapObjects),
+				RetainedHeapScope:         "whole test-process heap delta after GC; includes the live fixture, HTTP transport, and test bookkeeping",
+				SampledPeakHeapAllocBytes: sampledPeak.allocBytes,
+				SampledPeakHeapDeltaBytes: int64(sampledPeak.allocBytes) - int64(before.HeapAlloc),
+				HeapSamples:               sampledPeak.samples,
+				HeapSampleIntervalNS:      sampleInterval.Nanoseconds(),
+				SampledPeakHeapScope:      "sampled lower bound on whole test-process HeapAlloc during cold listing, including the live fixture, HTTP transport, and test bookkeeping; 500us polling can miss transient peaks and does not measure RSS or cache-only bytes",
+				WarmCacheHits:             warmHits, WarmRequests: warmRequests,
+			}
+			if sampledPeak.samples < 2 || sampledPeak.allocBytes < before.HeapAlloc {
+				t.Fatalf("sampled heap peak = %+v, baseline heap = %d; want at least two samples and a peak no lower than baseline", sampledPeak, before.HeapAlloc)
 			}
 			encoded, err := json.Marshal(evidence)
 			if err != nil {

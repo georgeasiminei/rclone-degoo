@@ -1513,6 +1513,7 @@ func (c *Client) runMetadataListCall(key metadataFlightKey, call *metadataListCa
 	if key.fresh {
 		// Fresh reads are always invalidating reads, including failed reads.
 		c.invalidateParentLocked(key.parentID)
+		c.recordParentInvalidation()
 	}
 	if c.metadataFlights[key] == call {
 		delete(c.metadataFlights, key)
@@ -1527,9 +1528,6 @@ func (c *Client) runMetadataListCall(key metadataFlightKey, call *metadataListCa
 	close(call.done)
 	c.metadataMu.Unlock()
 	call.cancel()
-	if key.fresh {
-		c.recordParentInvalidation()
-	}
 }
 
 func (c *Client) listDirUncached(ctx context.Context, parentID string) ([]Item, error) {

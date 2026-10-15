@@ -11,8 +11,13 @@ and encrypted operations, and removes the parent-hint eviction table scan.
 Direct-ID reads reject mismatched response identities. Successful object
 updates refresh their handles through synchronized metadata snapshots, fixing
 chunked rename readback while retaining concurrent stale-remove protection.
-These improvements
-do not select or implement a new remote format. The user has
+P1 now also includes sampled peak/multiple-parent memory fixtures and test-only
+persistent-ID and encrypted radix-index candidates. The latter measures bounded
+node traversal and copy-on-write fan-out; its root swap and direct-ID store
+are explicit model assumptions, not a provider publication protocol. Fresh-list
+completion records its final invalidation counter before waking callers so
+completed-operation traces cannot miss that event. These
+improvements do not select or implement a new remote format. The user has
 confirmed that current local pending uploads and remote Degoo contents are
 disposable pre-live tests. A necessary reset can replace legacy compatibility
 or migration work after advance notice; completing the existing upload queue
