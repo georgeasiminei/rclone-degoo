@@ -3,8 +3,10 @@
 import hashlib
 import io
 import json
+import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -865,6 +867,198 @@ class ProgressTest(unittest.TestCase):
             self.assertTrue(all("Downloading archive: still working" in line for line in lines))
             self.assertTrue(all("elapsed" in line for line in lines))
             self.assertEqual(len(lines), count)
+
+
+class DownloadProgressTest(unittest.TestCase):
+    def test_format_bytes(self):
+        self.assertEqual(update.format_bytes(0), "0 B")
+        self.assertEqual(update.format_bytes(-5), "0 B")
+        self.assertEqual(update.format_bytes(500), "500 B")
+        self.assertEqual(update.format_bytes(1024), "1.0 KiB")
+        self.assertEqual(update.format_bytes(1536), "1.5 KiB")
+        self.assertEqual(update.format_bytes(1024 * 1024), "1.0 MiB")
+        self.assertEqual(update.format_bytes(63.6 * 1024 * 1024), "63.6 MiB")
+        self.assertEqual(update.format_bytes(2.5 * 1024 * 1024 * 1024), "2.5 GiB")
+
+    def test_format_sizes(self):
+        self.assertEqual(update.format_sizes(0, 1024), "0 B/1.0 KiB")
+        self.assertEqual(update.format_sizes(1024 * 1024, 2 * 1024 * 1024), "1.0/2.0 MiB")
+        self.assertEqual(update.format_sizes(int(30.5 * 1024 * 1024), int(63.6 * 1024 * 1024)), "30.5/63.6 MiB")
+
+    def test_format_rate(self):
+        self.assertEqual(update.format_rate(0), "0 B/s")
+        self.assertEqual(update.format_rate(-10), "0 B/s")
+        self.assertEqual(update.format_rate(1024 * 1024), "1.0 MiB/s")
+
+    def test_format_eta(self):
+        self.assertEqual(update.format_eta(None), "--")
+        self.assertEqual(update.format_eta(-1), "--")
+        self.assertEqual(update.format_eta(0), "--")
+        self.assertEqual(update.format_eta(float("inf")), "--")
+        self.assertEqual(update.format_eta(45), "45s")
+        self.assertEqual(update.format_eta(75), "1m 15s")
+        self.assertEqual(update.format_eta(3665), "1h 01m")
+
+    def test_render_progress_respects_column_constraints(self):
+        total = 60 * 1024 * 1024
+        cur = 30 * 1024 * 1024
+        rate = 1.5 * 1024 * 1024
+        for cols in (40, 60, 80, 100, 120):
+            with self.subTest(cols=cols):
+                line = update.render_progress("Downloading package archive", cur, total, rate, 20.0, cols)
+                self.assertLessEqual(len(line), cols)
+                self.assertIn("50%", line)
+
+    def test_render_progress_includes_eta_at_80_columns(self):
+        total = int(63.6 * 1024 * 1024)
+        cur = int(28.6 * 1024 * 1024)
+        rate = int(1.2 * 1024 * 1024)
+        line = update.render_progress("Downloading package archive", cur, total, rate, 29.0, 80)
+        self.assertLessEqual(len(line), 80)
+        self.assertIn("ETA", line)
+        self.assertIn("44%", line)
+
+    def test_render_progress_without_total_bytes(self):
+        line = update.render_progress("Downloading package archive", 1024 * 1024, None, 512 * 1024, None, 80)
+        self.assertIn("1.0 MiB", line)
+        self.assertIn("512.0 KiB/s", line)
+
+    def test_download_progress_tracker_non_tty_periodic_emissions(self):
+        from unittest import mock
+        lines = []
+        total = 1000
+        with mock.patch("builtins.print", side_effect=lambda msg, **kwargs: lines.append(msg)):
+            tracker = update.download_progress("Downloading package archive", total, is_tty=False)
+            tracker.started_at = 100.0
+            tracker.last_print_time = 100.0
+            tracker.update_bytes(200)
+            tracker._tick(now=101.0)
+            tracker.update_bytes(500)
+            tracker._tick(now=102.0)
+        self.assertTrue(any("20%" in line for line in lines))
+        self.assertTrue(any("50%" in line for line in lines))
+
+    def test_download_progress_tracker_non_tty_heartbeat_and_final_line(self):
+        from unittest import mock
+        lines = []
+        with mock.patch("builtins.print", side_effect=lambda msg, **kwargs: lines.append(msg)):
+            with update.download_progress("Downloading package archive", 1000, is_tty=False) as tracker:
+                tracker.started_at = 100.0
+                tracker.last_print_time = 100.0
+                # Stalled at 0 bytes after 10 seconds: must emit heartbeat
+                tracker._tick(now=111.0)
+                tracker.update_bytes(1000)
+        self.assertTrue(any("still working (11s elapsed)" in line for line in lines))
+        self.assertTrue(any("100%" in line for line in lines))
+
+    def test_download_progress_tracker_tty_final_line(self):
+        import io
+        from unittest import mock
+        buf = io.StringIO()
+        total = 2048
+        with mock.patch("sys.stdout", buf):
+            with update.download_progress("Downloading package archive", total, is_tty=True) as tracker:
+                tracker.update_bytes(2048)
+        output = buf.getvalue()
+        self.assertIn("100%", output)
+        self.assertTrue(output.endswith("\n"))
+
+    def test_download_progress_tracker_exception_cleans_up(self):
+        import io
+        from unittest import mock
+        buf = io.StringIO()
+        with self.assertRaises(RuntimeError):
+            with mock.patch("sys.stdout", buf):
+                with update.download_progress("Downloading package archive", 1000, is_tty=True) as tracker:
+                    tracker.last_line_len = 15
+                    raise RuntimeError("interrupted")
+        output = buf.getvalue()
+        self.assertTrue(output.endswith("\n"))
+
+    def test_actions_source_records_artifact_size_and_binds_total_bytes(self):
+        from unittest import mock
+        run = {"id": 42, "head_branch": "staging", "head_sha": "a" * 40, "status": "completed", "conclusion": "success"}
+        artifacts = [
+            {"name": update.UPDATE_ARTIFACT_NAME, "expired": False},
+            {"name": update.ARTIFACT_NAME, "size_in_bytes": 54321, "expired": False},
+        ]
+        source = update.ActionsSource()
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            def fake_run(args, **kwargs):
+                if args[0] == "api" and "/artifacts" in args[1]:
+                    return json.dumps({"artifacts": artifacts}).encode()
+                elif args[0] == "api" and "/workflows/" in args[1]:
+                    return json.dumps({"workflow_runs": [run]}).encode()
+                elif update.UPDATE_ARTIFACT_NAME in args:
+                    (target / "metadata" / update.UPDATE_MANIFEST_NAME).write_text(json.dumps({
+                        "version": 1, "archive": update.ARCHIVE_NAME, "archive_sha256": "b" * 64,
+                        "archive_size": 12345, "binary_sha256": "c" * 64, "payload_sha256": "d" * 64,
+                        "commit": "a" * 40, "source_dirty": False
+                    }))
+                    (target / "metadata" / (update.ARCHIVE_NAME + ".sha256")).write_text(f"{'b' * 64}  {update.ARCHIVE_NAME}\n")
+                else:
+                    (target / update.ARCHIVE_NAME).write_bytes(b"data")
+                return b""
+
+            with mock.patch.object(update.ActionsSource, "_run", side_effect=fake_run) as run_mock, \
+                    mock.patch.object(update, "installed_matches", return_value=False), \
+                    mock.patch.object(update.installer, "load_manifest", return_value={}), \
+                    mock.patch.object(update, "preflight_mount_directory"):
+                archive, prov = source.download(target, installed_root=Path("/installed"))
+            self.assertEqual(source.artifact_size, 54321)
+            self.assertIn("tracker", run_mock.call_args_list[-1].kwargs)
+
+    def test_actions_source_ignores_invalid_artifact_size(self):
+        from unittest import mock
+        source = update.ActionsSource()
+        for bad_size in (True, False, -10, 0, update.MAX_PACKAGE_BYTES + 1, "123"):
+            with self.subTest(bad_size=bad_size):
+                artifacts = [{"name": update.ARTIFACT_NAME, "size_in_bytes": bad_size, "expired": False},
+                             {"name": update.UPDATE_ARTIFACT_NAME, "expired": True}]
+                with tempfile.TemporaryDirectory() as td:
+                    with mock.patch.object(update.ActionsSource, "_run", return_value=json.dumps({"artifacts": artifacts}).encode()):
+                        source._download_manifest({"id": 1}, Path(td))
+                    self.assertIsNone(source.artifact_size)
+
+    def test_actions_source_run_with_tracker_attaches_and_kills_on_timeout(self):
+        from unittest import mock
+        tracker = mock.Mock()
+        mock_proc = mock.Mock()
+        mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["gh"], timeout=1)
+        mock_proc.poll.return_value = None
+        with mock.patch("shutil.which", return_value="/bin/gh"), \
+                mock.patch("subprocess.Popen", return_value=mock_proc):
+            with self.assertRaises(update.UpdateError):
+                update.ActionsSource._run(["api"], timeout=1, tracker=tracker)
+            tracker.attach.assert_called_once_with(mock_proc)
+            mock_proc.kill.assert_called_once()
+            mock_proc.wait.assert_called_once()
+
+    def test_actions_source_run_with_tracker_cleans_up_on_exception(self):
+        from unittest import mock
+        tracker = mock.Mock()
+        mock_proc = mock.Mock()
+        mock_proc.communicate.side_effect = KeyboardInterrupt()
+        mock_proc.poll.return_value = None
+        with mock.patch("shutil.which", return_value="/bin/gh"), \
+                mock.patch("subprocess.Popen", return_value=mock_proc):
+            with self.assertRaises(KeyboardInterrupt):
+                update.ActionsSource._run(["api"], timeout=1, tracker=tracker)
+            mock_proc.kill.assert_called_once()
+            mock_proc.wait.assert_called_once()
+
+    def test_actions_source_run_with_tracker_checks_nonzero_exit(self):
+        from unittest import mock
+        tracker = mock.Mock()
+        mock_proc = mock.Mock()
+        mock_proc.communicate.return_value = (b"", b"")
+        mock_proc.returncode = 1
+        mock_proc.poll.return_value = 1
+        with mock.patch("shutil.which", return_value="/bin/gh"), \
+                mock.patch("subprocess.Popen", return_value=mock_proc):
+            with self.assertRaises(update.UpdateError):
+                update.ActionsSource._run(["api"], timeout=1, tracker=tracker)
 
 
 if __name__ == "__main__":

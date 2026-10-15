@@ -285,8 +285,11 @@ artifact, including older runs, use a visible full-archive fallback for
 comparison and verification.
 
 The updater reports phase changes and repeats elapsed time every ten seconds
-while a phase remains active. It does not invent percentage estimates. Before
-downloading a changed full archive, it refuses an active-mount update when the
+while an indeterminate phase remains active. For package archive downloads where
+expected artifact or manifest sizes are known, the updater renders an adaptive
+real-time progress bar (or periodic progress milestones in non-interactive
+environments) showing percentage, transferred bytes, transfer rate, and ETA.
+Before downloading a changed full archive, it refuses an active-mount update when the
 updater or its calling shell is working inside the mount. The same check runs
 before mount preparation for local archives. A no-op remains allowed from the
 mount. The child process cannot change its parent shell's current directory, so

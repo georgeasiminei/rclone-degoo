@@ -1415,3 +1415,21 @@ and service were active, with zero pending files and zero provider HTTP
 attempts. Repeating the same local-package update returned an unchanged-build
 no-op while the external path remained configured. These are local lifecycle
 checks; live provider uploads remain unverified during cooldown.
+
+### Package update download progress bar
+
+The package updater (`degoo-rc update`) now displays a live, adaptive progress bar
+during package archive downloads instead of repeating elapsed time.
+
+Validation passed:
+
+- All 444 offline Python helper tests and the packaging self-check
+  (`bin/package-degoo.py --self-check`) passed.
+- Unit tests in `contrib/degoo/scripts/python/test_update.py` cover
+  byte/rate/ETA formatting, column-width adaptivity (40, 60, 80, 100, 120
+  columns), ETA retention at 80 columns, non-TTY periodic milestone emissions
+  and 10-second heartbeats, TTY carriage-return updates and final line completion,
+  clean exception unwinding, `ActionsSource._run` process attachment, timeout
+  kill, exception cleanup, non-zero exit handling, and `ActionsSource.download`
+  binding with validated artifact sizes and progress tracking.
+- Markdown check and `git diff --check` passed cleanly with zero whitespace issues.
