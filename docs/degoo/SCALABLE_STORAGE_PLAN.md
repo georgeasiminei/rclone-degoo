@@ -175,7 +175,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 **Gate:** Reproducible counters and a written design comparison.
 
 - **P1-FIXTURES** — Status: `in progress`; dependencies: P0-DOC; evidencePR:
-  [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43). Add generated
+  [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43),
+  [#44](https://github.com/georgeasiminei/rclone-degoo/pull/44). Add generated
   directory/object fixtures at increasing sizes,
   including 1,000, 10,000, and 100,000 entries. Record remote/API calls, page
   count, bytes, cache hits, cold and warm lookup latency, full-list latency,
@@ -188,7 +189,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   probes, if needed, use generated test state and record date, client platform,
   operation, page, and response class without secrets or private IDs.
 - **P1-LOOKUP** — Status: `in progress`; dependencies: P1-FIXTURES;
-  evidencePR: [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43).
+  evidencePR: [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43),
+  [#44](https://github.com/georgeasiminei/rclone-degoo/pull/44).
   Trace `NewObject`, chunk/manifest sibling discovery,
   create, overwrite, rename, and delete. Count listings and invalidations per
   operation. Verify direct provider lookup by opaque ID and establish its
@@ -384,8 +386,9 @@ For each future task:
 ### 2026-10-15 — P1 memory and encrypted-operation follow-up
 
 - Owner: coordinating Codex agent, with delegated retained-memory and
-  encrypted-operation test work. Delivery: evidencePR `TBD`, targeting
-  `staging` for the user's review and merge. This slice starts from merged
+  encrypted-operation test work. Delivery:
+  [PR #44](https://github.com/georgeasiminei/rclone-degoo/pull/44), targeting
+  `staging` and awaiting the user's merge. This slice starts from merged
   PR #43; no installed runtime, pending cache, or remote vault is modified.
 - P1-FIXTURES now records post-GC process heap deltas at 1,000/10,000/100,000
   entries (about 0.28/2.45/19.0 MB), separately from cumulative allocation.

@@ -13,7 +13,8 @@ See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 The follow-up replaces full-table parent-hint eviction with ordered eviction,
 rejects direct-ID metadata with a different response identity, and adds
 retained-heap/occupancy measurements plus paginated and encrypted-stack traces.
-Delivery: evidencePR `TBD`, targeting `staging` for the user's review and merge.
+Delivery: [PR #44](https://github.com/georgeasiminei/rclone-degoo/pull/44),
+targeting `staging` and awaiting the user's merge.
 See [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for measured counters,
 reproduction commands, and memory-measurement limits.
 
