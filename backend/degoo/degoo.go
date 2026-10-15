@@ -125,13 +125,16 @@ type Fs struct {
 	dirCache *dircache.DirCache
 	features *fs.Features
 
-	placeholderMu sync.RWMutex
-	placeholders  map[string]struct{}
-	pathLocksMu   sync.Mutex
-	pathLocks     *pathLockManager
-	batchMu       sync.Mutex
-	uploadBatches *uploadBatchCoordinator
-	metadataCache *metadataCache
+	placeholderMu         sync.RWMutex
+	placeholders          map[string]struct{}
+	placeholderBytes      int
+	placeholderSaturated  bool
+	placeholderGeneration uint32
+	pathLocksMu           sync.Mutex
+	pathLocks             *pathLockManager
+	batchMu               sync.Mutex
+	uploadBatches         *uploadBatchCoordinator
+	metadataCache         *metadataCache
 }
 
 // Object describes a file stored in Degoo.
@@ -208,7 +211,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err := f.api.SetRateLimitFile(opt.AuthFile + ".rate-limit.json"); err != nil {
 		return nil, fmt.Errorf("degoo: load provider rate-limit state: %w", err)
 	}
-	f.dirCache = dircache.New(root, opt.RootFolderID, f)
+	f.dirCache = newDirectoryCache(root, opt.RootFolderID, f)
 	f.features = (&fs.Features{
 		CaseInsensitive:          false,
 		DuplicateFiles:           false,
@@ -254,7 +257,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return nil, fmt.Errorf("degoo: resolve vault root: %w", err)
 		}
 		parentPath, leaf := dircache.SplitPath(root)
-		parentCache := dircache.New(parentPath, opt.RootFolderID, f)
+		parentCache := newDirectoryCache(parentPath, opt.RootFolderID, f)
 		if parentErr := parentCache.FindRoot(ctx, false); parentErr != nil {
 			if errors.Is(parentErr, fs.ErrorDirNotFound) {
 				if !offlineRoot {
@@ -393,6 +396,11 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (string, bool, e
 		return "", false, err
 	}
 	item, isDir, ghosts, err := f.lookupChild(ctx, pathID, leaf)
+	if err == nil && item != nil && f.isPlaceholder(item.ID) {
+		// A provisional folder can promote while a listing snapshot remains
+		// valid. Resolve its current namespace identity from a fresh listing.
+		item, isDir, ghosts, err = f.lookupChildFresh(ctx, pathID, leaf)
+	}
 	if err != nil || item == nil {
 		return "", false, err
 	}
@@ -912,17 +920,46 @@ func (f *Fs) isProviderDirectoryCategory(category int) bool {
 	return category == 1 || category == 2
 }
 
+// These limits bound retained safety hints, not provider directory capacity.
+const (
+	placeholderMaxEntries = 4096
+	placeholderMaxBytes   = 256 * 1024
+)
+
 func (f *Fs) rememberPlaceholder(id string) {
+	if id == "" {
+		return
+	}
 	f.placeholderMu.Lock()
-	f.placeholders[id] = struct{}{}
-	f.placeholderMu.Unlock()
+	defer f.placeholderMu.Unlock()
+	if f.placeholderSaturated {
+		return
+	}
+	if _, ok := f.placeholders[id]; ok {
+		return
+	}
+	if len(f.placeholders) >= placeholderMaxEntries || len(id) > placeholderMaxBytes-f.placeholderBytes {
+		// Forgetting a provisional ID would turn an unsafe cache hit into a
+		// trusted one. Saturation conservatively distrusts every cached ID.
+		f.placeholderSaturated = true
+		f.placeholderGeneration++
+		f.placeholders = nil
+		f.placeholderBytes = 0
+		return
+	}
+	if f.placeholders == nil {
+		f.placeholders = make(map[string]struct{})
+	}
+	f.placeholders[strings.Clone(id)] = struct{}{}
+	f.placeholderBytes += len(id)
+	f.placeholderGeneration++
 }
 
 func (f *Fs) isPlaceholder(id string) bool {
 	f.placeholderMu.RLock()
+	defer f.placeholderMu.RUnlock()
 	_, ok := f.placeholders[id]
-	f.placeholderMu.RUnlock()
-	return ok
+	return ok || f.placeholderSaturated
 }
 
 func directoryMarkerName(directoryID string) string {
@@ -1042,6 +1079,19 @@ func validateLeaf(leaf string) error {
 	return nil
 }
 
+const (
+	directoryCacheMaxEntries     = 4096
+	directoryCacheMaxStringBytes = 4 * 1024 * 1024
+)
+
+func newDirectoryCache(root, rootID string, f *Fs) *dircache.DirCache {
+	return dircache.NewWithLimits(root, rootID, f, dircache.Limits{
+		MaxEntries:     directoryCacheMaxEntries,
+		MaxStringBytes: directoryCacheMaxStringBytes,
+		Admit:          func(_, id string) bool { return !f.isPlaceholder(id) },
+	})
+}
+
 // DirCacheFlush resets directory and persistent metadata caches.
 func (f *Fs) DirCacheFlush() {
 	f.dirCache.ResetRoot()
@@ -1057,12 +1107,51 @@ func (f *Fs) findDir(ctx context.Context, remote string, create bool) (string, e
 	if err := validateRemote(remote); err != nil {
 		return "", err
 	}
-	if remote != "" {
-		if id, ok := f.dirCache.Get(remote); ok && f.isPlaceholder(id) {
-			f.dirCache.FlushDir(remote)
+	for range 3 {
+		generation := f.provisionalGeneration()
+		f.invalidateProvisionalAncestors(remote)
+		id, err := f.dirCache.FindDir(ctx, remote, create)
+		if err != nil && !errors.Is(err, fs.ErrorDirNotFound) {
+			return "", err
+		}
+		if generation == f.provisionalGeneration() {
+			return id, err
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
 	}
-	return f.dirCache.FindDir(ctx, remote, create)
+	return "", errors.New("degoo: directory metadata changed during resolution; retry operation")
+}
+
+func (f *Fs) provisionalGeneration() uint32 {
+	f.placeholderMu.RLock()
+	defer f.placeholderMu.RUnlock()
+	return f.placeholderGeneration
+}
+
+func (f *Fs) invalidateProvisionalAncestors(remote string) {
+	if f.root != "" {
+		if id, ok := f.dirCache.Get(""); ok && f.isPlaceholder(id) {
+			f.dirCache.ResetRoot()
+		}
+	}
+	// A cached descendant can otherwise bypass revalidation of a provisional
+	// ancestor when the provider promotes that ancestor to a different ID.
+	for offset := 0; offset < len(remote); {
+		end := strings.IndexByte(remote[offset:], '/')
+		if end < 0 {
+			end = len(remote)
+		} else {
+			end += offset
+		}
+		ancestor := remote[:end]
+		if id, ok := f.dirCache.Get(ancestor); ok && f.isPlaceholder(id) {
+			f.dirCache.FlushDir(ancestor)
+			break
+		}
+		offset = end + 1
+	}
 }
 
 // List lists files and directories directly below dir.
@@ -1416,7 +1505,27 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return err
 	}
 	defer releasePaths()
-	srcID, srcParentID, srcLeaf, dstParentID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	var srcID, srcParentID, srcLeaf, dstParentID, dstLeaf string
+	resolved := false
+	for range 3 {
+		srcGeneration, dstGeneration := srcFs.provisionalGeneration(), f.provisionalGeneration()
+		srcFs.invalidateProvisionalAncestors(srcRemote)
+		f.invalidateProvisionalAncestors(dstRemote)
+		srcID, srcParentID, srcLeaf, dstParentID, dstLeaf, err = f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+		if err != nil && !errors.Is(err, fs.ErrorDirNotFound) && !errors.Is(err, fs.ErrorDirExists) {
+			return err
+		}
+		if srcGeneration == srcFs.provisionalGeneration() && dstGeneration == f.provisionalGeneration() {
+			resolved = true
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	if !resolved {
+		return errors.New("degoo: directory metadata changed during move resolution; retry operation")
+	}
 	if err != nil {
 		return err
 	}

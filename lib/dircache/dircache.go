@@ -6,6 +6,7 @@ package dircache
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -18,9 +19,13 @@ import (
 
 // DirCache caches paths to directory IDs and vice versa
 type DirCache struct {
-	cacheMu  sync.RWMutex // protects cache and invCache
-	cache    map[string]string
-	invCache map[string]string
+	cacheMu    sync.RWMutex // protects cache and invCache
+	cache      map[string]string
+	invCache   map[string]string
+	limits     Limits
+	cacheLRU   *list.List
+	lruPaths   map[string]*list.Element
+	cacheBytes int
 
 	mu           sync.Mutex // protects the below
 	fs           DirCacher  // Interface to find and make directories
@@ -29,6 +34,21 @@ type DirCache struct {
 	rootID       string     // ID of the root directory
 	rootParentID string     // ID of the root's parent directory
 	foundRoot    bool       // Whether we have found the root or not
+}
+
+// Limits optionally bounds the directory ID cache. A zero limit is unlimited.
+// MaxEntries includes the pinned root mapping. MaxStringBytes limits the total
+// path and ID bytes admitted for non-root mappings; the root mapping is required
+// for normal operation and is excluded from that byte budget. Negative limits
+// are treated as unlimited.
+type Limits struct {
+	// MaxEntries caps cached path mappings, including the pinned root mapping.
+	MaxEntries int
+	// MaxStringBytes caps admitted path and ID bytes for non-root mappings.
+	MaxStringBytes int
+	// Admit, when non-nil, decides whether a non-root mapping may be cached.
+	// It is called with the cache lock held and must not call back into DirCache.
+	Admit func(path, id string) bool
 }
 
 // DirCacher describes an interface for doing the low level directory work
@@ -53,14 +73,43 @@ type DirCacher interface {
 //
 // The cache is safe for concurrent use
 func New(root string, trueRootID string, fs DirCacher) *DirCache {
+	return NewWithLimits(root, trueRootID, fs, Limits{})
+}
+
+// NewWithLimits makes a DirCache with optional entry and string-byte limits.
+// Entries that cannot fit are left uncached and will be resolved again on use.
+func NewWithLimits(root string, trueRootID string, fs DirCacher, limits Limits) *DirCache {
+	if limits.MaxEntries < 0 {
+		limits.MaxEntries = 0
+	}
+	if limits.MaxStringBytes < 0 {
+		limits.MaxStringBytes = 0
+	}
+	if limits.MaxEntries > 0 || limits.MaxStringBytes > 0 || limits.Admit != nil {
+		root = strings.Clone(root)
+		trueRootID = strings.Clone(trueRootID)
+	}
 	d := &DirCache{
 		trueRootID: trueRootID,
 		root:       root,
 		fs:         fs,
+		limits:     limits,
+	}
+	if d.hasCapacityLimit() {
+		d.cacheLRU = list.New()
+		d.lruPaths = make(map[string]*list.Element)
 	}
 	d.Flush()
 	d.ResetRoot()
 	return d
+}
+
+func (dc *DirCache) bounded() bool {
+	return dc.hasCapacityLimit() || dc.limits.Admit != nil
+}
+
+func (dc *DirCache) hasCapacityLimit() bool {
+	return dc.limits.MaxEntries > 0 || dc.limits.MaxStringBytes > 0
 }
 
 // String returns the directory cache in string form for debugging
@@ -93,6 +142,15 @@ func (dc *DirCache) String() string {
 // Returns the ID and a boolean as to whether it was found or not in
 // the cache.
 func (dc *DirCache) Get(path string) (id string, ok bool) {
+	if dc.hasCapacityLimit() {
+		dc.cacheMu.Lock()
+		id, ok = dc.cache[path]
+		if ok {
+			dc.touchPathAndAncestorsLocked(path)
+		}
+		dc.cacheMu.Unlock()
+		return id, ok
+	}
 	dc.cacheMu.RLock()
 	id, ok = dc.cache[path]
 	dc.cacheMu.RUnlock()
@@ -104,6 +162,15 @@ func (dc *DirCache) Get(path string) (id string, ok bool) {
 // Returns the path and a boolean as to whether it was found or not in
 // the cache.
 func (dc *DirCache) GetInv(id string) (path string, ok bool) {
+	if dc.hasCapacityLimit() {
+		dc.cacheMu.Lock()
+		path, ok = dc.invCache[id]
+		if ok {
+			dc.touchPathAndAncestorsLocked(path)
+		}
+		dc.cacheMu.Unlock()
+		return path, ok
+	}
 	dc.cacheMu.RLock()
 	path, ok = dc.invCache[id]
 	dc.cacheMu.RUnlock()
@@ -112,6 +179,12 @@ func (dc *DirCache) GetInv(id string) (path string, ok bool) {
 
 // Put a (path, directory ID) pair into the cache
 func (dc *DirCache) Put(path, id string) {
+	if dc.bounded() {
+		dc.cacheMu.Lock()
+		dc.putBoundedLocked(path, id)
+		dc.cacheMu.Unlock()
+		return
+	}
 	dc.cacheMu.Lock()
 	dc.cache[path] = id
 	dc.invCache[id] = path
@@ -123,7 +196,162 @@ func (dc *DirCache) Flush() {
 	dc.cacheMu.Lock()
 	dc.cache = make(map[string]string)
 	dc.invCache = make(map[string]string)
+	dc.cacheBytes = 0
+	if dc.cacheLRU != nil {
+		dc.cacheLRU.Init()
+		dc.lruPaths = make(map[string]*list.Element)
+	}
 	dc.cacheMu.Unlock()
+}
+
+// putBoundedLocked admits one path mapping while preserving a complete cached
+// ancestor chain. The root mapping is pinned and is not part of the byte budget.
+func (dc *DirCache) putBoundedLocked(path, id string) {
+	if path != "" && dc.limits.Admit != nil && !dc.limits.Admit(path, id) {
+		dc.removeSubtreeLocked(path)
+		return
+	}
+
+	parent := ""
+	if path != "" {
+		parent, _ = SplitPath(path)
+		if _, ok := dc.cache[parent]; !ok {
+			dc.removeSubtreeLocked(path)
+			return
+		}
+		dc.touchPathAndAncestorsLocked(parent)
+	}
+
+	if oldID, ok := dc.cache[path]; ok {
+		if oldID == id {
+			storedPath := strings.Clone(path)
+			if element := dc.lruPaths[path]; element != nil {
+				storedPath = element.Value.(string)
+			}
+			dc.invCache[oldID] = storedPath
+			dc.touchPathAndAncestorsLocked(path)
+			return
+		}
+		if path == "" {
+			dc.removePathLocked(path)
+			dc.repairInverseLocked([]string{oldID})
+		} else {
+			dc.removeSubtreeLocked(path)
+		}
+	}
+
+	if path != "" {
+		entryBytes := len(path) + len(id)
+		if dc.limits.MaxStringBytes > 0 && entryBytes > dc.limits.MaxStringBytes {
+			dc.removeSubtreeLocked(path)
+			return
+		}
+		for dc.overEntryLimitLocked(1) || dc.overByteLimitLocked(entryBytes) {
+			if !dc.evictOldestLocked() {
+				dc.removeSubtreeLocked(path)
+				return
+			}
+			if _, ok := dc.cache[parent]; !ok {
+				return
+			}
+		}
+	}
+
+	if path == "" {
+		id = strings.Clone(id)
+		dc.cache[path] = id
+		dc.invCache[id] = path
+		return
+	}
+	dc.cacheBytes += len(path) + len(id)
+	path = strings.Clone(path)
+	id = strings.Clone(id)
+	dc.cache[path] = id
+	dc.invCache[id] = path
+	if dc.cacheLRU != nil {
+		dc.lruPaths[path] = dc.cacheLRU.PushBack(path)
+	}
+}
+
+func (dc *DirCache) overEntryLimitLocked(additional int) bool {
+	return dc.limits.MaxEntries > 0 && len(dc.cache)+additional > dc.limits.MaxEntries
+}
+
+func (dc *DirCache) overByteLimitLocked(additional int) bool {
+	return dc.limits.MaxStringBytes > 0 && dc.cacheBytes+additional > dc.limits.MaxStringBytes
+}
+
+func (dc *DirCache) touchPathAndAncestorsLocked(path string) {
+	if dc.cacheLRU == nil || path == "" {
+		return
+	}
+	var ancestors []string
+	for current := path; current != ""; {
+		ancestors = append(ancestors, current)
+		current, _ = SplitPath(current)
+	}
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		if element := dc.lruPaths[ancestors[i]]; element != nil {
+			dc.cacheLRU.MoveToBack(element)
+		}
+	}
+}
+
+func (dc *DirCache) evictOldestLocked() bool {
+	if dc.cacheLRU == nil || dc.cacheLRU.Len() == 0 {
+		return false
+	}
+	path := dc.cacheLRU.Front().Value.(string)
+	dc.removeSubtreeLocked(path)
+	return true
+}
+
+func (dc *DirCache) removePathLocked(path string) (id string, ok bool) {
+	id, ok = dc.cache[path]
+	if !ok {
+		return "", false
+	}
+	delete(dc.cache, path)
+	if dc.invCache[id] == path {
+		delete(dc.invCache, id)
+	}
+	if element := dc.lruPaths[path]; element != nil {
+		delete(dc.lruPaths, path)
+		dc.cacheLRU.Remove(element)
+	}
+	if path != "" {
+		dc.cacheBytes -= len(path) + len(id)
+	}
+	return id, true
+}
+
+func (dc *DirCache) removeSubtreeLocked(dir string) {
+	prefix := dir + "/"
+	removedIDs := make([]string, 0, 1)
+	for path := range dc.cache {
+		if path == dir || strings.HasPrefix(path, prefix) {
+			if id, ok := dc.removePathLocked(path); ok {
+				removedIDs = append(removedIDs, id)
+			}
+		}
+	}
+	dc.repairInverseLocked(removedIDs)
+}
+
+func (dc *DirCache) repairInverseLocked(ids []string) {
+	missing := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := dc.invCache[id]; ok {
+			continue
+		}
+		missing[id] = struct{}{}
+	}
+	for path, id := range dc.cache {
+		if _, ok := missing[id]; ok {
+			dc.invCache[id] = path
+			delete(missing, id)
+		}
+	}
 }
 
 // SetRootIDAlias sets the rootID to that passed in. This assumes that
@@ -136,6 +364,9 @@ func (dc *DirCache) Flush() {
 // for some operations.
 func (dc *DirCache) SetRootIDAlias(rootID string) {
 	// No locking as this is called from FindLeaf
+	if dc.bounded() {
+		rootID = strings.Clone(rootID)
+	}
 	dc.rootID = rootID
 	dc.Put("", dc.rootID)
 }
@@ -147,6 +378,12 @@ func (dc *DirCache) SetRootIDAlias(rootID string) {
 func (dc *DirCache) FlushDir(dir string) {
 	if dir == "" {
 		dc.ResetRoot()
+		return
+	}
+	if dc.bounded() {
+		dc.cacheMu.Lock()
+		dc.removeSubtreeLocked(dir)
+		dc.cacheMu.Unlock()
 		return
 	}
 	dc.cacheMu.Lock()
@@ -230,22 +467,9 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 
 	}
 
-	// Find the leaf in parentPathID
-	pathID, found, err := dc.fs.FindLeaf(ctx, parentPathID, leaf)
+	pathID, err = dc._findLeaf(ctx, parentPathID, leaf, create)
 	if err != nil {
 		return "", err
-	}
-
-	// If not found create the directory if required or return an error
-	if !found {
-		if create {
-			pathID, err = dc.fs.CreateDir(ctx, parentPathID, leaf)
-			if err != nil {
-				return "", fmt.Errorf("failed to make directory: %w", err)
-			}
-		} else {
-			return "", fs.ErrorDirNotFound
-		}
 	}
 
 	// Store the leaf directory in the cache
@@ -253,6 +477,52 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 
 	// fmt.Println("Dir", path, "is", pathID)
 	return pathID, nil
+}
+
+// _findLeaf finds or creates one directory below parentID.
+//
+// Call with mu held.
+func (dc *DirCache) _findLeaf(ctx context.Context, parentID, leaf string, create bool) (string, error) {
+	pathID, found, err := dc.fs.FindLeaf(ctx, parentID, leaf)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		return pathID, nil
+	}
+	if !create {
+		return "", fs.ErrorDirNotFound
+	}
+	pathID, err = dc.fs.CreateDir(ctx, parentID, leaf)
+	if err != nil {
+		return "", fmt.Errorf("failed to make directory: %w", err)
+	}
+	return pathID, nil
+}
+
+// _findDirAndParent resolves a directory and returns the parent ID used for its leaf.
+//
+// Call with mu held.
+func (dc *DirCache) _findDirAndParent(ctx context.Context, path string, create bool) (pathID, parentID string, err error) {
+	if path == "" {
+		return dc.rootID, dc.rootID, nil
+	}
+	parentPath, leaf := SplitPath(path)
+	parentID, err = dc._findDir(ctx, parentPath, create)
+	if err != nil {
+		return "", "", err
+	}
+	pathID, err = dc._findLeaf(ctx, parentID, leaf, create)
+	if err != nil {
+		return "", "", err
+	}
+	// FindLeaf may replace an alias for the true root while resolving its
+	// child, so return the current root ID when the leaf's parent is the root.
+	if parentPath == "" {
+		parentID = dc.rootID
+	}
+	dc.Put(path, pathID)
+	return pathID, parentID, nil
 }
 
 // FindPath finds the leaf and directoryID from a path
@@ -302,7 +572,13 @@ func (dc *DirCache) _findRoot(ctx context.Context, create bool) error {
 	if dc.foundRoot {
 		return nil
 	}
-	rootID, err := dc._findDir(ctx, dc.root, create)
+	var rootID, rootParentID string
+	var err error
+	if dc.bounded() {
+		rootID, rootParentID, err = dc._findDirAndParent(ctx, dc.root, create)
+	} else {
+		rootID, err = dc._findDir(ctx, dc.root, create)
+	}
 	if err != nil {
 		return err
 	}
@@ -311,8 +587,13 @@ func (dc *DirCache) _findRoot(ctx context.Context, create bool) error {
 
 	// Find the parent of the root while we still have the root
 	// directory tree cached
-	rootParentPath, _ := SplitPath(dc.root)
-	dc.rootParentID, _ = dc.Get(rootParentPath)
+	if dc.bounded() {
+		dc.rootID = strings.Clone(rootID)
+		dc.rootParentID = strings.Clone(rootParentID)
+	} else {
+		rootParentPath, _ := SplitPath(dc.root)
+		dc.rootParentID, _ = dc.Get(rootParentPath)
+	}
 
 	// Reset the tree based on dc.root
 	dc.Flush()

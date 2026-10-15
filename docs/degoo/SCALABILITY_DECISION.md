@@ -402,3 +402,41 @@ specific vault/cache/pending data affected, downtime, and source paths to copy
 again with rsync, while protecting credentials and all source data outside the
 mount. No reset is necessary or performed for this decision. Go-live remains
 explicit and requires the P4/P6 recovery and acceptance evidence.
+
+## Single-host implementation boundary and delayed-effect refinement
+
+Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+Targets `staging`;
+merging remains with the user.
+
+The first writer scope selected in the independent PR #50 is one Linux host,
+with normal same-host restart and robustness before performance. This follow-up
+implements a local lifetime-lock component and an inactive bounded encrypted
+metadata codec; neither is a complete publication mechanism or an activated
+format. Generic directory cache bounds also ship independently of P3.
+
+The new delayed-effect experiment avoids an assumed remote CAS. Required
+control state outside the disposable cache contains a monotonic frontier,
+current/previous locators and bounded exhaustive intents. Remote objects are
+unique and immutable. Unknown effects retain reservations and block dependent
+publication; exact-ID retirement never permits reuse. A delayed request can
+therefore add or delete only its own immutable object under the model contract.
+The encrypted root carries the child reference digest, so a derived-cache wipe
+can rebuild the fixture from that root without a local child metadata record.
+
+This is a candidate protocol, not a provider-backed decision closure. It relies
+on immutable non-overwriting identity, authenticated exact reads, complete intent
+persistence and exact deletion. Loss of required control state fails closed;
+restoration of a stale valid registry is neither detected nor supported. The
+registry cannot be treated as a disposable cache or a remotely fresh bookmark.
+A production control-state recovery/backup policy remains required. The model's
+two pending intents, sixteen lifetime slots and one-root/one-data graph do not
+implement paged inventories, reusable allocation or active-reader lifetime pins.
+
+P1-LOOKUP and P1-DECISION remain open. The page codec's role/vault/logical-ID/
+generation fields and encrypted-byte digest authenticate identity, not freshness.
+The sequencing plan now allows this independent inactive component before
+provider activation. P3 still needs its payload schemas, allocator, publication,
+shards/manifests, rebuild and mount wiring. No provider request, runtime update,
+reset or reseed was performed. The persisted hold must be rechecked before any
+later live direct-ID or deletion experiment.

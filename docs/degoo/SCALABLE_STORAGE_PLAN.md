@@ -1,7 +1,7 @@
 # Degoo scalable storage plan and progress
 
 **Plan date:** 2026-10-15; **Planning status:** complete; **Implementation
-status:** in progress (P1 lookup contracts and conditional publication decision).
+status:** in progress (P2 directory bounds; inactive P3 page codec).
 
 This durable tracker records evidence, open decisions, validation gates, and
 next steps for large directories and logical files above Degoo's reported
@@ -238,7 +238,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   P3-SHARDS. Phase numbers do not require P2 to finish before P3 starts.
 - **P2-BOUNDS** — Status: `in progress`; dependencies: P2-HOTPATH;
   evidencePR:
-  [#50](https://github.com/georgeasiminei/rclone-degoo/pull/50).
+  [#50](https://github.com/georgeasiminei/rclone-degoo/pull/50),
+  [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
   Bound cache entries and memory, verify complete paginated
   listing above 1,000 children, and assert that a known-path lookup does not
   grow linearly with sibling count after cache warmup. For the selected indexed
@@ -250,8 +251,9 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 
 **Gate:** Bounded objects/shards and crash-safe publication.
 
-- **P3-FORMAT** — Status: `not started`; dependencies: P1-DECISION;
-  evidencePR: `TBD`. Specify the versioned encrypted object/index/manifest
+- **P3-FORMAT** — Status: `in progress`; dependencies: P1-DECISION;
+  evidencePR: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+  Specify the versioned encrypted object/index/manifest
   schema, key derivation and authenticated fields, shard addressing, maximum
   record size, chunk sizing after encryption overhead, and how a local cache
   reconstructs from remote state. Do not add a single unbounded index.
@@ -663,3 +665,62 @@ targeting `staging`; merging remains with the user. Implementation commit:
   race, scoped vet/lint, isolated 100,000-entry warm lookup and 200,000-record
   snapshot-budget evidence, backup-encoding regression, Markdown/links/task IDs
   and staged diff checks. Exact results are in [VALIDATION.md](VALIDATION.md).
+
+### 2026-10-15 — directory bounds and local writer authority in progress
+
+- The full scalable-storage implementation remains the active objective; PRs
+  are review units, not completion of the plan. PR #50 is now merged at
+  `6bbe0374a`, including the writer-scope decision and API cache bounds; its
+  original worktree remains preserved.
+- This increment started from fetched `origin/staging` after PR #49 and was
+  rebased onto merged PR #50 before final integrated validation. Opt-in generic
+  directory-cache bounds cap Degoo at 4,096 path/ID
+  pairs and 4 MiB of non-root retained strings. Root locator state is fixed
+  per cache and separate from that string budget. Complete directory listing
+  still returns every entry; evicted paths resolve again.
+- Provisional-directory safety hints have a 4,096-entry/256 KiB exact budget.
+  Saturation releases the exact set and conservatively revalidates every
+  cached directory ID for the remaining instance lifetime. Cache flush cannot
+  reset this state. This favors robustness over cache performance.
+- A new regression reproduces a cached child bypassing a provisional ancestor:
+  the baseline returns the old child ID. Revalidating the earliest provisional
+  ancestor fixes this; cache eviction must retain this safety property.
+- A separate Linux local-authority component is being implemented with explicit
+  initialization, host/vault/path binding, a stable non-expiring lock and
+  missing-state refusal. It is not integrated as a publication mechanism;
+  delayed remote side effects still need a verified protocol.
+- Rechecked persisted cooldown at 15:02 UTC: expiry remains **21:30:29 UTC**.
+  No provider/authentication request, installed-runtime change or reset occurs.
+  Direct-ID continuity/deletion and publication/provider activation gates stay
+  open. Implementation plan updated before these components were added.
+
+### Inactive page codec and delayed-effect results
+
+- P3-FORMAT is `in progress` for the bounded page codec only. Its encrypted
+  version/role/vault/logical-ID/generation/length envelope reuses rclone crypt;
+  the 130,953-byte maximum payload produces a 131,072-byte stored page.
+  Payload schemas, index/manifest trees, allocation and mount integration
+  remain unfinished. The plan records this sequencing refinement before code.
+- The new single-host model uses no CAS/epoch service. It persists intent
+  before a single request, retains unknown outcomes, protects current/previous
+  roots and never reuses exact retired IDs/slots. Two unresolved intents or
+  sixteen lifetime allocations stop it. A checkpoint error after rename poisons
+  the instance until disk reopen; no remote effect follows from the failed
+  instance. These are finite experiments, not a production coordinator.
+- Cache deletion rebuilds one encrypted root/data graph using only the root
+  locator/digest plus its authenticated remote child reference. A separate
+  test demonstrates that restoring an older valid registry can read the older
+  root; rollback detection is not implemented. Missing/corrupt registry refusal
+  is not stale-backup detection. No remote-only latest-root claim is made.
+- The complete implementation goal remains unfinished. P1-LOOKUP/P1-DECISION
+  need real identity, publication and deletion evidence. P3 needs the remaining
+  schemas, allocator, publisher, shards/manifests and remote rebuild/mount
+  integration; P4/P6 need recovery/fault/status/live/soak acceptance. The next
+  provider check must re-read persisted API and auth holds, coordinate with the
+  mount, use generated scoped objects, and stop on throttle/auth failure.
+  No installed runtime, cache, pending file or remote object was reset.
+
+Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+Targets `staging`.
+Source commit: `18bf74315`; integrated validation: `952acf6e3`. The user merges
+and removes the source branch. No merge was performed by the agent.
