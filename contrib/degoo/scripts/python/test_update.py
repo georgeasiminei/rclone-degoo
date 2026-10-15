@@ -5,6 +5,7 @@ import io
 import json
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -865,6 +866,85 @@ class ProgressTest(unittest.TestCase):
             self.assertTrue(all("Downloading archive: still working" in line for line in lines))
             self.assertTrue(all("elapsed" in line for line in lines))
             self.assertEqual(len(lines), count)
+
+
+class DownloadProgressTest(unittest.TestCase):
+    def test_format_bytes(self):
+        self.assertEqual(update.format_bytes(0), "0 B")
+        self.assertEqual(update.format_bytes(-5), "0 B")
+        self.assertEqual(update.format_bytes(500), "500 B")
+        self.assertEqual(update.format_bytes(1024), "1.0 KiB")
+        self.assertEqual(update.format_bytes(1536), "1.5 KiB")
+        self.assertEqual(update.format_bytes(1024 * 1024), "1.0 MiB")
+        self.assertEqual(update.format_bytes(63.6 * 1024 * 1024), "63.6 MiB")
+        self.assertEqual(update.format_bytes(2.5 * 1024 * 1024 * 1024), "2.5 GiB")
+
+    def test_format_rate(self):
+        self.assertEqual(update.format_rate(0), "0 B/s")
+        self.assertEqual(update.format_rate(-10), "0 B/s")
+        self.assertEqual(update.format_rate(1024 * 1024), "1.0 MiB/s")
+
+    def test_format_eta(self):
+        self.assertEqual(update.format_eta(None), "--")
+        self.assertEqual(update.format_eta(-1), "--")
+        self.assertEqual(update.format_eta(float("inf")), "--")
+        self.assertEqual(update.format_eta(0), "0s")
+        self.assertEqual(update.format_eta(45), "45s")
+        self.assertEqual(update.format_eta(75), "1m 15s")
+        self.assertEqual(update.format_eta(3665), "1h 01m")
+
+    def test_render_progress_respects_column_constraints(self):
+        total = 60 * 1024 * 1024
+        cur = 30 * 1024 * 1024
+        rate = 1.5 * 1024 * 1024
+        for cols in (40, 60, 80, 100, 120):
+            with self.subTest(cols=cols):
+                line = update.render_progress("Downloading package archive", cur, total, rate, 20.0, cols)
+                self.assertLessEqual(len(line), cols)
+                self.assertIn("50%", line)
+
+    def test_render_progress_without_total_bytes(self):
+        line = update.render_progress("Downloading package archive", 1024 * 1024, None, 512 * 1024, None, 80)
+        self.assertIn("1.0 MiB", line)
+        self.assertIn("512.0 KiB/s", line)
+
+    def test_download_progress_tracker_non_tty_periodic_emissions(self):
+        from unittest import mock
+        lines = []
+        total = 1000
+        with mock.patch("builtins.print", side_effect=lambda msg, **kwargs: lines.append(msg)):
+            with update.download_progress("Downloading package archive", total, is_tty=False, interval=0.01) as tracker:
+                tracker.update_bytes(200)
+                time.sleep(0.02)
+                tracker.update_bytes(500)
+                time.sleep(0.02)
+        self.assertTrue(any("20%" in line or "50%" in line for line in lines))
+
+    def test_download_progress_tracker_tty_final_line(self):
+        import io
+        from unittest import mock
+        buf = io.StringIO()
+        total = 2048
+        with mock.patch("sys.stdout", buf):
+            with update.download_progress("Downloading package archive", total, is_tty=True, interval=0.01) as tracker:
+                tracker.update_bytes(2048)
+                time.sleep(0.02)
+        output = buf.getvalue()
+        self.assertIn("100%", output)
+        self.assertTrue(output.endswith("\n"))
+
+    def test_download_progress_tracker_exception_cleans_up(self):
+        import io
+        from unittest import mock
+        buf = io.StringIO()
+        with self.assertRaises(RuntimeError):
+            with mock.patch("sys.stdout", buf):
+                with update.download_progress("Downloading package archive", 1000, is_tty=True, interval=0.01) as tracker:
+                    tracker.update_bytes(100)
+                    time.sleep(0.02)
+                    raise RuntimeError("interrupted")
+        output = buf.getvalue()
+        self.assertTrue(output.endswith("\n"))
 
 
 if __name__ == "__main__":
