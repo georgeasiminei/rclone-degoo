@@ -63,6 +63,13 @@ quota claim:
   work. Keep honoring provider `Retry-After`; measure the scope and the
   conservative hold's effects before changing that policy.
 
+The [2026-10-15 incident record](RATE_LIMIT_INVESTIGATION.md) preserves the
+underlying live comparisons, including browser success before the client's
+deadline, exact response/deadline samples, and service-worker 504 masking.
+It separates confirmed local failure mechanisms from the unproven provider
+cause. The incident snapshot is also recorded in [VALIDATION.md](VALIDATION.md).
+These observations do not close P1-LOOKUP, P1-DECISION, or live recovery gates.
+
 Limited evidence includes a generated 2 MiB file, range read and matching
 hash, lifecycle operations, nested operations, and fresh-cache remount. Live
 support above 20 GiB, pagination beyond 1,000 entries, quota scope, upload

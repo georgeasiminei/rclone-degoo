@@ -141,6 +141,19 @@ records the same observed page ceiling and reuses folder listings to satisfy
 item lookups. These are implementation observations, not current Degoo
 guarantees.
 
+### Selective failures and browser success (2026-10-15)
+
+The [dated rate-limit investigation](RATE_LIMIT_INVESTIGATION.md) records a
+later incident: the user reported working Windows browser operations during
+the client's global cooldown, and independent same-account browser-style
+listing replays succeeded from Linux. Other listings, including later pages
+in the upload directory, returned
+429. Smaller pages were not a reliable remedy. The record includes exact
+retry deadlines, protocol/header controls, synthetic service-worker 504s,
+confirmed client-side failure mechanisms, and the unresolved provider scope.
+It supplements the 2026-10-13 evidence; it does not establish a numeric quota
+or authorize ignoring `Retry-After`.
+
 ### Request reduction and local cache behavior (2026-10-14)
 
 The backend stores a typed rate-limit deadline beside the private auth file
