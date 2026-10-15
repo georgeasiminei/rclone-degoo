@@ -10,6 +10,9 @@ See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 
 ## Scalable storage P1 baseline — 2026-10-15
 
+Delivery: [PR #43](https://github.com/georgeasiminei/rclone-degoo/pull/43),
+targeting `staging` and awaiting the user's merge.
+
 The first implementation slice adds generated directory fixtures at 1,000,
 10,000, and opt-in 100,000 entries, API-call/invalidation traces for file
 operations and chunker discovery, and later-page 429/cancellation regressions.

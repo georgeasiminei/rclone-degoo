@@ -175,18 +175,21 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 **Gate:** Reproducible counters and a written design comparison.
 
 - **P1-FIXTURES** — Status: `in progress`; dependencies: P0-DOC; evidencePR:
-  `TBD`. Add generated directory/object fixtures at increasing sizes,
+  [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43). Add generated
+  directory/object fixtures at increasing sizes,
   including 1,000, 10,000, and 100,000 entries. Record remote/API calls, page
   count, bytes, cache hits, cold and warm lookup latency, full-list latency,
   and peak local index size. Do not use private vault names or account data.
 - **P1-RATELIMIT** — Status: `complete`; dependencies: P0-DOC; evidencePR:
-  `TBD`. Add controlled mock cases for first-page success followed by later
+  [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43). Add controlled mock
+  cases for first-page success followed by later
   page 429, repeated 429, unaffected small-folder success, cancellation, and
   persisted global cooldown. Preserve exact `Retry-After` behavior. Live
   probes, if needed, use generated test state and record date, client platform,
   operation, page, and response class without secrets or private IDs.
 - **P1-LOOKUP** — Status: `in progress`; dependencies: P1-FIXTURES;
-  evidencePR: `TBD`. Trace `NewObject`, chunk/manifest sibling discovery,
+  evidencePR: [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43).
+  Trace `NewObject`, chunk/manifest sibling discovery,
   create, overwrite, rename, and delete. Count listings and invalidations per
   operation. Verify direct provider lookup by opaque ID and establish its
   failure semantics.
@@ -342,8 +345,10 @@ For each future task:
 ### 2026-10-15 — P1 baseline implementation
 
 - Owner: coordinating Codex agent, with delegated API-failure and lookup-trace
-  test work. Delivery PR: TBD. No installed runtime or vault was reset or
-  modified; all requests went to generated localhost fixtures.
+  test work. Delivery:
+  [PR #43](https://github.com/georgeasiminei/rclone-degoo/pull/43), targeting
+  `staging` and awaiting the user's merge. No installed runtime or vault was
+  reset or modified; all requests went to generated localhost fixtures.
 - P1-FIXTURES now has generated 1,000-, 10,000-, and opt-in 100,000-entry
   correctness cases plus cold/warm lookup/list and direct-ID benchmarks.
   Requests, pages, JSON bytes, snapshot hits, latency, and allocations are
