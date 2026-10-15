@@ -941,7 +941,7 @@ The next existing-format increment opts Degoo into generic directory-cache
 entry and retained-string limits. Other backends keep their existing defaults.
 Directory-cache eviction must preserve root and root-parent lookup correctness,
 paired inverse mappings and mutation invalidation. This is independent of the
-open PR #50 API snapshot/name-index increment.
+merged PR #50 API snapshot/name-index increment.
 
 Placeholder IDs are safety hints: forgetting an ID must not make it trusted.
 Keep a bounded exact set with a conservative saturated state. On saturation,

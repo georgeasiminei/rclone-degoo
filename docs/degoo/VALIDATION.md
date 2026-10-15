@@ -1733,3 +1733,66 @@ Validation passed:
   kill, exception cleanup, non-zero exit handling, and `ActionsSource.download`
   binding with validated artifact sizes and progress tracking.
 - Markdown check and `git diff --check` passed cleanly with zero whitespace issues.
+
+## Directory bounds, local authority and inactive page codec — 2026-10-15
+
+This increment was developed in an isolated worktree after PR #49, then rebased
+onto PR #50 merged at `6bbe0374a` before integrated checks. The original worktrees
+and unrelated stash are preserved. Production code changes cap Degoo's directory
+cache and placeholder hints, revalidate provisional ancestors/nested roots, and
+preserve provider/auth/cooldown errors through bounded resolution retries.
+
+Two internal components are inactive: a Linux stable-lifetime writer authority
+and a bounded authenticated metadata page codec using rclone crypt. They are
+not wired into a new mount or publication format. The separate delayed-effect
+experiment is test-only and assumes immutable exact remote IDs; it explicitly
+shows that an old valid registry backup can select an older root. A checkpoint
+failure after rename poisons that instance until disk reopen without replay.
+See [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for bounds and limitations.
+
+Passed against the integrated source:
+
+- Fresh `go build` to a private temporary binary; installed runtime untouched.
+- `go test -race -p 1 ./backend/degoo/... ./lib/dircache -count=1` with
+  `RCLONE_CONFIG=/notfound`:
+  backend, API, auth, authority, page codec and dircache packages pass.
+- `go vet ./backend/degoo/... ./lib/dircache` and
+  `golangci-lint run ./backend/degoo/... ./lib/dircache`: zero issues.
+- Earlier full-source validation before the rebase passed all 189 test
+  packages. The final integrated repository-wide run also passed all 189
+  test packages with exit status zero.
+
+The full-suite command uses the existing `CI=true` unreliable-network-test
+policy, `RCLONE_CONFIG=/notfound`, a short private `TMPDIR`/`GOTMPDIR`, private
+`XDG_CACHE_HOME`, and the fresh binary plus existing fusermount compatibility
+link on `PATH`:
+
+```sh
+go test -timeout 20m -count=1 ./...
+```
+
+The stale-descendant regression failed against the baseline (`old-child` was
+returned) and passed after the correction. Additional cases exercise complete
+10,005-directory listing with bounded retention, eviction/replacement/inverse
+aliases, same-ID owned strings, root-parent resolution under tiny budgets,
+root aliasing, hint saturation, mid-resolution hint changes, retry exhaustion,
+provider-fault preservation, directory moves and provisional nested roots.
+Authority checks include a separate process paused with SIGSTOP while its
+non-expiring flock stays held, cancellation, shared authority across distinct
+cache locations, permissions/symlinks and replaced-lock refusal. Host-dependent
+authority tests skip only on an unsupported machine-ID environment; none skipped
+here. Codec cases cover the exact encrypted size boundary, corrupt/truncated/
+malformed authenticated pages, wrong key/vault/identity and concurrent seal/open.
+
+Read-only persisted-state checks still find the API hold through **2026-10-15
+21:30:29 UTC**, with no separate password-login hold recorded. No provider/auth
+request, runtime installation, reset, pending-write discard or reseed occurred.
+Live direct-ID continuity, scoped terminal deletion, publication activation,
+large-file/new-format mounted recovery and live soak remain unverified.
+
+Final documentation checks passed: Markdown lint on all five changed documents,
+66 relative links across the six handoff documents, 18 unique task IDs, and
+`git diff --check`. Initial intermediate validation caught an import grouping
+issue, corrected before final lint. Rebase conflicts were append-only evidence
+and tracker sections; both PR #50 history and this increment were retained.
+The integrated build/full suite/scoped race/vet/lint all passed after that rebase.

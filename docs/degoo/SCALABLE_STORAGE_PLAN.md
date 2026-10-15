@@ -667,10 +667,12 @@ targeting `staging`; merging remains with the user. Implementation commit:
 ### 2026-10-15 — directory bounds and local writer authority in progress
 
 - The full scalable-storage implementation remains the active objective; PRs
-  are review units, not completion of the plan. PR #50 is open and preserved
-  separately, including the writer-scope decision and API cache bounds.
-- This independent increment starts from fetched `origin/staging` after merged
-  PR #49. Opt-in generic directory-cache bounds cap Degoo at 4,096 path/ID
+  are review units, not completion of the plan. PR #50 is now merged at
+  `6bbe0374a`, including the writer-scope decision and API cache bounds; its
+  original worktree remains preserved.
+- This increment started from fetched `origin/staging` after PR #49 and was
+  rebased onto merged PR #50 before final integrated validation. Opt-in generic
+  directory-cache bounds cap Degoo at 4,096 path/ID
   pairs and 4 MiB of non-root retained strings. Root locator state is fixed
   per cache and separate from that string budget. Complete directory listing
   still returns every entry; evicted paths resolve again.
@@ -689,3 +691,29 @@ targeting `staging`; merging remains with the user. Implementation commit:
   No provider/authentication request, installed-runtime change or reset occurs.
   Direct-ID continuity/deletion and publication/provider activation gates stay
   open. Implementation plan updated before these components were added.
+
+### Inactive page codec and delayed-effect results
+
+- P3-FORMAT is `in progress` for the bounded page codec only. Its encrypted
+  version/role/vault/logical-ID/generation/length envelope reuses rclone crypt;
+  the 130,953-byte maximum payload produces a 131,072-byte stored page.
+  Payload schemas, index/manifest trees, allocation and mount integration
+  remain unfinished. The plan records this sequencing refinement before code.
+- The new single-host model uses no CAS/epoch service. It persists intent
+  before a single request, retains unknown outcomes, protects current/previous
+  roots and never reuses exact retired IDs/slots. Two unresolved intents or
+  sixteen lifetime allocations stop it. A checkpoint error after rename poisons
+  the instance until disk reopen; no remote effect follows from the failed
+  instance. These are finite experiments, not a production coordinator.
+- Cache deletion rebuilds one encrypted root/data graph using only the root
+  locator/digest plus its authenticated remote child reference. A separate
+  test demonstrates that restoring an older valid registry can read the older
+  root; rollback detection is not implemented. Missing/corrupt registry refusal
+  is not stale-backup detection. No remote-only latest-root claim is made.
+- The complete implementation goal remains unfinished. P1-LOOKUP/P1-DECISION
+  need real identity, publication and deletion evidence. P3 needs the remaining
+  schemas, allocator, publisher, shards/manifests and remote rebuild/mount
+  integration; P4/P6 need recovery/fault/status/live/soak acceptance. The next
+  provider check must re-read persisted API and auth holds, coordinate with the
+  mount, use generated scoped objects, and stop on throttle/auth failure.
+  No installed runtime, cache, pending file or remote object was reset.
