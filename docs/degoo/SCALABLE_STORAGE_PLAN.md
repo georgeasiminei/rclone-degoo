@@ -164,9 +164,10 @@ decision. No implementation task has an active owner yet.
 
 ### P0 — durable plan
 
-- **P0-DOC** — Status: `complete`; dependencies: none; evidencePR: `TBD` (PR
-  containing this document). Create this durable plan and record that
-  implementation has not started.
+- **P0-DOC** — Status: `complete`; dependencies: none; evidencePR:
+  [#42](https://github.com/georgeasiminei/rclone-degoo/pull/42). Create this
+  durable plan and record that implementation has not started. The PR targets
+  `staging` and awaits the user's merge.
 
 ### P1 — reproduce, measure, and select the design
 
@@ -319,6 +320,11 @@ For each future task:
 
 - Planning is complete. No scalability implementation was started in this
   task.
+- Planning delivery: [PR #42](https://github.com/georgeasiminei/rclone-degoo/pull/42).
+  Markdown lint passed for all four changed documents, relative file links
+  resolved, task IDs were unique, and `git diff --cached --check` passed.
+  No source tests or live provider validation were needed for this
+  documentation-only change. No runtime or data reset was performed.
 - The principal known cost is full-parent listing for `NewObject` and chunker
   sibling discovery. A 1,000-item page limit is a batching choice, not a
   correctness boundary or established quota.
