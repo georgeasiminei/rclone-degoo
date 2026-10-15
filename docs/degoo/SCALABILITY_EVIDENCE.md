@@ -884,3 +884,88 @@ encodings and original duplicate resolution. Exact-name hits remain indexed;
 backup recovery work may grow with the number of backups, rather than all
 ordinary siblings. The regression failed before the correction and passed
 afterward. The comparable final benchmark above includes this correction.
+
+## Directory cache and local-authority implementation increment
+
+The directory cache now has an opt-in generic bounded constructor; existing
+backends retain the unbounded default. Degoo admits at most 4,096 path/ID pairs
+including the pinned root, with 4 MiB of non-root path/ID strings. These are
+retained-string and entry budgets, not exact Go heap or RSS limits. Map/list
+bookkeeping is bounded by entry count. Root/configuration locator strings are
+fixed per instance and excluded from the admitted-string budget.
+
+Eviction removes descendants and repairs inverse aliases. Nested admission
+requires a retained parent chain; paths too deep or large for the budget still
+resolve but remain uncached. Root resolution captures the parent actually used
+for the final leaf, including root alias updates, without relying on evictable
+intermediates. Owned copies prevent short substrings retaining larger buffers.
+
+The wide-directory regression returns all 10,005 generated directories while
+retaining at most 4,096 path/ID mappings. Evicted and retained paths both resolve.
+An independently reproduced baseline bug returned a stale cached descendant
+beneath a known provisional ancestor; prefix invalidation fixes the lookup and
+directory-move cases. Cache admission rejects provisional IDs and descendants;
+a bounded generation recheck covers hints learned during resolution. Three
+unstable attempts fail explicitly before the requested move mutation.
+
+Placeholder hints retain at most 4,096 IDs and 256 KiB of ID strings. At overflow,
+the exact set is released and every ID is conservatively provisional for the
+remaining instance lifetime. Admission then rejects all new non-root mappings.
+Cache flush does not erase that safety state. This may reduce lookup performance;
+it cannot silently turn a forgotten provisional ID into a trusted directory.
+
+The separate Linux authority package explicitly initializes a private stable
+binding and lock directory, then opens existing state without recreation.
+Subprocess tests cover mutual exclusion, SIGSTOP pause, cancellation and shared
+authority across distinct cache paths. Missing/corrupt state, binding mismatch,
+symlinks, unsafe permissions and replaced lock paths are refused. Release
+preserves the lock inode. Its local filesystem/device identity and machine-ID
+assumptions are explicit. This package is not yet used by a scalable mount and
+does not fence remote effects after process death. No provider request, runtime
+installation, reset or reseed is part of these tests.
+
+### Inactive bounded encrypted page codec
+
+The new internal metadata codec reuses rclone crypt's scrypt-derived secretbox
+content stream. The entire 55-byte version/role/vault/logical-ID/generation/
+length envelope is encrypted and authenticated. A reference authenticates the
+complete ciphertext through its expected SHA-256 digest; callers must obtain
+that reference from trusted control state or an authenticated parent page.
+Wrong keys, vaults, roles, IDs, generations, malformed authenticated headers,
+truncated data and trailing bytes fail. The payload limit is 130,953 bytes:
+with the envelope, crypt stream header and two authentication blocks, the
+complete largest page is exactly 131,072 bytes. One more payload byte fails.
+Concurrent seal/open tests pass with the race detector.
+
+This codec supplies no payload schema, index, manifest tree, remote locator,
+allocator, coordinator or mount adapter. It neither initializes a vault nor
+changes the installed mount. Digest/identity checking does not prove root
+freshness or provider immutability. P3-FORMAT has started with this independent
+component; its full schema and integration gate remain unfinished.
+
+### Single-host delayed-effects experiment
+
+The test-only model removes the earlier assumed CAS/epoch authority and instead
+uses a required fsynced local safety registry, exact immutable transaction IDs,
+serialized root creation, and retained allocation/delete intents. An absent
+read after a lost response cannot distinguish never accepted from accepted but
+not yet applied. Both traces retain the reservation and block dependent root
+publication; no blind retry is sent. Positive authenticated readback can adopt
+that exact transaction. Current/previous roots and their data remain protected.
+
+The finite fixture caps unresolved intents at two and lifetime allocations at
+sixteen. Lost deletes retain tombstones; their exact IDs and slots are never
+reused. A late delete cannot affect a different immutable new ID. This proves
+safe refusal under those assumptions, not cleanup progress or sustainable
+production allocation. The registry serializer is capped by the existing
+16 KiB durable-checkpoint fixture; it is not a paged production inventory.
+
+The cold-cache case covers one encrypted root referencing one encrypted data
+object. The authenticated root carries the child digest; readback needs only
+the required root locator/digest and the remote graph, not a local child record.
+Missing/corrupt registry state is refused. **A stale but valid registry backup
+is not detected or supported**; it is not equivalent to deleting a derived
+cache. Host authority, required control-state backup/recovery, provider-assigned
+opaque IDs, real immutable create semantics, physical placement, active-reader
+pins, and terminal deletion remain integration or provider gates. No remote-only
+latest-root claim follows from this experiment.

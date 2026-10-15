@@ -1,7 +1,7 @@
 # Degoo scalable storage plan and progress
 
 **Plan date:** 2026-10-15; **Planning status:** complete; **Implementation
-status:** in progress (P1 lookup contracts and conditional publication decision).
+status:** in progress (P2 directory bounds; inactive P3 page codec).
 
 This durable tracker records evidence, open decisions, validation gates, and
 next steps for large directories and logical files above Degoo's reported
@@ -250,7 +250,7 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 
 **Gate:** Bounded objects/shards and crash-safe publication.
 
-- **P3-FORMAT** — Status: `not started`; dependencies: P1-DECISION;
+- **P3-FORMAT** — Status: `in progress`; dependencies: P1-DECISION;
   evidencePR: `TBD`. Specify the versioned encrypted object/index/manifest
   schema, key derivation and authenticated fields, shard addressing, maximum
   record size, chunk sizing after encryption overhead, and how a local cache
@@ -663,3 +663,29 @@ targeting `staging`; merging remains with the user. Implementation commit:
   race, scoped vet/lint, isolated 100,000-entry warm lookup and 200,000-record
   snapshot-budget evidence, backup-encoding regression, Markdown/links/task IDs
   and staged diff checks. Exact results are in [VALIDATION.md](VALIDATION.md).
+
+### 2026-10-15 — directory bounds and local writer authority in progress
+
+- The full scalable-storage implementation remains the active objective; PRs
+  are review units, not completion of the plan. PR #50 is open and preserved
+  separately, including the writer-scope decision and API cache bounds.
+- This independent increment starts from fetched `origin/staging` after merged
+  PR #49. Opt-in generic directory-cache bounds cap Degoo at 4,096 path/ID
+  pairs and 4 MiB of non-root retained strings. Root locator state is fixed
+  per cache and separate from that string budget. Complete directory listing
+  still returns every entry; evicted paths resolve again.
+- Provisional-directory safety hints have a 4,096-entry/256 KiB exact budget.
+  Saturation releases the exact set and conservatively revalidates every
+  cached directory ID for the remaining instance lifetime. Cache flush cannot
+  reset this state. This favors robustness over cache performance.
+- A new regression reproduces a cached child bypassing a provisional ancestor:
+  the baseline returns the old child ID. Revalidating the earliest provisional
+  ancestor fixes this; cache eviction must retain this safety property.
+- A separate Linux local-authority component is being implemented with explicit
+  initialization, host/vault/path binding, a stable non-expiring lock and
+  missing-state refusal. It is not integrated as a publication mechanism;
+  delayed remote side effects still need a verified protocol.
+- Rechecked persisted cooldown at 15:02 UTC: expiry remains **21:30:29 UTC**.
+  No provider/authentication request, installed-runtime change or reset occurs.
+  Direct-ID continuity/deletion and publication/provider activation gates stay
+  open. Implementation plan updated before these components were added.

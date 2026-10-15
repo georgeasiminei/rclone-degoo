@@ -934,3 +934,76 @@ consistency guarantees alongside the evidence.
 - [Rclone chunker](https://rclone.org/chunker/)
 - [Backend guide](https://rclone.org/contributing/#writing-a-new-backend)
 - [cligoo API reference](https://github.com/georgeasiminei/cligoo)
+
+## Directory metadata bounds — implementation increment
+
+The next existing-format increment opts Degoo into generic directory-cache
+entry and retained-string limits. Other backends keep their existing defaults.
+Directory-cache eviction must preserve root and root-parent lookup correctness,
+paired inverse mappings and mutation invalidation. This is independent of the
+open PR #50 API snapshot/name-index increment.
+
+Placeholder IDs are safety hints: forgetting an ID must not make it trusted.
+Keep a bounded exact set with a conservative saturated state. On saturation,
+release the set and treat every ID as potentially provisional for the lifetime
+of the filesystem instance. This trades cache performance for preservation; it
+does not evict safety knowledge. Revalidate cached provisional ancestors as well
+as the requested directory. These are local cache changes, not a new remote
+format or a claim of provider publication safety. No reset is required.
+
+## Single-host authority component — implementation boundary
+
+Implement a Linux local authority component separately from remote publication.
+Initialization explicitly binds a private, stable directory to the vault,
+canonical authority path, machine identity and owner UID. Opening an existing
+vault never creates missing authority state. A lifetime kernel lock has no
+lease expiry and is never removed on release; clients using different cache
+paths still use the same descriptor-carried authority path. Detect replaced
+lock inodes and reject unsafe permissions, symlinks and identity mismatches.
+This assumes a trusted local machine and cooperating clients; cloned machine
+identity, privileged tampering and isolated lock namespaces are unsupported.
+
+This component is necessary for the chosen one-host scope but is not remote
+fencing. Do not wire a new writable format to it until immutable publication,
+durable intent, delayed remote effects and remote rebuild have their evidence.
+No reset, runtime installation or provider request is part of this component.
+
+### Additional single-host delayed-effect experiment
+
+Extend the offline publication evidence without an assumed CAS or epoch service.
+Use unique immutable transaction locators, bounded durable intent, current and
+previous root protection, and delayed create/delete completions across disk
+reopen. Distinguish cache loss from loss of required authority/control state.
+Prove that unresolved operations block unsafe reuse/publication and that a late
+request cannot overwrite an immutable newer version. Keep the required local
+registry and remote-only freshness limitations explicit. The experiment cannot
+establish provider consistency, ID continuity, terminal deletion, or a complete
+production publication protocol. Format activation remains blocked.
+
+### Sequencing refinement: bounded metadata codec before provider activation
+
+The immutable metadata codec can be implemented and validated independently of
+root publication. Add it as an inactive internal component while publication
+and provider identity/deletion evidence remain open; do not wire it to a mount
+or initialize a remote format. This advances an independently verifiable part
+of P3-FORMAT without assuming the modeled provider primitive exists.
+
+Reuse rclone crypt's established streaming content cipher and KDF rather than
+introducing a new encryption algorithm. The proposed page envelope is entirely
+inside authenticated encrypted content: eight-byte `DGSVP002` marker, big-endian
+uint16 version 2, one-byte role (root/index/manifest/inventory), 16-byte vault ID,
+16-byte logical page ID, uint64 generation, uint32 payload length, then payload.
+The fixed inner header is 55 bytes. Require nonzero IDs/generation, a nonempty
+password, and a fresh nonzero 32-byte salt represented as lowercase hexadecimal
+for crypt's password-salt input. The existing crypt implementation defines its
+scrypt/key and stream-block derivation; record that dependency explicitly.
+
+Cap the entire stored encrypted page at 128 KiB, deriving the payload allowance
+from crypt.EncryptedSize rather than ignoring block overhead. References carry
+a SHA-256 digest of the complete encrypted bytes plus the expected role, logical
+ID and generation. Verify that digest before decryption and check every inner
+identity field afterward. This authenticates page substitution and references;
+it does not establish root freshness or provider immutability. Metadata payload
+schemas, sharding, manifests, allocator, bootstrap/publication and mount wiring
+remain separate implementation gates. Physical page names must be opaque
+random locators; user names belong only inside encrypted payloads.
