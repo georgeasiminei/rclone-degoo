@@ -10,6 +10,9 @@ See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 
 ## Scalable storage P1 memory and candidate prototypes — 2026-10-15
 
+Delivery: [PR #46](https://github.com/georgeasiminei/rclone-degoo/pull/46),
+targeting `staging` and awaiting the user's merge.
+
 This slice completes generated P1-FIXTURES measurements and adds test-only
 persistent-ID and encrypted radix-index candidates. It changes no production
 mount format. [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) records the

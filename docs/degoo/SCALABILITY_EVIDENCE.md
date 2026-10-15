@@ -338,6 +338,9 @@ cost, not a bounded metadata hot path or a provider latency guarantee.
 
 ## P1 candidate prototypes: persistent IDs and encrypted radix pages
 
+Delivery: [PR #46](https://github.com/georgeasiminei/rclone-degoo/pull/46),
+targeting `staging` and awaiting the user's merge.
+
 These are executable test-only experiments, not a new mount format. The
 persistent-ID prototype uses the actual generated GraphQL client. The remote
 index prototype uses a local encrypted object map with direct ID addressing;

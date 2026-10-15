@@ -176,7 +176,8 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 
 - **P1-FIXTURES** — Status: `complete`; dependencies: P0-DOC; evidencePR:
   [#43](https://github.com/georgeasiminei/rclone-degoo/pull/43),
-  [#44](https://github.com/georgeasiminei/rclone-degoo/pull/44). Add generated
+  [#44](https://github.com/georgeasiminei/rclone-degoo/pull/44),
+  [#46](https://github.com/georgeasiminei/rclone-degoo/pull/46). Add generated
   directory/object fixtures at increasing sizes,
   including 1,000, 10,000, and 100,000 entries. Record remote/API calls, page
   count, bytes, cache hits, cold and warm lookup latency, full-list latency,
@@ -431,8 +432,9 @@ For each future task:
 
 - Owner: coordinating Codex agent, with delegated memory and persistent-ID
   fixtures. Branch: `feat/degoo-scalability-prototypes`, based on merged PR #44.
-  Delivery: PR pending. No installed runtime, cache, credentials, or remote
-  test state was changed.
+  Delivery: [PR #46](https://github.com/georgeasiminei/rclone-degoo/pull/46),
+  targeting `staging` and awaiting the user's merge. No installed runtime,
+  cache, credentials, or remote test state was changed.
 - P1-FIXTURES is complete for generated evidence: cold-list sampled heap peaks,
   populated snapshots, bounded persistent-ID disk occupancy, and encrypted
   radix-node lookup/update/rebuild counters are reproducible. Samples are
