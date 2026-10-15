@@ -1,7 +1,7 @@
 # Degoo scalable storage plan and progress
 
 **Plan date:** 2026-10-15; **Planning status:** complete; **Implementation
-status:** not started.
+status:** in progress (P1 baseline fixtures and failure tests).
 
 This durable tracker records evidence, open decisions, validation gates, and
 next steps for large directories and logical files above Degoo's reported
@@ -160,31 +160,32 @@ Explain a skipped or superseded task and its replacement before marking it
 The agent taking a task owns its implementation and evidence; the coordinating
 agent owns integration, PR delivery, and the handoff. Record the active owner,
 date, and next action when work starts or stops. The user owns the go-live
-decision. No implementation task has an active owner yet.
+decision. The coordinating Codex agent owns the P1 baseline work started on
+2026-10-15; the exact remaining work is recorded below.
 
 ### P0 — durable plan
 
 - **P0-DOC** — Status: `complete`; dependencies: none; evidencePR:
   [#42](https://github.com/georgeasiminei/rclone-degoo/pull/42). Create this
   durable plan and record that implementation has not started. The PR targets
-  `staging` and awaits the user's merge.
+  `staging` and was merged on 2026-10-15.
 
 ### P1 — reproduce, measure, and select the design
 
 **Gate:** Reproducible counters and a written design comparison.
 
-- **P1-FIXTURES** — Status: `not started`; dependencies: P0-DOC; evidencePR:
+- **P1-FIXTURES** — Status: `in progress`; dependencies: P0-DOC; evidencePR:
   `TBD`. Add generated directory/object fixtures at increasing sizes,
   including 1,000, 10,000, and 100,000 entries. Record remote/API calls, page
   count, bytes, cache hits, cold and warm lookup latency, full-list latency,
   and peak local index size. Do not use private vault names or account data.
-- **P1-RATELIMIT** — Status: `not started`; dependencies: P0-DOC; evidencePR:
+- **P1-RATELIMIT** — Status: `complete`; dependencies: P0-DOC; evidencePR:
   `TBD`. Add controlled mock cases for first-page success followed by later
   page 429, repeated 429, unaffected small-folder success, cancellation, and
   persisted global cooldown. Preserve exact `Retry-After` behavior. Live
   probes, if needed, use generated test state and record date, client platform,
   operation, page, and response class without secrets or private IDs.
-- **P1-LOOKUP** — Status: `not started`; dependencies: P1-FIXTURES;
+- **P1-LOOKUP** — Status: `in progress`; dependencies: P1-FIXTURES;
   evidencePR: `TBD`. Trace `NewObject`, chunk/manifest sibling discovery,
   create, overwrite, rename, and delete. Count listings and invalidations per
   operation. Verify direct provider lookup by opaque ID and establish its
@@ -337,3 +338,40 @@ For each future task:
 - Current Degoo data and pending uploads remain disposable tests until an
   explicit user go-live statement. Any intentional pre-live reset requires
   advance notice describing its concrete scope and `rsync` reseed impact.
+
+### 2026-10-15 — P1 baseline implementation
+
+- Owner: coordinating Codex agent, with delegated API-failure and lookup-trace
+  test work. Delivery PR: TBD. No installed runtime or vault was reset or
+  modified; all requests went to generated localhost fixtures.
+- P1-FIXTURES now has generated 1,000-, 10,000-, and opt-in 100,000-entry
+  correctness cases plus cold/warm lookup/list and direct-ID benchmarks.
+  Requests, pages, JSON bytes, snapshot hits, latency, and allocations are
+  measured. Cold lookup needs 1/10/100 requests at the three scales; warm
+  lookup needs none but still copies/scans every sibling. Peak retained
+  metadata/index memory remains unmeasured, so the task remains in progress.
+- P1-RATELIMIT's controlled cases are complete: later-page 429, repeated
+  cooldown access, unrelated cached-folder blocking, cancellation, and
+  persisted restart hold. Existing long-delay/restart tests are reused.
+  This establishes no live numeric quota or provider quota scope.
+- P1-LOOKUP now traces backend create/overwrite/rename/delete invalidation,
+  direct-ID success/null results, and real chunker manifest/sibling discovery
+  over the mock backend. Large paginated mutations and the encrypted stack
+  still need measurement before closing this task.
+- The 100,000-entry correctness run passed in isolation. Concurrent heavy
+  validation caused ten-second metadata-deadline failures in the initial
+  benchmark; those failures are evidence of the current limit, not grounds
+  to extend the production deadline. See
+  [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for counters, reproduction,
+  measurement limits, operation traces, and next evidence gates.
+- Validation passed: fresh Go build, the credential-free repository-wide Go
+  suite with a short private temporary path and fresh binary on `PATH`, scoped
+  race/vet/lint, the opt-in 100,000-entry correctness case, all 30 benchmark
+  combinations, Markdown lint, relative links, and diff checks. An initial full
+  suite failed existing Unix-socket tests due to a long temporary prefix; the
+  short-path rerun passed. Details are in [VALIDATION.md](VALIDATION.md).
+- Next action: finish retained-memory measurement and paginated/encrypted
+  mutation traces, then compare bounded persistent local-index and sharded
+  remote-index prototypes. P1-DECISION and all format/publication work remain
+  unstarted. A local CPU cost also merits a focused follow-up: parent-hint
+  eviction scans its full 4,096-entry table for every new item after saturation.

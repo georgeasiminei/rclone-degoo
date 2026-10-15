@@ -3,7 +3,10 @@
 **Active work (2026-10-15):** Follow
 [SCALABLE_STORAGE_PLAN.md](SCALABLE_STORAGE_PLAN.md) for the storage and metadata
 redesign, stable task IDs, progress, and the next-session handoff. Its planning
-task authorizes documentation only; implementation has not started. The user has
+task authorized documentation only; the follow-up implementation request
+started P1 baseline fixtures, operation traces, and failure regressions. See
+[SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for measurements and gaps.
+No new remote format has been selected or implemented. The user has
 confirmed that current local pending uploads and remote Degoo contents are
 disposable pre-live tests. A necessary reset can replace legacy compatibility
 or migration work after advance notice; completing the existing upload queue
