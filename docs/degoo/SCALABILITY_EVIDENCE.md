@@ -2,9 +2,11 @@
 
 This is the first P1 implementation slice from
 [SCALABLE_STORAGE_PLAN.md](SCALABLE_STORAGE_PLAN.md). It measures the current
-layout and adds failure regressions. It does not select or implement a new
-remote format. All provider responses and object names are generated locally;
-no Degoo account, installed mount, pending cache, or remote vault is used.
+layout and adds failure regressions. The initial slices do not select or
+implement a new remote format. The later decision is conditional and adds no
+production format. All provider responses and object names are generated
+locally; no Degoo account, installed mount, pending cache, or remote vault is
+used.
 
 ## Reproduce
 
@@ -339,7 +341,7 @@ cost, not a bounded metadata hot path or a provider latency guarantee.
 ## P1 candidate prototypes: persistent IDs and encrypted radix pages
 
 Delivery: [PR #46](https://github.com/georgeasiminei/rclone-degoo/pull/46),
-targeting `staging` and awaiting the user's merge.
+targeting `staging` and merged on 2026-10-15.
 
 These are executable test-only experiments, not a new mount format. The
 persistent-ID prototype uses the actual generated GraphQL client. The remote
@@ -551,3 +553,114 @@ invalidation events recorded. The worker now records that event before closing
 the completion channel, preserving exact operation-trace assertions. Cache
 invalidation itself, request counts, and cooldown policy are unchanged. The
 counter snapshot remains local-only.
+
+## P1 lookup contracts and publication decision
+
+Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
+targeting `staging`.
+
+The [decision record](SCALABILITY_DECISION.md) compares root publication,
+writer fencing, physical placement, stable directory identity and cleanup.
+The conditional target is immutable encrypted remote pages with stable logical
+IDs and an authoritative conditional root boundary. Its provider primitive is
+unverified; the current mount and wire format remain unchanged. P1-LOOKUP and
+P1-DECISION retain their live evidence gates rather than treating a modeled
+CAS or positive readback as a provider guarantee.
+
+### Live availability and direct-ID failure contract
+
+Read-only local inspection on 2026-10-15 found a persisted provider hold until
+**2026-10-15 21:30:29 UTC**. No provider call, token renewal, login, runtime
+change, or reset was attempted. The deadline was not shortened or removed.
+A later session must re-read it because another client may extend the hold.
+Live ID stability, continuity after rename/move/overwrite, deleted-ID response,
+and root consistency/fencing remain unverified.
+
+New GetItem fixtures use the real GraphQL client against generated transports:
+
+| Case | Direct metadata HTTP attempts | Listings | Result |
+| --- | ---: | ---: | --- |
+| Cancellation / deadline in flight | 1 each | 0 | Wrapped context error; no returned item |
+| HTTP 503 with Retry-After 2 | 1 | 0 | Retryable API error with preserved two-second delay |
+| Malformed JSON | 1 | 0 | API error; no returned item |
+| HTTP 401 then renewed token accepted | 2 | 0 | One refresh; exact requested ID returned |
+| Repeated HTTP 401 | 2 | 0 | One refresh; non-retryable auth error; no loop |
+| HTTP 429 with Retry-After 120 | 1 | 0 | Typed cooldown persisted without reducing deadline |
+| Fresh client loading that cooldown | 0 | 0 | Same persisted deadline; zero token acquisition calls |
+
+These complement existing null/403, response-ID mismatch and GraphQL auth
+fixtures. Null is an API error, not a canonical not-found result. GetItem has
+no parent/name/size expectation; an indexed caller must validate its expected
+identity and authenticated version. One successful ID read does not establish
+that a cached pathname is still the current namespace winner.
+
+Reproduce the added direct-ID cases:
+
+```sh
+RCLONE_CONFIG=/notfound go test ./backend/degoo/api \
+  -run '^TestGetItem' -count=1 -v
+```
+
+### Publication and placement experiments
+
+Reproduce the new publication fixtures:
+
+```sh
+RCLONE_CONFIG=/notfound go test ./backend/degoo \
+  -run '^TestScalabilityPublication' -count=1 -v
+```
+
+The small snapshot copier reuses the encrypted radix-node store but is a
+separate root/placement experiment. It admits at most 64 records and a
+128 KiB encrypted node; each snapshot writes an index node and a root node.
+It checks record/byte limits before writes and caps staged state at eight
+objects / 512 KiB. Known orphan inventory is capped at 16 IDs, and publication
+stops when projected orphan count reaches the eight-object threshold. An
+exhausted staging budget rejects repeated attempts before allocation. Unknown
+publication or incomplete inventory stops further staging and cleanup.
+These are explicit fixture parameters, not provider quotas or a final format.
+
+| Experiment | Observed model result |
+| --- | --- |
+| Explicit failure before root apply | One attempted root write; previous encrypted root remains readable |
+| Lost response before versus after root apply | Same client error and stale root view, different actual heads; neither permits cleanup or further staging |
+| Unfenced writer after successful readback | Three root writes allow the paused writer to replace the newer root |
+| Modeled authority with expected revision and epoch | Stale revision rejected; old and self-invented future epochs independently rejected; CAS alone accepts a stale owner with the latest revision |
+| Rename a generated directory with one child | Stable directory, file and data IDs preserved; four encrypted-node writes and two reads across old/new snapshots |
+| Six physical roles with 96 objects each | 576 objects; 8,650 directory records; maximum occupancy 16, counting files and child directories including root/control |
+| Short physical route forced full | Next allocation rejected; no overflow directory or bucket |
+| Seven known orphans; cleanup work budget three | Seven deletions over seven steps, 13 inspections; current/previous complete roots retained |
+
+The 8,650-directory result exposes a substantial cost of the fixed-depth
+16-digit placement experiment: it is not a recommendation for production
+folder topology. Adaptive expansion and provider folder/placeholder overhead
+must be measured before selecting P3 physical allocation. A forced short-route
+collision fails closed; no hash-distribution claim substitutes for the cap.
+
+The model's root has a fixed control slot and switches for conditional write,
+authority-issued epochs, and strong reads. None is a verified Degoo primitive.
+The root value is model memory, not a serialized authenticated provider control
+record. Index reads validate AES-GCM through the earlier model; there is no
+chunk upload or verification. Directory rename tests identity preservation,
+not asymptotic update cost, cycle rejection, replacement or mounted handles.
+
+Inventories are bounded in-memory bookkeeping collected after modeled writes.
+There is no durable intent-before-network, ambiguous provider-ID discovery,
+reader pin protocol beyond current/previous metadata roots, restart recovery, remote
+inventory pagination, or recycle/hard-delete exercise. Cleanup sorts the
+bounded queue locally; the per-step budget counts inventory inspections and
+object deletions, not all CPU instructions or physical-directory removals.
+The earlier 100,000-record radix experiment supplies lookup/update/rebuild
+scale evidence; this snapshot copier does not rewrite that many records.
+Allocation and cleanup assume a single actor; they do not enforce writer epochs.
+Data IDs are symbolic; pins protect index/root pages only, not actual file
+chunks. Missing physical identity/path data stops cleanup and retains its
+reservation. Production publication, inventory/GC and fencing remain P3/P4 gates.
+
+An initial model run exposed an uninitialized placement-parent map; the
+preflight was corrected before final combined validation. Integration review
+also made the unapplied/applied lost-acknowledgement errors identical and added
+admission refusal during uncertain publication or incomplete inventory. This
+avoids claiming that distinguishable synthetic failures prove ambiguity, or
+that a publication-only hold bounds further staging. No provider request,
+selected-format production code, reset or installation is part of this work.

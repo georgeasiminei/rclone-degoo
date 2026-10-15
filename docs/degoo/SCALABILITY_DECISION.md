@@ -1,0 +1,264 @@
+# Scalable storage decision — 2026-10-15
+
+Status: **conditional architecture selected for further experiments; production
+format and provider activation blocked**. Owner: coordinating Codex agent.
+The user owns go-live. This record completes the offline comparison, but does
+not close P1-LOOKUP or P1-DECISION's live evidence gate. Requirements are in
+[REQUIREMENTS.md](REQUIREMENTS.md); measurements and executable experiments are
+in [SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md).
+
+Delivery: [#48](https://github.com/georgeasiminei/rclone-degoo/pull/48),
+targeting `staging`; merging remains with the user.
+
+## Decision and scenarios
+
+Continue with an immutable encrypted sharded remote index, stable logical file
+and directory IDs, bounded physical allocation, and an explicitly fenced root
+publication boundary. A bounded local ID/page cache is an accelerator only.
+Keep the current mount format until the publication primitive is verified.
+No new runtime, remote format identifier, cipher suite, or reset is introduced
+by this decision. P3-FORMAT must specify those before implementation.
+
+The decisive scenarios, in priority order, are:
+
+1. A restart with no local index can open one known path by reading a trusted
+   root and bounded pages; it must not enumerate all siblings or rebuild the
+   entire vault first. The generated 100,000-record index needs four node
+   reads, versus 100 listing pages in the existing layout.
+2. A crash, timeout, authentication outage, or 429 during replacement leaves
+   pending local bytes recoverable and exposes only a complete remote version
+   or a clear failure. A lost acknowledgement must not trigger blind replay.
+3. Renaming a populated directory changes its parent/name links and a bounded
+   number of index paths, preserving descendant data IDs. Full enumeration
+   remains O(N); rename must not move every encrypted descendant.
+4. Every physical directory, metadata page, root/control record, transaction
+   inventory page, and cleanup step has an explicit bound. Repeated failures
+   must eventually stop allocation rather than accumulate unlimited orphans.
+
+These are product/architecture constraints, not claims that the test models
+satisfy the complete mounted contract. One local process owns the metadata
+coordinator; no new service boundary is justified. Provider operations remain
+behind the API client. Authentication, cooldown persistence, and VFS pending
+write ownership retain their existing boundaries.
+
+## Alternatives and tradeoffs
+
+| Candidate | Measured evidence | Decision / cost |
+| --- | --- | --- |
+| Smaller listing pages | At 100,000 siblings, 100-item responses require 1,000 calls versus 100 with 1,000-item responses | Reject as scalability solution: cold lookup remains O(N); no live throttle benefit established |
+| Bounded persistent IDs over current layout | Restart hit: one direct metadata request, no pages; retained fixture cache 16,348 bytes | Retain only as accelerator: misses/rebuild still enumerate siblings; old IDs do not prove the current name winner |
+| Immutable encrypted radix pages | Cold reads 2/3/4 at 1,000/10,000/100,000 records; overwrite writes 2/3/4; full rebuild 126/273/4,369 reads | Conditional selection: bounds point metadata work and permits copy-on-write; adds object count, write fan-out, allocator and GC complexity |
+| One encrypted whole-vault index | No performance experiment needed to establish unbounded rewrite/recovery unit | Reject: violates bounded metadata requirement |
+| Append-only roots, choose maximum generation | Publication model demonstrates stale writers and stale visibility | Reject as sole authority: generation alone neither fences writers nor establishes latest root; root listings/history grow without cleanup |
+| Two named root slots with ordinary rename/overwrite | No verified provider atomic replacement or conditional update | Reject for activation: duplicate names, delete/create gaps, stale reads and ambiguous acknowledgements remain unresolved |
+
+All user names, keyed lookup records, file metadata, chunk descriptors,
+transaction inventories and root contents must be encrypted. Degoo can still
+observe physical object sizes/counts, request timing, traversal/access patterns,
+and possibly the bucket/folder topology. This design does not hide those
+observables or protect against deletion/rollback by the provider.
+
+The radix model's simplified name/key/data-ID records omit full file metadata
+and chunk descriptors. Its bytes are not an equivalent-metadata comparison
+with API listings. Radix 16, 64-record leaves, and 128 KiB encrypted pages are
+experiment parameters, not a committed wire format or provider quota. Bound
+both records and encoded bytes, validate hash collisions, and fail explicitly
+at maximum depth/record size. A fixed hash prefix alone does not cap bucket
+occupancy under skew or repeated versions.
+
+## Authority, root discovery, and writer fencing
+
+Remote encrypted state is authoritative. A portable vault descriptor binds the
+vault identity, format, KDF parameters, and bootstrap locator; it is retained
+with the vault configuration, never solely in the disposable metadata cache.
+It must locate a bounded remote control namespace without a full-vault scan.
+Creation must use a discovered device folder; earlier live setup rejected
+account root ID `0`. If a bootstrap provider ID can change, its bounded
+rediscovery mechanism and
+identity checks are a P3-FORMAT gate. A missing or corrupt descriptor/control
+record fails; it must not silently initialize an empty vault.
+
+The desired publication operation compares the expected root revision and
+writer epoch, then atomically installs a bounded authenticated control value:
+current root, previous root, transaction identity, allocation high-water mark,
+and cleanup-inventory root/cursor. Large inventories live in bounded encrypted
+pages referenced by this value. This is a **required abstract primitive, not
+an implemented or verified Degoo mutation**. Encryption authenticates the vault,
+format, object role, logical/version identity, and references; it does not
+establish freshness against remote rollback.
+
+A local cache lock excludes only processes sharing that lock. A timestamp,
+random writer ID, increasing counter in an ordinary object, pre-write read,
+or successful post-write read cannot exclude another machine or a paused old
+writer. Any lease expiry/takeover must advance an epoch enforced by the same
+authority that accepts root publication. Expected-root comparison rejects
+concurrent updates; epoch checking also rejects an old writer after ownership
+changes. Garbage collection and allocation use that authority too. Recovery
+cannot rely on an operator's clock to decide an old writer has stopped.
+
+No such provider-enforced conditional primitive appears in the implemented
+GetOverlay4/SetUploadFile3/SetRenameFile/SetMoveFile contracts. Their Boolean
+acknowledgements do not imply atomic pointer replacement, compare-and-swap,
+unique create, idempotency, or linearizable reads. Absence from these client
+contracts is not proof Degoo offers no suitable operation. Verify the actual
+provider or revise the protocol before production implementation.
+
+An external authoritative coordinator could supply fencing and root revision
+storage, but would add a deployment and recovery dependency outside the current
+simple client setup. It is an alternative requiring a separate architecture
+review, not an implicitly approved new service. Restricting tests to one host
+is useful experimental containment, not remote fencing evidence. Do not ship a
+second writable client or advertise multi-machine safety on that basis.
+
+## Publication and ambiguous outcomes
+
+The coordinator serializes publication while allowing data preparation within
+bounded quotas. A transaction has a durable local identity before network
+side effects and a remotely discoverable, paged allocation inventory. It stages
+immutable data/chunk-descriptor pages, verifies authenticated content and
+expected identity/size, then writes encrypted index descendants before parents.
+Only then may it attempt conditional root publication. File manifests use a
+bounded descriptor tree, not one ever-growing chunk array.
+
+| Boundary / failure | Required result |
+| --- | --- |
+| Before any staging or during chunk/index upload | Old root remains authoritative; local write pending; inventory retains every possible allocated slot |
+| Root publication explicitly rejected on expected revision/epoch | Conflict; preserve local bytes; reconcile/rebase deliberately; no silent last-writer-wins |
+| Root publication acknowledgement lost | Outcome unknown; retain old and proposed roots and allocations; stop further publication and destructive GC until reconciled |
+| Readback shows old root but visibility may lag | Still unknown; neither proof of abort nor permission to recycle proposed objects |
+| Authoritative readback proves the same transaction committed | Confirm the complete version; resume idempotently without a duplicate root publication |
+| Restart while outcome unresolved or provider throttled | Recover local transaction; make no requests before persisted deadline; expose explicit pending/error status |
+
+A positive metadata response is not complete content validation. A direct ID
+response must match the expected ID, role, parent, size and authenticated
+version references before use. Null, 401/403, 429, timeout, 5xx, malformed or
+mismatched responses must not become authoritative absence. GetItem currently
+returns API errors, with no fallback sibling listing; parent/name/size checks
+belong to its caller. No provider visibility deadline has been established.
+
+Conditional publication alone does not preserve old immutable objects if an
+unfenced stale worker can delete or reuse slots. Unique non-reused transaction
+allocation and serialized, authority-checked cleanup are required. A lost create
+acknowledgement reserves the possible slot until bounded reconciliation proves
+its outcome; duplicate create/name semantics must be measured. A single
+unresolved transaction is sufficient to stop new metadata publication safely.
+
+## Physical placement and stable directory identity
+
+Separate index, data, transaction, and cleanup namespaces beneath a fixed
+bounded vault root. Recursively allocate physical directories with a bounded
+number of children; terminal directories contain a bounded number of objects.
+Count child directories, provider placeholders/ghosts, historical versions,
+markers and in-flight creates toward occupancy. Reserve explicit capacity for
+split/recovery before allocation. If capacity or visibility is uncertain, stop
+allocation. Choosing a random bucket or making each shard individually small
+cannot establish a physical-directory bound.
+
+A possible allocator uses persisted slot ordinals and fixed-radix directory
+paths with a maximum depth. Its locator pages and cursors are encrypted and
+bounded. Capacity exhaustion is an explicit error, not unbounded extra root
+folders. The publication experiment tests a finite tree with files plus child
+directories counted. Its fixed-depth folder count is deliberately measured;
+adaptive placement and its tradeoffs are still a P3 decision. It does not test
+real folder creation, ghost retirement,
+provider-assigned IDs, or synchronization of allocator state. Final fanout,
+byte limits, headroom, maximum depth, and capacity belong to P3-FORMAT and
+P3-SHARDS, using live evidence rather than an invented provider threshold.
+
+Logical directory identity is independent of its encrypted pathname and physical
+placement. Index keys use directory identity plus a keyed child-name digest;
+authenticated records include name, child identity, kind, parent and version.
+Rename changes source/destination mappings and the moved directory's parent
+record in one proposed root. Descendant directory/file identities and data
+references remain unchanged. Cycle checks walk parent identities with bounded
+depth and fail on malformed cycles. Directory replacement and open-handle
+semantics must be specified and tested; the small model proves identity
+preservation only, not full POSIX rename or mounted handle behavior.
+
+## Retention and orphan cleanup
+
+Protect current and previous complete roots, active transaction references,
+and roots pinned by readers. Reader pins need a bounded retention budget;
+publication backpressure must preserve live readers instead of deleting their
+data to meet a quota. Authoritative pin registration, expiry/takeover and
+allocation-intent publication before remote side effects remain explicit
+P3 protocol gates, including behavior after client crash or network partition.
+An append-only root history is not the recovery index.
+Superseded objects become candidates only after reference checks against all
+protected roots and authoritative publication reconciliation.
+
+Each allocation must enter a bounded encrypted inventory before an uncertain
+remote side effect. Inventory pages and traversal checkpoints allow bounded
+work per cleanup step and restart without a complete account scan. A lost
+registration response may hide a provider ID: reserve its known physical slot,
+reconcile that bounded directory, and retain the intent until absence or the
+matching object is established. If inventory is incomplete or stale, stop GC.
+Do not infer unreachable status from a stale root or timeout.
+
+Repeated failed attempts consume an explicit staging/orphan budget. At that
+budget, stop new staging/publication until reconciliation and cleanup restore
+headroom. This trades write availability during provider failure for bounded
+storage and preservation. A per-attempt cap alone cannot bound accumulation.
+Live object storage scales with user data; the bound concerns each container,
+record and step plus the admitted temporary backlog, not a constant total vault
+size. Retention parameters must leave room for a large logical file's paged
+transaction inventory and the previous complete version.
+
+Delete/recycle acknowledgement is not proof of reclaimed account bytes. Earlier
+live evidence required recycling before hard deletion and waiting for visibility.
+Do not empty account trash as a vault cleanup implementation. Confirm the
+selected vault's exact generated IDs and two-stage delete semantics; retain
+cleanup inventory through ambiguous deletion. Remote orphan GC remains
+unimplemented. The model exercises only known, fully visible metadata-object
+deletion under a single actor; its allocation/cleanup operations have no
+writer fencing. Referenced file data and reader pins are not modeled.
+
+## Provider evidence and remaining gates
+
+On 2026-10-15, local read-only inspection found an installed client and persisted
+cooldown expiring at **21:30:29 UTC**. No API, token renewal, auth login, runtime
+installation, or reset was attempted. Expiry permits a later controlled
+experiment; it is not permission to ignore a newer persisted deadline.
+The Python reference [cligoo](https://github.com/georgeasiminei/cligoo) describes
+an unofficial GraphQL client. It supplies endpoint evidence, not a provider
+consistency or fencing guarantee.
+
+| Assumption / gate | Current evidence | Required before activation |
+| --- | --- | --- |
+| Opaque ID direct reads and stability | Generated GetOverlay4 identity/error/cooldown contracts; earlier small live smoke only | Generated dedicated-vault create/direct read/restart/rename/move/overwrite/delete matrix; classify ID continuity and errors |
+| Root/bootstrap persistence and freshness | Model locator/control only | Cold-cache rediscovery and authoritative readback across restart; never reinterpret missing as empty |
+| Conditional publication and writer fencing | Test model offers explicit revision/epoch primitive | Verify a real provider primitive or revise/review protocol; reject stale writer after takeover, including stale delete/allocation work |
+| Physical capacity / directory behavior | Finite placement model; earlier live placeholder caveat | Count real folders, ghosts and ambiguous creates against reserved headroom; fault every split/allocation boundary |
+| Orphan discoverability and delete completion | Known-object model inventory; earlier recycle/hard-delete smoke | Restart with lost create/register/delete acknowledgements and incomplete visibility; no referenced-object removal |
+| Encrypted object cap / large files | Reported 20 GiB; provisional 19 GiB safety setting; local large-file evidence | Live encrypted overhead and generated logical file above 20 GiB; bounded manifests and verified chunk hashes |
+
+After the hold, first re-read persisted state and coordinate with any existing
+mount so probe traffic cannot race its cooldown state. Use the shared client
+cooldown guard; never issue a raw token-bearing request around it. Use a fresh
+generated object in an isolated test namespace for mutations; do not mutate an
+existing mounted object or enumerate private account contents for evidence.
+Stop on the first new throttle/auth failure and record response class/counters
+only. Repeat direct reads in a later client/session and test generated rename,
+move, overwrite and delete separately. The current contracts do not provide a
+CAS experiment to run blindly; discover a supported primitive first.
+
+## Evolution, reversal, and reset consequences
+
+The coordinating agent owns implementation evidence and plan updates. The
+API worker owns direct-ID/error fixtures; the storage-model worker owns
+publication/placement experiments. Follow-on P3 owners must specify the wire
+format and test publication, sharding and rebuild before wiring a mount.
+P2 cache/invalidation improvements independent of the new format may proceed.
+
+Reverse the conditional selection if direct reads require unbounded scans,
+bootstrap cannot be recovered, publication cannot be safely fenced, or physical
+allocation/GC cannot preserve the bounds. Do not weaken writable-mount,
+encryption or pending-write requirements to make an experiment pass.
+
+The target format will be incompatible with the current chunker/crypt layout.
+No migration or queue drain is required for disposable pre-live data. Prefer
+an isolated empty test namespace first. Any later reset must announce the
+specific vault/cache/pending data affected, downtime, and source paths to copy
+again with rsync, while protecting credentials and all source data outside the
+mount. No reset is necessary or performed for this decision. Go-live remains
+explicit and requires the P4/P6 recovery and acceptance evidence.
