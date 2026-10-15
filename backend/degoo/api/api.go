@@ -36,8 +36,11 @@ const defaultRateLimitCooldown = time.Minute
 const rateLimitLockTimeout = 5 * time.Second
 const metadataCacheTTL = 5 * time.Second
 const metadataCacheMaxEntries = 32
+const metadataCacheMaxBytes = 64 << 20
+const metadataCacheMaxItems = 262144
 const metadataListFlightTimeout = 30 * time.Second
 const itemParentCacheMaxEntries = 4096
+const itemParentCacheMaxBytes = 1 << 20
 const maxWriteAuthBatch = 30
 const maxRegisterBatch = 100
 
@@ -176,9 +179,13 @@ type Client struct {
 	metadataMu         sync.Mutex
 	metadataGeneration uint64
 	metadataCache      map[string]metadataCacheEntry
+	metadataBytes      int64
+	metadataItems      int
+	metadataBudget     metadataCacheBudget
 	metadataParents    map[string]*metadataParentState
 	metadataFlights    map[metadataFlightKey]*metadataListCall
 	itemParents        map[string]itemParentEntry
+	itemParentBytes    int64
 	itemParentOrder    list.List
 	mutationEpoch      uint64
 
@@ -191,6 +198,9 @@ type Client struct {
 
 type metadataCacheEntry struct {
 	items            []Item
+	names            map[string][]int
+	sortedNames      []string
+	bytes            int64
 	expires          time.Time
 	createdAt        time.Time
 	globalGeneration uint64
@@ -470,12 +480,15 @@ func (c *Client) ClearMetadataCache() {
 func (c *Client) clearMetadataCacheLocked() {
 	c.metadataGeneration++
 	c.metadataCache = nil
+	c.metadataBytes = 0
+	c.metadataItems = 0
 	for parentID, state := range c.metadataParents {
 		if state.activeFlights == 0 {
 			delete(c.metadataParents, parentID)
 		}
 	}
 	c.itemParents = nil
+	c.itemParentBytes = 0
 	c.itemParentOrder.Init()
 	c.statsMu.Lock()
 	c.stats.MetadataGlobalInvalidations++
@@ -501,7 +514,7 @@ func (c *Client) invalidateMetadataParents(parents []string, known bool) {
 	}
 	c.metadataMu.Lock()
 	for parentID := range unique {
-		delete(c.metadataCache, parentID)
+		c.removeMetadataEntryLocked(parentID)
 		if state := c.metadataParents[parentID]; state != nil {
 			state.generation++
 			if state.activeFlights == 0 {
@@ -597,7 +610,7 @@ func (c *Client) parentStateLocked(parentID string) *metadataParentState {
 	state := c.metadataParents[parentID]
 	if state == nil {
 		state = &metadataParentState{}
-		c.metadataParents[parentID] = state
+		c.metadataParents[strings.Clone(parentID)] = state
 	}
 	return state
 }
@@ -610,7 +623,7 @@ func (c *Client) parentGenerationLocked(parentID string) uint64 {
 }
 
 func (c *Client) invalidateParentLocked(parentID string) {
-	delete(c.metadataCache, parentID)
+	c.removeMetadataEntryLocked(parentID)
 	c.parentStateLocked(parentID).generation++
 }
 
@@ -638,24 +651,20 @@ func (c *Client) cleanupParentStateLocked(parentID string) {
 func (c *Client) pruneMetadataCacheLocked(now time.Time) {
 	for parentID, entry := range c.metadataCache {
 		if !now.Before(entry.expires) {
-			delete(c.metadataCache, parentID)
+			c.removeMetadataEntryLocked(parentID)
 			c.cleanupParentStateLocked(parentID)
 		}
 	}
 }
 
-func (c *Client) cachedListDirLocked(parentID string, globalGeneration, parentGeneration uint64) ([]Item, bool) {
-	now := time.Now()
-	c.pruneMetadataCacheLocked(now)
-	entry, ok := c.metadataCache[parentID]
-	if !ok || entry.globalGeneration != globalGeneration || entry.parentGeneration != parentGeneration || !now.Before(entry.expires) {
-		return nil, false
-	}
-	return cloneItems(entry.items), true
-}
-
 func (c *Client) cacheListDirLocked(parentID string, items []Item, globalGeneration, parentGeneration uint64) {
 	if globalGeneration != c.metadataGeneration || parentGeneration != c.parentGenerationLocked(parentID) {
+		return
+	}
+	limits := c.metadataLimitsLocked()
+	entry, fits := newMetadataEntry(parentID, items, limits)
+	c.removeMetadataEntryLocked(parentID)
+	if !fits {
 		return
 	}
 	now := time.Now()
@@ -663,31 +672,30 @@ func (c *Client) cacheListDirLocked(parentID string, items []Item, globalGenerat
 		c.metadataCache = make(map[string]metadataCacheEntry)
 	}
 	c.pruneMetadataCacheLocked(now)
-	if _, exists := c.metadataCache[parentID]; !exists && len(c.metadataCache) >= metadataCacheMaxEntries {
+	for len(c.metadataCache) >= metadataCacheMaxEntries || c.metadataItems > limits.items-len(items) || c.metadataBytes > limits.bytes-entry.bytes {
 		oldestKey := ""
 		var oldestTime time.Time
 		haveOldest := false
-		for key, entry := range c.metadataCache {
-			if !haveOldest || entry.createdAt.Before(oldestTime) {
-				oldestKey = key
-				oldestTime = entry.createdAt
-				haveOldest = true
+		for key, cached := range c.metadataCache {
+			if !haveOldest || cached.createdAt.Before(oldestTime) {
+				oldestKey, oldestTime, haveOldest = key, cached.createdAt, true
 			}
 		}
-		if haveOldest {
-			delete(c.metadataCache, oldestKey)
-			c.cleanupParentStateLocked(oldestKey)
+		if !haveOldest {
+			return
 		}
+		c.removeMetadataEntryLocked(oldestKey)
+		c.cleanupParentStateLocked(oldestKey)
 	}
 	state := c.parentStateLocked(parentID)
 	state.generation = parentGeneration
-	c.metadataCache[parentID] = metadataCacheEntry{
-		items:            cloneItems(items),
-		expires:          now.Add(metadataCacheTTL),
-		createdAt:        now,
-		globalGeneration: globalGeneration,
-		parentGeneration: parentGeneration,
-	}
+	entry.expires = now.Add(metadataCacheTTL)
+	entry.createdAt = now
+	entry.globalGeneration = globalGeneration
+	entry.parentGeneration = parentGeneration
+	c.metadataCache[strings.Clone(parentID)] = entry
+	c.metadataBytes += entry.bytes
+	c.metadataItems += len(entry.items)
 }
 
 func (c *Client) rememberItemsLocked(items []Item) {
@@ -696,25 +704,48 @@ func (c *Client) rememberItemsLocked(items []Item) {
 	}
 }
 
+func (c *Client) removeItemParentLocked(id string) {
+	if entry, exists := c.itemParents[id]; exists {
+		c.itemParentBytes -= int64(len(id) + len(entry.parentID))
+		c.itemParentOrder.Remove(entry.order)
+		delete(c.itemParents, id)
+	}
+}
+
 func (c *Client) rememberItemParentLocked(item Item) {
 	if item.ID == "" || item.ParentID == "" {
+		return
+	}
+	// Each field is checked separately so the combined charge cannot overflow.
+	if len(item.ID) > itemParentCacheMaxBytes || len(item.ParentID) > itemParentCacheMaxBytes {
+		c.removeItemParentLocked(item.ID)
+		return
+	}
+	charge := int64(len(item.ID) + len(item.ParentID))
+	if charge > itemParentCacheMaxBytes {
+		c.removeItemParentLocked(item.ID)
 		return
 	}
 	if c.itemParents == nil {
 		c.itemParents = make(map[string]itemParentEntry)
 	}
 	if entry, exists := c.itemParents[item.ID]; exists {
-		entry.parentID = item.ParentID
 		c.itemParentOrder.MoveToBack(entry.order)
+		if entry.parentID == item.ParentID {
+			return
+		}
+		c.itemParentBytes -= int64(len(item.ID) + len(entry.parentID))
+		entry.parentID = strings.Clone(item.ParentID)
 		c.itemParents[item.ID] = entry
-		return
+		c.itemParentBytes += charge
+	} else {
+		id := strings.Clone(item.ID)
+		c.itemParents[id] = itemParentEntry{parentID: strings.Clone(item.ParentID), order: c.itemParentOrder.PushBack(id)}
+		c.itemParentBytes += charge
 	}
-	if len(c.itemParents) >= itemParentCacheMaxEntries {
-		oldest := c.itemParentOrder.Front()
-		delete(c.itemParents, oldest.Value.(string))
-		c.itemParentOrder.Remove(oldest)
+	for len(c.itemParents) > itemParentCacheMaxEntries || c.itemParentBytes > itemParentCacheMaxBytes {
+		c.removeItemParentLocked(c.itemParentOrder.Front().Value.(string))
 	}
-	c.itemParents[item.ID] = itemParentEntry{parentID: item.ParentID, order: c.itemParentOrder.PushBack(item.ID)}
 }
 
 func (c *Client) rememberItemParent(item Item) {
@@ -755,10 +786,7 @@ func (c *Client) advanceMutationEpoch() {
 func (c *Client) forgetItemParents(ids []string) {
 	c.metadataMu.Lock()
 	for _, id := range ids {
-		if entry, exists := c.itemParents[id]; exists {
-			c.itemParentOrder.Remove(entry.order)
-			delete(c.itemParents, id)
-		}
+		c.removeItemParentLocked(id)
 	}
 	c.metadataMu.Unlock()
 }
@@ -1403,7 +1431,22 @@ func (c *Client) ListDirFresh(ctx context.Context, parentID string) ([]Item, err
 	return c.listDir(ctx, parentID, true)
 }
 
+// ListDirMatches returns the exact-name group, or names with fallbackPrefix when
+// no exact match exists. It uses the same complete, short-lived snapshot as
+// ListDir; cached selection copies matching records only. An empty prefix has
+// no fallback. Matching records retain their original listing order.
+func (c *Client) ListDirMatches(ctx context.Context, parentID, name, fallbackPrefix string) ([]Item, error) {
+	return c.listDirSelect(ctx, parentID, false, &metadataNameSelection{name: name, fallbackPrefix: fallbackPrefix})
+}
+
 func (c *Client) listDir(ctx context.Context, parentID string, fresh bool) ([]Item, error) {
+	return c.listDirSelect(ctx, parentID, fresh, nil)
+}
+
+func (c *Client) listDirSelect(ctx context.Context, parentID string, fresh bool, selection *metadataNameSelection) ([]Item, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := c.checkRateLimit(ctx, "GetFileChildren5"); err != nil {
 		return nil, err
 	}
@@ -1432,8 +1475,8 @@ func (c *Client) listDir(ctx context.Context, parentID string, fresh bool) ([]It
 			startCall = true
 		}
 	} else {
-		if cached, ok := c.cachedListDirLocked(parentID, globalGeneration, parentGeneration); ok {
-			items = cached
+		if cached, ok := c.cachedMetadataEntryLocked(parentID, globalGeneration, parentGeneration); ok {
+			items = selectCachedMetadata(cached, selection)
 			cacheHit = true
 		} else {
 			key = metadataFlightKey{parentID: parentID, globalGeneration: globalGeneration, parentGeneration: parentGeneration}
@@ -1463,7 +1506,7 @@ func (c *Client) listDir(ctx context.Context, parentID string, fresh bool) ([]It
 	if startCall {
 		go c.runMetadataListCall(key, call)
 	}
-	return c.waitForMetadataList(ctx, key, call)
+	return c.waitForMetadataList(ctx, key, call, selection)
 }
 
 func (c *Client) recordParentInvalidation() {
@@ -1472,7 +1515,7 @@ func (c *Client) recordParentInvalidation() {
 	c.statsMu.Unlock()
 }
 
-func (c *Client) waitForMetadataList(ctx context.Context, key metadataFlightKey, call *metadataListCall) ([]Item, error) {
+func (c *Client) waitForMetadataList(ctx context.Context, key metadataFlightKey, call *metadataListCall, selection *metadataNameSelection) ([]Item, error) {
 	select {
 	case <-ctx.Done():
 		c.removeMetadataListWaiter(key, call)
@@ -1481,7 +1524,7 @@ func (c *Client) waitForMetadataList(ctx context.Context, key metadataFlightKey,
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return cloneItems(call.items), call.err
+		return selectListedMetadata(call.items, selection), call.err
 	}
 }
 

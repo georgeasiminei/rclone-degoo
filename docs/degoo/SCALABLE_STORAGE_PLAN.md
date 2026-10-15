@@ -223,19 +223,23 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
   IMPLEMENTATION_PLAN.md before coding the selected format. The offline
   comparison and conditional architecture are recorded in
   [SCALABILITY_DECISION.md](SCALABILITY_DECISION.md); activation remains gated
-  on live direct-ID and authoritative root/fencing evidence.
+  on live direct-ID and verified root-publication/exclusive-writer recovery.
 
 ### P2 — bound metadata hot paths
 
-- **P2-HOTPATH** — Status: `not started`; dependencies: P1-DECISION;
-  evidencePR: `TBD`. Implement the selected lookup path, including direct ID
+- **P2-HOTPATH** — Status: `in progress`; dependencies: P1-DECISION;
+  evidencePR:
+  [#50](https://github.com/georgeasiminei/rclone-degoo/pull/50).
+  Implement the selected lookup path, including direct ID
   reads where available and narrowly scoped cache invalidation. Compare
   before/after API-call counters for stat, open, create, overwrite, rename,
   delete, and refresh. Existing-format lookup improvements may start here;
   integration using the new remote index also depends on P3-FORMAT and
   P3-SHARDS. Phase numbers do not require P2 to finish before P3 starts.
-- **P2-BOUNDS** — Status: `not started`; dependencies: P2-HOTPATH;
-  evidencePR: `TBD`. Bound cache entries and memory, verify complete paginated
+- **P2-BOUNDS** — Status: `in progress`; dependencies: P2-HOTPATH;
+  evidencePR:
+  [#50](https://github.com/georgeasiminei/rclone-degoo/pull/50).
+  Bound cache entries and memory, verify complete paginated
   listing above 1,000 children, and assert that a known-path lookup does not
   grow linearly with sibling count after cache warmup. For the selected indexed
   format, also verify cold point lookup traverses bounded index pages without
@@ -600,3 +604,62 @@ implementation commit `4af0011c8`. The user merges and removes the source branch
   fencing protocol. If blocked, experiment with paged remote intent/bootstrap,
   authoritative graph freshness, repeatable cleanup generations and safe
   allocation namespace evolution without assuming provider CAS.
+
+### 2026-10-15 — full-plan goal and existing-format P2 implementation
+
+Delivery: [PR #50](https://github.com/georgeasiminei/rclone-degoo/pull/50),
+targeting `staging`; merging remains with the user. Implementation commit:
+`be976e776`.
+
+- The user set the active goal to finish the full scalable storage plan. This
+  is not a go-live statement or permission to merge PRs on the user's behalf.
+  The previous turn made progress through PR #49's experiments. The resumed
+  inspection confirmed it merged at `a0115f690`; this worktree was rebased on
+  that fetched staging commit with all partial edits preserved.
+- Owner: coordinating Codex agent with API-cache, backend-integration and
+  architecture-review workers. The 10:20 UTC local-only cooldown check still
+  found the hold through 21:30:29 UTC; no provider/auth request was made.
+- P2-HOTPATH and P2-BOUNDS are active for existing-format cache byte/record
+  admission and indexed warm child selection. This is an explicit independent
+  dependency exception: it requires no selected remote format or provider
+  publication assumption. Full indexed cold access remains P3-dependent.
+- Before source edits, the implementation plan records accounting, admission,
+  invalidation, backup/duplicate semantics, deadline preservation and scale
+  evidence. The production mount is not being deployed or reset.
+- Next action: implement and fault-test the bounded cache/index, validate and
+  deliver an independent PR to staging; review publication alternatives against
+  binding requirements while the provider evidence gate remains unavailable.
+
+- Resumed work at 14:17 UTC confirmed PR #49 merged at `a0115f690`; both partial
+  source and documentation edits were preserved while rebasing onto it.
+  API-cache and architecture workers hit a service usage limit before delivery;
+  the coordinating agent owns the remaining implementation and review directly.
+- The user chose the recommended one-writable-Linux-host scope, with robustness
+  before performance. Requirements and decision now record no automatic host
+  takeover, explicit tradeoffs and the delayed-provider-effect counterexample
+  that a local lock alone cannot solve. The full publication/recovery proof
+  remains open; no provider CAS is assumed and no required durability is waived.
+- The 14:23 UTC local-only cooldown check still found expiry at 21:30:29 UTC.
+  No provider or authentication request was sent during the hold.
+
+- Production API snapshots now have byte and record admission alongside the
+  existing parent count/TTL, with bounded parent-hint strings and indexed warm
+  child selection. The opt-in 100,000-entry case passed: warm NewObject uses
+  768 bytes and zero requests, versus the first baseline's 13,607,520 bytes.
+  Cold scans remain O(N). Full P2-BOUNDS also needs the existing directory-ID
+  cache/placeholder set and the P3-dependent cold index path; this increment
+  does not close those gates.
+
+- Full-goal audit remains open: P1 needs live direct-ID evidence and a verified
+  single-host publication/recovery protocol; P2 also needs complete backend
+  cache coverage and the P3 cold index. P3 format/publication/shards/rebuild,
+  P4 mounted crash/fault/operations evidence, optional P5 reset/reseed, and P6
+  live >1,000-entry/>20 GiB/soak acceptance remain required. P6-GOLIVE still
+  requires the user's separate explicit go-live statement. The active goal
+  is not complete and has not been reduced to this cache increment.
+
+- Validation passed on the final source: fresh build, all 186 credential-free
+  packages under the existing CI network-test policy, sequential backend/API/auth
+  race, scoped vet/lint, isolated 100,000-entry warm lookup and 200,000-record
+  snapshot-budget evidence, backup-encoding regression, Markdown/links/task IDs
+  and staged diff checks. Exact results are in [VALIDATION.md](VALIDATION.md).

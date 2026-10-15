@@ -791,3 +791,96 @@ Pending folder states are resolved by an explicitly supplied outcome;
 Degoo visibility, uniqueness, folder placeholders and deletion acknowledgements
 remain unverified. Caller-selected generated IDs and in-memory folder paths are
 not proof that provider-assigned locators can be durably discovered or recovered.
+
+## Production snapshot admission and indexed warm lookup
+
+Delivery: [PR #50](https://github.com/georgeasiminei/rclone-degoo/pull/50),
+targeting `staging`; merging remains with the user. Implementation commit:
+`be976e776`.
+
+This P2 increment starts from merged PR #49 at `a0115f690`. It changes the
+existing backend without introducing a remote format, provider operation or
+runtime deployment. The full scalable-storage plan remains active. Cooldown
+checks at 10:20 and 14:23 UTC on 2026-10-15 still found the shared-client hold
+through 21:30:29 UTC. No provider/authentication request or data reset occurred.
+
+Each API client now caps retained snapshots at 32 parents, 262,144 records and
+64 MiB of accounted bytes. Byte accounting includes Item slice capacity,
+ID/name/parent/URL string contents, retained parent keys, name-index slices and
+a fixed logical charge per name-map entry. It is not exact Go allocator usage
+or a process RSS ceiling. Parent hints separately retain at most 4,096 entries
+and 1 MiB of ID/parent string content. Retained strings are copied so a small
+substring cannot pin a large uncharged response buffer.
+
+Admission evicts oldest snapshots until all budgets fit. An individual
+oversized snapshot bypasses retention; every item is still returned to its
+caller. Replacement, expiry, targeted mutation and global flush release the
+same accounting. This is a local resource policy, not a Degoo quota. Full
+listing results and in-flight responses still scale with directory size;
+production cold point lookup requires the P3 remote index. The backend's
+existing directory-ID cache and remembered-placeholder set are also not made
+byte-bounded by this API change; P2-BOUNDS remains open for complete coverage.
+
+Each admitted snapshot indexes exact names and sorted unique names for backup
+prefix fallback. A warm lookup copies only matching records. Exact duplicates,
+backup-only recovery and promoted-directory placeholder resolution keep their
+existing backend behavior. A cold selector shares complete pagination/flight
+coalescing with ListDir; it does not issue a guessed selective server query.
+Fresh reads continue to bypass snapshots and paginate the complete directory.
+Cache access still checks cancellation and the persisted provider cooldown.
+The five-second TTL and metadata deadlines are unchanged.
+
+Reproduce the warm correctness/allocation and comparable benchmark cases in
+isolation from heavy validation:
+
+```sh
+RCLONE_CONFIG=/notfound RCLONE_DEGOO_SCALE_TESTS=1 \
+  go test ./backend/degoo -run '^TestLookupChildIndexedWarmAllocationBounds$' \
+  -count=1 -v
+RCLONE_CONFIG=/notfound go test ./backend/degoo -run '^$' \
+  -bench '^BenchmarkScalabilityDirectory$/^entries=(1000|10000|100000)$/^page=1000$/^warm_lookup$' \
+  -benchtime=1x -benchmem -count=1
+```
+
+| Siblings | Recorded initial warm NewObject allocation | Indexed warm NewObject allocation | New sample time | HTTP / pages |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 139,872 B/op | 784 B/op | 8.8 microseconds | 0 / 0 |
+| 10,000 | 1,368,672 B/op | 768 B/op | 13.5 microseconds | 0 / 0 |
+| 100,000 | 13,607,520 B/op | 768 B/op | 13.0 microseconds | 0 / 0 |
+
+These are single Linux amd64 / Go 1.26.0 samples of the same existing benchmark,
+compared with its recorded first baseline. Each new operation records one
+snapshot hit. A separate sixteen-iteration direct lookup fixture measures
+561/560/560 bytes per operation at the three scales and asserts that warm
+allocation does not grow with unrelated siblings. Timing is descriptive and
+not a latency guarantee. The default correctness suite covers 1,000/10,000;
+the 100,000-entry allocation case is opt-in and passed separately. Cold scans
+still need 1/10/100 pages at these scales.
+
+Generated tests cover byte and record eviction, oversized admission without
+partial listing results, stale replacement removal, accounting release,
+matching order and caller isolation, duplicate/backup/placeholder semantics,
+cancellation, cooldown refusal, and mutation invalidation. The existing
+populated-snapshot fixture additionally checks accounted byte/record/hint bounds
+and reports them alongside heap samples. No mounted large-scale or live
+provider guarantee follows from these results.
+
+The final populated-snapshot run retained 32,000 / 30,000 / 200,000 item records
+at the 1,000 / 10,000 / 100,000 per-parent scales. Accounted snapshot storage
+was 10,373,376 / 9,720,504 / 64,800,336 bytes, each below 67,108,864 bytes;
+parent-hint strings were 241,664 bytes in all three cases. Exact parent-count,
+complete-pagination and zero-request warm assertions still pass. At 200,000
+records, the whole-process post-GC heap delta was about +69.6 MB, compared with
+the earlier +51.89 MB sample without name indexes. The index costs additional
+retained memory to remove per-lookup sibling scans/copies; the new byte/record
+admission prevents indefinite cache growth. Neither sample isolates cache heap
+or establishes a strict process memory ceiling.
+
+An additional regression reproduced lost backup recovery when the initial
+selector narrowed fallback to one lowercase encoded target prefix. The existing
+backup decoder accepts uppercase hexadecimal too. Fallback now selects the
+reserved backup-name group and applies that decoder, preserving both accepted
+encodings and original duplicate resolution. Exact-name hits remain indexed;
+backup recovery work may grow with the number of backups, rather than all
+ordinary siblings. The regression failed before the correction and passed
+afterward. The comparable final benchmark above includes this correction.

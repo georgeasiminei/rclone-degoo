@@ -34,6 +34,82 @@ authentication change, or remote mutation occurred in that investigation.
 The exact comparison matrix, retry headers, and unresolved causes are in the
 incident record; offline scalability fixtures remain separate evidence.
 
+## Production metadata bounds and indexed warm lookup — 2026-10-15
+
+Delivery: [PR #50](https://github.com/georgeasiminei/rclone-degoo/pull/50),
+targeting `staging`; merging remains with the user. Implementation commit:
+`be976e776`.
+
+This increment rebases the preserved partial P2 work onto merged PR #49 at
+`a0115f690`. It changes the existing backend's snapshot admission and warm name
+lookup, without a new provider operation, remote format, installed-runtime
+change or data reset. The active user goal is still the full scalable storage
+plan. The user's robustness-first, single-writable-Linux-host preference is
+recorded in requirements and the decision; publication/recovery proof remains
+open, including remote effects completing after a local writer dies.
+
+Local-only checks at 10:20 and 14:23 UTC found the shared-client provider hold
+still expiring at **2026-10-15 21:30:29 UTC**. No live Degoo request or account
+authentication work was performed. Worker service limits interrupted API and
+architecture work; the coordinating agent preserved partial backend tests and
+completed implementation directly. No unmerged work was discarded.
+
+Ten new test functions cover snapshot byte/record admission, complete uncached
+oversized results, matching/copy isolation, cancellation and cooldowns,
+mutation invalidation, parent-hint string admission, duplicate names,
+backup-only recovery, promoted placeholders, fresh pagination and warm
+allocation across generated scales. The existing populated-snapshot fixture
+now asserts accounted-byte/record/hint budgets too. See
+[SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) for exact counters, accounting
+scope, timing qualifications, and the additional retained-memory tradeoff.
+
+The initial implementation passed the credential-free repository-wide suite
+(all 186 test packages), then review found that a target-specific lowercase
+backup prefix could lose recovery accepted by the existing hex decoder. A
+regression failed with no returned item for that valid backup. The correction
+selects the indexed backup-name group and retains the original decoder. It
+passed cold and warm recovery, exact-name precedence and duplicate/placeholder
+cases. The final build and suite include this correction; cache lifetime and
+metadata deadlines were not extended.
+
+Checks:
+
+- Fresh full `go build -o` to a temporary binary, used first on `PATH` with a
+  temporary FUSE-helper alias and isolated runtime cache. Short owner-private
+  `TMPDIR`/`GOTMPDIR` paths preserve existing socket-test requirements.
+- `CI=true RCLONE_CONFIG=/notfound go test -timeout 20m -count=1 ./...`:
+  the final run passed all 186 test packages after the backup correction. The
+  existing CI unreliable-network-test policy skips external self-update tests;
+  this does not validate an external download.
+- `RCLONE_CONFIG=/notfound go test -race -p 1 ./backend/degoo/... -count=1`:
+  backend, API and auth passed sequentially.
+- `go vet ./backend/degoo/...` and
+  `golangci-lint run ./backend/degoo/...`: passed with zero lint issues.
+- `RCLONE_CONFIG=/notfound RCLONE_DEGOO_SCALE_TESTS=1 go test ./backend/degoo
+  -run '^TestLookupChildIndexedWarmAllocationBounds$' -count=1 -v`: passed at
+  1,000, 10,000 and 100,000 siblings, zero warm requests, about 560 bytes per
+  direct lookup and no growth with unrelated siblings.
+- The same opt-in environment with `go test ./backend/degoo/api -run
+  '^TestScalabilityPopulatedMetadataSnapshots$' -count=1 -v`: passed through
+  two 100,000-entry snapshots with 64,800,336 accounted bytes, below 67,108,864;
+  hints retained 241,664 string bytes. Parent-count and warm-hit assertions
+  remain intact; no deadline or correctness assertion was weakened.
+- Existing warm NewObject benchmarks, isolated single-iteration samples:
+  784/768/768 bytes per operation and zero HTTP requests/pages at
+  1,000/10,000/100,000 siblings. These are local fixture timings, not provider
+  performance guarantees.
+
+Changed Markdown lint, 65 relative file links, eighteen unique task IDs,
+formatting and staged diff checks passed. The final race and full-suite runs
+were sequential to avoid the existing populated-snapshot fixture's TTL/load
+sensitivity. No timeout or cache freshness lifetime was increased.
+
+This does not close P2-BOUNDS: transient whole-directory/in-flight storage,
+backend directory-ID/placeholder caches and P3-dependent cold index integration
+remain outside this increment. No new-format mounted recovery, live scale,
+large encrypted logical file, provider publication/fencing or power-loss
+exercise was run. P1 provider and P3–P6 acceptance gates remain open.
+
 ## Durable allocation and adaptive placement — 2026-10-15
 
 Delivery: [PR #49](https://github.com/georgeasiminei/rclone-degoo/pull/49),

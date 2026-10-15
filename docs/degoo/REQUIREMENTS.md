@@ -55,6 +55,22 @@ The initial request on 2026-10-15 is for the persistent plan only.
 Implementation and resets belong to later tasks; this planning task must not
 discard any data.
 
+### Robustness and initial writer scope
+
+On 2026-10-15 the user chose the recommended initial writer scope and stated
+that robustness takes priority over performance. The first scalable vault
+supports one writable Linux host, with normal restart on that host and no
+automatic transfer of ownership to another machine. Cross-host handoff and
+concurrent writable hosts are outside initial acceptance. Explain their costs
+before adding them; do not introduce a coordination service implicitly.
+
+This does not weaken ordinary writable-mount, encryption, pending-write
+preservation, complete-version publication, or cache-rebuild requirements.
+A single-host lock is an ownership mechanism within its supported environment,
+not a provider fence. Publication must still handle delayed remote effects,
+ambiguous acknowledgements and recovery. A future transfer must establish that
+the previous writer cannot resume; elapsed time alone is insufficient.
+
 ### Linux mount
 
 - Linux is the primary platform for the initial implementation and acceptance.
@@ -376,7 +392,6 @@ not user constraints or acceptance gates:
 - Layer chunking over rclone’s crypt remote.
 - Start with 1 GiB chunks.
 - Store Degoo refresh state in a separate file named `auth.json`.
-- Begin with a single writer, with an optional read-only development phase.
 
 A future agent may choose another design if it meets the user requirements.
 Do not describe these suggestions as decisions already made by the user.
