@@ -8,6 +8,50 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Scalable storage P1 baseline — 2026-10-15
+
+Delivery: [PR #43](https://github.com/georgeasiminei/rclone-degoo/pull/43),
+targeting `staging` and awaiting the user's merge.
+
+The first implementation slice adds generated directory fixtures at 1,000,
+10,000, and opt-in 100,000 entries, API-call/invalidation traces for file
+operations and chunker discovery, and later-page 429/cancellation regressions.
+[SCALABILITY_EVIDENCE.md](SCALABILITY_EVIDENCE.md) records the counters,
+reproduction commands, measurement limits, and remaining P1 evidence.
+
+Validation passed:
+
+- A fresh `go build -o` to a temporary binary.
+- The credential-free repository-wide `go test -timeout 20m ./...`, with the
+  freshly built binary on `PATH` and a short, private, disk-backed temporary
+  directory for both `TMPDIR` and `GOTMPDIR`.
+- `RCLONE_CONFIG=/notfound go test -race ./backend/degoo/... -count=1`,
+  `go vet ./backend/degoo/...`, and
+  `golangci-lint run ./backend/degoo/...` (zero lint issues).
+- `RCLONE_CONFIG=/notfound RCLONE_DEGOO_SCALE_TESTS=1 go test
+  ./backend/degoo -run '^TestScalabilityDirectory$' -count=1 -v`, including
+  complete 100,000-child enumeration, cold/warm lookup, direct ID, and refresh.
+- All 30 combinations in `BenchmarkScalabilityDirectory`, using
+  `-benchtime=1x -benchmem -count=1`, with returned page ceilings of 1,000 and
+  100. The client still requests 1,000; the smaller ceiling simulates
+  under-filled provider responses. Allocations/op are not peak index memory.
+- Scoped Markdown lint, relative file-link checks, and `git diff --check`.
+
+An initial repository-wide run failed only in `cmd/degoo` socket tests because
+its temporary directory prefix made Unix socket paths too long. The command
+package and subsequent full repository suite passed with a shorter private
+temporary directory. An initial benchmark
+also overlapped heavy validation and hit the existing metadata deadline in
+several 100,000-entry cases; the isolated final benchmark and explicit large
+correctness run passed. The large test remains opt-in so routine race checks
+do not depend on uninstrumented large-directory timing.
+
+P1-RATELIMIT's controlled cases are complete. P1-FIXTURES and P1-LOOKUP remain
+in progress because peak retained index memory, paginated mutations, and the
+encrypted stack still need measurements. No new remote format, provider quota,
+large live directory, or live object cap has been validated. No Degoo requests,
+installed-runtime changes, vault resets, or pending-write deletions occurred.
+
 ## Updates across helper inventory changes — 2026-10-14
 
 An installed updater without `stats.py` in its helper inventory rejected the
