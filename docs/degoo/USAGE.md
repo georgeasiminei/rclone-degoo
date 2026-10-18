@@ -80,6 +80,38 @@ is an explicit, guarded option, not a routine update repair. Deleting queued
 cache data is an exceptional recovery action and should occur only when the
 user has explicitly authorized that data loss for a specific recovery plan.
 
+## Recovering after deleting the remote vault
+
+The local installation stores the dedicated remote folder's ID. Deleting that
+folder in Degoo leaves the local binding pointing to an unavailable object;
+neither `update` nor `login` selects a replacement folder. A new folder with
+the same name has a different ID. In the observed 2026-10-18 incident,
+`GetOverlay4` returned `GraphQLException` for the removed root while account
+listing still succeeded. That error class alone does not prove deletion;
+account or provider problems can also prevent root access.
+
+Stop a failing service with `degoo-rc service stop`, then inspect
+`degoo-rc info` and `degoo-rc logs`. Keep the cache and matching configuration
+until local recovery needs have been assessed. A clean cache entry may hold
+only downloaded ranges, so a cache with no pending uploads is not a complete
+backup of deleted remote files. Recovery of remote deletions depends on
+provider trash or another backup; this client does not guarantee it.
+
+For an intentional fresh start, use the documented
+[uninstall and reinstall flow](INSTALLATION.md#uninstall), retaining both
+configuration and cache if any local data may be needed. Retention needs
+enough separate disk space. Create a new dedicated remote folder and use a
+fresh cache through the installation wizard, then copy the source data again
+with rsync. Do not hand-edit the old folder ID or reuse its cache against a
+new vault. The installer deliberately refuses a different folder ID for an
+existing installation, including through `setup`; a folder newly created by
+`setup` can remain unbound if the follow-up install refuses that change.
+
+Updated updaters check candidate root access before stopping a mounted vault.
+If access fails, resolve the remote binding or account problem first. This
+does not restore already deleted data, and a provider failure can still occur
+between the check and restart.
+
 ## Updating with pending uploads and an older updater
 
 An ordinary `degoo-rc update` keeps pending uploads in the local cache, flushes

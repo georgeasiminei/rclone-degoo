@@ -329,6 +329,216 @@ class UpdateTest(unittest.TestCase):
         start.assert_called_once()
         self.assertFalse((self.root / "tmp/update-backup").exists())
 
+    def test_candidate_vault_preflight_uses_root_only_and_hides_location_output(self):
+        from unittest import mock
+        candidate = self.base / "candidate"
+        (candidate / "bin").mkdir(parents=True)
+        binary = candidate / "bin/rclone"
+        binary.write_text("candidate")
+        commands = []
+
+        def run(arguments, **kwargs):
+            commands.append(arguments)
+            if arguments[-1] == "--help":
+                kwargs["stdout"].write(b"Usage: degoo location [--root-only] vault.json\n")
+                return subprocess.CompletedProcess(arguments, 0)
+            self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+            return subprocess.CompletedProcess(arguments, 0)
+
+        with mock.patch.object(update.subprocess, "run", side_effect=run):
+            update.preflight_candidate_vault(self.root, candidate)
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[1][0], str(binary))
+        self.assertEqual(commands[0][-3:], ["degoo", "location", "--help"])
+        self.assertEqual(commands[1][-3:], ["location", "--root-only", str(self.root / "config/vault.json")])
+        self.assertIn("--config", commands[1])
+        self.assertEqual(commands[1][commands[1].index("--config") + 1], str(self.root / "config/rclone.conf"))
+
+    def test_candidate_vault_preflight_falls_back_without_disclosing_location_output(self):
+        from unittest import mock
+        candidate = self.base / "candidate"
+        (candidate / "bin").mkdir(parents=True)
+        (candidate / "bin/rclone").write_text("candidate")
+        commands = []
+
+        def run(arguments, **kwargs):
+            commands.append(arguments)
+            if arguments[-1] == "--help":
+                kwargs["stdout"].write(b"Usage: degoo location vault.json\n")
+            else:
+                self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+            return subprocess.CompletedProcess(arguments, 0)
+
+        with mock.patch.object(update.subprocess, "run", side_effect=run):
+            update.preflight_candidate_vault(self.root, candidate)
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[1][-2:], ["location", str(self.root / "config/vault.json")])
+
+    def test_candidate_vault_preflight_reports_only_sanitized_failure_class(self):
+        from unittest import mock
+        candidate = self.base / "candidate"
+        (candidate / "bin").mkdir(parents=True)
+        (candidate / "bin/rclone").write_text("candidate")
+
+        def run(arguments, **kwargs):
+            if arguments[-1] == "--help":
+                kwargs["stdout"].write(b"Usage: degoo location [--root-only] vault.json\n")
+                return subprocess.CompletedProcess(arguments, 0)
+            self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+            kwargs["stderr"].write(
+                b'2026/10/18 12:00:00 ERROR : GetOverlay4: GraphQLException token=generated-secret provider body\n'
+            )
+            return subprocess.CompletedProcess(arguments, 1)
+
+        with mock.patch.object(update.subprocess, "run", side_effect=run):
+            with self.assertRaises(update.UpdateError) as raised:
+                update.preflight_candidate_vault(self.root, candidate)
+
+        message = str(raised.exception)
+        self.assertIn("GetOverlay4", message)
+        self.assertIn("GraphQLException", message)
+        self.assertIn("may have been moved or removed", message)
+        self.assertIn("degoo-rc setup --help", message)
+        self.assertIn("will not create a replacement", message)
+        self.assertNotIn("generated-secret", message)
+        self.assertNotIn("provider body", message)
+        self.assertNotIn("private folder ancestry", message)
+
+    def test_candidate_vault_preflight_timeout_fails_closed(self):
+        from unittest import mock
+        candidate = self.base / "candidate"
+        (candidate / "bin").mkdir(parents=True)
+        (candidate / "bin/rclone").write_text("candidate")
+        with mock.patch.object(update.subprocess, "run", side_effect=subprocess.TimeoutExpired("candidate", 30)):
+            with self.assertRaisesRegex(update.UpdateError, "root check timed out") as raised:
+                update.preflight_candidate_vault(self.root, candidate)
+        self.assertIn("current mount and installed program were left untouched", str(raised.exception))
+
+    def test_candidate_preflight_failure_prevents_mount_preparation_and_shutdown(self):
+        from unittest import mock
+        state = {"service_active": False, "service_owned": False, "manual_arguments": ["owned"],
+                 "manual_directory": str(self.home), "mounted": True}
+        identity = {"payload_sha256": "f" * 64, "binary_sha256": "e" * 64}
+        with mock.patch.object(update, "installed_matches", return_value=False), \
+                mock.patch.object(update, "runtime_state", return_value=state), \
+                mock.patch.object(update, "preflight_mount_directory"), \
+                mock.patch.object(update.wizard, "_mount_preflight", return_value=[]), \
+                mock.patch.object(update, "preflight_candidate_vault", side_effect=update.UpdateError("root check failed")) as preflight, \
+                mock.patch.object(update, "prepare_mount_for_update") as prepare, \
+                mock.patch.object(update, "stop_runtime") as stop, \
+                mock.patch.object(update, "start_runtime") as start:
+            with self.assertRaisesRegex(update.UpdateError, "root check failed"):
+                update.apply_update(self.root, self.base / "unused-package", identity, {}, "a" * 64,
+                                    delete_cache=False)
+        preflight.assert_called_once_with(self.root, self.base / "unused-package")
+        prepare.assert_not_called()
+        stop.assert_not_called()
+        start.assert_not_called()
+
+    def test_unchanged_update_skips_candidate_provider_preflight(self):
+        from unittest import mock
+        with mock.patch.object(update, "installed_matches", return_value=True), \
+                mock.patch.object(update, "preflight_candidate_vault") as preflight:
+            self.assertFalse(update.apply_update(self.root, self.base / "unused-package", {}, {}, "a" * 64,
+                                                 delete_cache=False))
+        preflight.assert_not_called()
+
+    def test_failed_service_restart_reports_fresh_sanitized_error_and_stops_loop(self):
+        from unittest import mock
+        import uninstall
+        log = self.root / "logs/mount.log"
+        log.write_text("2026/10/18 11:59:00 ERROR : historical failure from old run\n", encoding="utf-8")
+        log.chmod(0o600)
+        state = {"service_owned": True, "service_active": True, "manual_arguments": None}
+
+        def wait_for_mount(_root):
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "2026/10/18 12:00:00 ERROR : GetOverlay4: GraphQLException token=generated-secret provider response body\n"
+                )
+            return "not mounted"
+
+        with mock.patch.object(update.service, "_systemctl", return_value=subprocess.CompletedProcess([], 0)), \
+                mock.patch.object(update.service, "_require_loaded_unit"), \
+                mock.patch.object(update.wizard, "_wait_for_mount", side_effect=wait_for_mount), \
+                mock.patch.object(update.wizard, "_mounted_state", return_value="not mounted"), \
+                mock.patch.object(uninstall, "_stop_owned_service") as stop:
+            with self.assertRaises(update.UpdateError) as raised:
+                update.start_runtime(self.root, state)
+
+        message = str(raised.exception)
+        self.assertIn("GetOverlay4", message)
+        self.assertIn("GraphQLException", message)
+        self.assertNotIn("historical failure", message)
+        self.assertNotIn("generated-secret", message)
+        self.assertNotIn("provider response body", message)
+        stop.assert_called_once_with(self.root, update.installer.load_manifest(self.root), disable=False)
+
+    def test_rotated_or_truncated_startup_log_does_not_reuse_old_errors(self):
+        log = self.root / "logs/mount.log"
+        old_error = "2026/10/18 11:59:00 ERROR : GetOverlay4 GraphQLException old-run-private-body\n"
+        for mode in ("truncated", "rotated"):
+            with self.subTest(mode=mode):
+                log.write_text(old_error, encoding="utf-8")
+                log.chmod(0o600)
+                snapshot = update._startup_log_snapshot(self.root, "mount.log")
+                if mode == "truncated":
+                    log.write_text("2026/10/18 12:00:00 INFO : new process started\n", encoding="utf-8")
+                    log.chmod(0o600)
+                else:
+                    log.rename(self.root / "logs/mount.log.old")
+                    log.write_text("2026/10/18 12:00:00 INFO : new process started\n", encoding="utf-8")
+                    log.chmod(0o600)
+                self.assertEqual(update._fresh_startup_diagnostics(snapshot), "")
+                if mode == "rotated":
+                    (self.root / "logs/mount.log.old").unlink()
+
+    def test_failed_service_restart_keeps_owned_service_when_mount_state_is_not_confirmed(self):
+        from unittest import mock
+        import uninstall
+        state = {"service_owned": True, "service_active": True, "manual_arguments": None}
+        for mount_state in ("mounted", "unknown (mount table unavailable)"):
+            with self.subTest(mount_state=mount_state), \
+                    mock.patch.object(update.service, "_systemctl", return_value=subprocess.CompletedProcess([], 0)), \
+                    mock.patch.object(update.service, "_require_loaded_unit"), \
+                    mock.patch.object(update.wizard, "_wait_for_mount", return_value="not mounted"), \
+                    mock.patch.object(update.wizard, "_mounted_state", return_value=mount_state), \
+                    mock.patch.object(uninstall, "_stop_owned_service") as stop:
+                with self.assertRaises(update.UpdateError):
+                    update.start_runtime(self.root, state)
+                stop.assert_not_called()
+
+    def test_nonzero_service_start_stops_owned_service_only_after_mount_check(self):
+        from unittest import mock
+        import uninstall
+        log = self.root / "logs/mount.log"
+        log.write_text("2026/10/18 11:59:00 ERROR : old startup error\n", encoding="utf-8")
+        log.chmod(0o600)
+        state = {"service_owned": True, "service_active": True, "manual_arguments": None}
+
+        def systemctl(_root, *arguments):
+            if arguments[0] == "start":
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write("2026/10/18 12:00:00 ERROR : GetOverlay4 GraphQLException private response\n")
+                return subprocess.CompletedProcess([], 1)
+            return subprocess.CompletedProcess([], 0)
+
+        with mock.patch.object(update.service, "_systemctl", side_effect=systemctl), \
+                mock.patch.object(update.service, "_require_loaded_unit"), \
+                mock.patch.object(update.wizard, "_mounted_state", return_value="not mounted"), \
+                mock.patch.object(update.wizard, "_wait_for_mount") as wait, \
+                mock.patch.object(uninstall, "_stop_owned_service") as stop:
+            with self.assertRaises(update.UpdateError) as raised:
+                update.start_runtime(self.root, state)
+
+        self.assertIn("GetOverlay4", str(raised.exception))
+        self.assertNotIn("old startup error", str(raised.exception))
+        self.assertNotIn("private response", str(raised.exception))
+        wait.assert_not_called()
+        stop.assert_called_once_with(self.root, update.installer.load_manifest(self.root), disable=False)
+
     def test_unsafe_runtime_bytecode_is_actionable_before_runtime_stop(self):
         from unittest import mock
         bytecode_dir = self.root / "scripts/python/__pycache__"
@@ -583,6 +793,7 @@ class UpdateTest(unittest.TestCase):
         identity = {"payload_sha256": "f" * 64, "binary_sha256": "e" * 64}
         with mock.patch.object(update, "runtime_state", return_value=state), \
                 mock.patch.object(update.wizard, "_mount_preflight", return_value=[]), \
+                mock.patch.object(update, "preflight_candidate_vault"), \
                 mock.patch.object(update, "prepare_mount_for_update", side_effect=update.UpdateError("busy deadline")) as prepare, \
                 mock.patch.object(update, "stop_runtime") as stop, \
                 mock.patch.object(update, "start_runtime") as start:
@@ -605,6 +816,7 @@ class UpdateTest(unittest.TestCase):
         connection.getresponse.return_value = response
         with mock.patch.object(update, "runtime_state", return_value=state), \
                 mock.patch.object(update.wizard, "_mount_preflight", return_value=[]), \
+                mock.patch.object(update, "preflight_candidate_vault"), \
                 mock.patch.object(update.mount_sync, "_socket_path", return_value=self.root / "tmp/vfs-sync.sock"), \
                 mock.patch.object(update.mount_sync, "UnixHTTPConnection", return_value=connection), \
                 mock.patch.object(update, "stop_runtime") as stop, \
@@ -624,6 +836,7 @@ class UpdateTest(unittest.TestCase):
         with mock.patch.object(update, "runtime_state", return_value=state), \
                 mock.patch.object(update.wizard, "_mount_preflight", return_value=[]), \
                 mock.patch.object(update, "preflight_mount_directory"), \
+                mock.patch.object(update, "preflight_candidate_vault"), \
                 mock.patch.object(update, "prepare_mount_for_update", return_value=(Path("/private/sock"), token)), \
                 mock.patch.object(update, "renew_mount_preparation") as renew, \
                 mock.patch.object(update, "stop_runtime", side_effect=update.UpdateError("busy unmount")), \
