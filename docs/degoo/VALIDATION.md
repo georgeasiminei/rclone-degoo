@@ -8,6 +8,43 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Uninstall metadata lock mismatch — 2026-10-18
+
+An explicitly requested fresh uninstall, with all retention options declined
+and the vault-secret and removal confirmations supplied, refused cleanup
+because the persistent metadata cache contained `.lock.lock`. The runtime
+passes `.lock` to a shared locking helper which appends `.lock`; the older
+uninstaller recognized only `.lock`. The observed file was an owner-private,
+empty regular file with one link. It contained no pending file content.
+
+The correction recognizes these two exact lock names with the existing
+ownership, permissions, regular-file, link-count and size checks. Lock files
+do not consume the 8,192-entry metadata-object budget. Arbitrary names and
+unsafe files still refuse cleanup; upload-recovery and cache-identity checks
+remain in place. Cache retention copies these locks, so the restore auditor
+needs the same exact-name correction to accept a valid retained cache.
+Generated fixtures exercise cleanup, restoration and the rejection paths.
+
+Validation passed: all 458 Python helper tests, including 66 uninstall tests
+and 16 restore tests; Python compilation; Markdown lint; relative document
+links; and `git diff --check`. The pending-data fixture verifies restoration
+of a retained external cache containing both metadata lock variants.
+The metadata-object budget remains 8,192 even when either or both locks exist.
+No Go source was changed, and no provider request was needed for validation.
+
+The user-authorized live retry used the corrected source helper against the
+existing installation. Its recorded binary hash matched; an independent scan
+found all local VFS metadata clean and well formed, with no pending uploads.
+Cleanup completed with no retention selected: the installed program,
+configuration (including the vault secret), cached file data, logs, owned
+command link and user-service links were removed. The external cache retains
+only the empty cache-lock sentinel intentionally preserved by the helper.
+Two inspected service overrides from earlier cache/pacing setup were removed
+separately. Systemd then reported `LoadState=not-found`, `ActiveState=inactive`,
+an empty fragment path and no drop-ins. No remote request or mutation occurred.
+A fresh installation and rsync reseed remain for the user; no replacement
+vault or new remote format was created.
+
 ## Update restart after remote deletion — 2026-10-18
 
 The update from successful staging build `39101975418` (`49d220745d31`)

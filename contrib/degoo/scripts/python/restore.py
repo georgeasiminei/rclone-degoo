@@ -364,13 +364,21 @@ def _scan_cache(path: Path) -> tuple[bool, tuple[tuple[Any, ...], ...]]:
                     metadata_entries = sorted(metadata_dir.iterdir(), key=lambda item: item.name)
                 except OSError:
                     raise RestoreError("the retained metadata cache could not be inspected") from None
-                if len(metadata_entries) > MAX_METADATA_CACHE_ENTRIES + 1:
+                metadata_lock_names = {".lock", ".lock.lock"}
+                metadata_file_count = sum(
+                    metadata_entry.name not in metadata_lock_names
+                    for metadata_entry in metadata_entries
+                )
+                if (
+                    len(metadata_entries) > MAX_METADATA_CACHE_ENTRIES + len(metadata_lock_names)
+                    or metadata_file_count > MAX_METADATA_CACHE_ENTRIES
+                ):
                     raise RestoreError("the retained metadata cache exceeds its bounded entry count")
                 total_bytes = 0
                 for metadata_entry in metadata_entries:
                     relative = f"metadata/{cache_name}/{metadata_entry.name}"
                     info = _private_cache_file(metadata_entry)
-                    if metadata_entry.name == ".lock":
+                    if metadata_entry.name in metadata_lock_names:
                         if info.st_size > MAX_LOCK_SIZE:
                             raise RestoreError("the retained metadata cache lock file is invalid")
                     elif METADATA_CACHE_FILE.fullmatch(metadata_entry.name):

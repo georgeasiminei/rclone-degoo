@@ -168,6 +168,7 @@ class RestoreTest(unittest.TestCase):
         metadata_entry = metadata_dir / ("b" * 64 + ".cache")
         self.write_private(metadata_entry, b"generated encrypted metadata entry")
         self.write_private(metadata_dir / ".lock", b"")
+        self.write_private(metadata_dir / ".lock.lock", b"")
 
         external_cache = self.base / "target cache"
         external_cache.mkdir(mode=0o700)
@@ -188,9 +189,47 @@ class RestoreTest(unittest.TestCase):
             restore.restore_to_install(backup, self.target)
 
         self.assertTrue((external_cache / "metadata" / self.cache_name / metadata_entry.name).is_file())
+        self.assertTrue((external_cache / "metadata" / self.cache_name / ".lock.lock").is_file())
         self.assertTrue((external_cache / "vfs" / self.cache_name / "pending data.bin").is_file())
         self.assertEqual(decoy.read_bytes(), b"unrelated install cache")
         self.assertEqual(json.loads((self.target / "config/vault.json").read_bytes())["cache_dir"], str(external_cache))
+
+    def test_metadata_cache_lock_variants_remain_private_bounded_and_exact(self) -> None:
+        self.add_cache_data()
+        metadata_dir = self.backup / "cache" / "metadata" / self.cache_name
+        metadata_dir.mkdir(parents=True, mode=0o700)
+        metadata_dir.chmod(0o700)
+        (self.backup / "cache" / "metadata").chmod(0o700)
+        lock = metadata_dir / ".lock.lock"
+
+        self.write_private(lock, b"")
+        lock.chmod(0o644)
+        with self.assertRaises(restore.RestoreError):
+            restore.inspect_backup(self.backup, self.target)
+
+        lock.chmod(0o600)
+        self.write_private(lock, bytes(restore.MAX_LOCK_SIZE + 1))
+        with self.assertRaises(restore.RestoreError):
+            restore.inspect_backup(self.backup, self.target)
+
+        self.write_private(lock, b"")
+        hardlink = metadata_dir / "outside-link"
+        os.link(lock, hardlink)
+        with self.assertRaises(restore.RestoreError):
+            restore.inspect_backup(self.backup, self.target)
+        hardlink.unlink()
+
+        unknown = metadata_dir / ".lock.lock.extra"
+        self.write_private(unknown, b"")
+        with self.assertRaisesRegex(restore.RestoreError, "unknown file"):
+            restore.inspect_backup(self.backup, self.target)
+        unknown.unlink()
+
+        self.write_private(metadata_dir / ("a" * 64 + ".cache"), b"")
+        self.write_private(metadata_dir / ("b" * 64 + ".cache"), b"")
+        with mock.patch.object(restore, "MAX_METADATA_CACHE_ENTRIES", 1):
+            with self.assertRaisesRegex(restore.RestoreError, "bounded entry count"):
+                restore.inspect_backup(self.backup, self.target)
 
     def test_restore_rejects_an_active_source_cache_lock(self) -> None:
         self.add_cache_data()
