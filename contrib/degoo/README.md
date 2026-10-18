@@ -462,7 +462,9 @@ command's options and examples. The interface includes `install`, `uninstall`,
 `location`, `folders`, `service`, `info`, `logs`, `trash`, and `empty-trash`. Run
 `mount-setup` explicitly with `sudo` to install the helper for an immutable
 `/mnt/degoo`; it does not mount the vault or start its service. `service`
-accepts `enable`, `disable`, `start`, `stop`, `restart`, and `status`. Existing
+accepts `install`, `enable`, `disable`, `start`, `stop`, `restart`, and `status`.
+`service install` registers the user unit without enabling or starting it; the
+wizard performs that registration when startup is declined. Existing
 command options remain available; command help is the reference for their
 current parameters.
 

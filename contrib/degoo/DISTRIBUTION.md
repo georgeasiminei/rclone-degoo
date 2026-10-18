@@ -500,7 +500,9 @@ their only root-level Degoo command. In-place upgrades may retain root-level
 `.sh` shims already present in an older install. New examples use `degoo-rc`.
 The command list is available with `degoo-rc help`, and `degoo-rc COMMAND help`
 shows that command's options.
-`service` accepts `enable`, `disable`, `start`, `stop`, `restart`, and `status`;
+`service` accepts `install`, `enable`, `disable`, `start`, `stop`, `restart`,
+and `status`;
+`service install` registers the user unit without enabling or starting it;
 existing command options remain available. `trash` lists account trash, while
 `empty-trash` is the separate deletion command. The six Markdown files in
 `docs/` are copied from `docs/degoo/` and flattened to that directory.

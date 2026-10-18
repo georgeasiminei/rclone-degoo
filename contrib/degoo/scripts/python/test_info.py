@@ -418,6 +418,36 @@ class InfoTest(unittest.TestCase):
         with mock.patch.object(info, "_systemctl", side_effect=systemctl):
             self.assertEqual(info.service_status(self.root, self.manifest), "enabled; active")
 
+    def test_linked_service_state_is_not_reported_as_enabled(self) -> None:
+        config_home = self.base / "xdg-config"
+        unit_dir = config_home / "systemd/user"
+        unit_dir.mkdir(parents=True, mode=0o700)
+        source_unit = self.root / "rclone-degoo.service"
+        source_unit.write_text("[Service]\n", encoding="ascii")
+        source_unit.chmod(0o600)
+        direct = unit_dir / "rclone-degoo.service"
+        direct.symlink_to(source_unit)
+        self.manifest["service_config_home"] = str(config_home)
+        self.manifest["service_links"] = [str(direct)]
+        self.write_private(self.root / "install.json", self.manifest)
+
+        for unit_file_state, active_state, expected in (
+            ("enabled", "active", "enabled; active"),
+            ("enabled-runtime", "inactive", "enabled; inactive"),
+            ("linked", "active", "disabled; active"),
+            ("linked-runtime", "inactive", "disabled; inactive"),
+        ):
+            with self.subTest(unit_file_state=unit_file_state, active_state=active_state):
+                def systemctl(*args: str, **_: object):
+                    if args[0] == "show":
+                        return subprocess_result(str(direct).encode())
+                    if args[0] == "is-enabled":
+                        return subprocess_result(f"{unit_file_state}\n".encode())
+                    return subprocess_result(f"{active_state}\n".encode())
+
+                with mock.patch.object(info, "_systemctl", side_effect=systemctl):
+                    self.assertEqual(info.service_status(self.root, self.manifest), expected)
+
     def test_remote_check_keeps_only_validated_folder_names(self) -> None:
         binary = self.root / "bin/rclone"
         binary.write_text(

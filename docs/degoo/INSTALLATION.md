@@ -329,7 +329,10 @@ remote files. Restoring an existing encrypted folder requires its original
 The installer uses `~/.local/share/rclone-degoo` as the private root and sets
 its directories to owner-only access (`0700`) and private config files to
 `0600`. The wizard offers to enable the systemd user service by default when a
-user manager responds. It does not enable lingering automatically.
+user manager responds. Answering No registers the unit without enabling or
+starting it, so configuration can be edited before the first mount. Existing
+service enablement is preserved during an upgrade. It does not enable lingering
+automatically.
 
 The initial cache defaults to the install's `cache/` directory. After setup,
 `cache_dir` in `config/vault.json` is authoritative; all helpers accept a
@@ -536,6 +539,28 @@ degoo-rc service enable
 degoo-rc service status
 degoo-rc service restart
 ```
+
+If you declined startup in the wizard, edit the configuration first and run
+`degoo-rc service start` when ready. This starts the registered service without
+enabling automatic startup. Older installations whose unit was never registered
+can run `degoo-rc service install` first; this registers it without enabling or
+starting it. `degoo-rc service enable` both enables automatic startup and starts
+the service.
+
+Run these commands as the installing user, without sudo. The generated
+`rclone-degoo.service` is a user unit and has no `User=` setting. Copying it to
+`/etc/systemd/system` makes it run as root, where private-file ownership checks
+fail. If that copy was installed by mistake, stop and disable the system unit,
+remove that copied definition, and reload the system manager before starting
+the registered user unit.
+
+When `degoo-rc stats` says the vault is not mounted, `/mnt/degoo` is the
+underlying local directory. Its write protection prevents accidental local
+writes; changing its mode does not mount Degoo. Use
+`findmnt --mountpoint /mnt/degoo`, then check the service and its logs.
+Preserve any ordinary files created
+there outside the mount before retrying. After mounting, run `cd /mnt/degoo`
+again so a shell previously in the underlying directory enters the FUSE mount.
 
 The service starts at login. To keep it running after logout and start it at
 boot, check and enable account lingering if needed:
@@ -982,7 +1007,8 @@ Run `degoo-rc help` to list commands and `degoo-rc COMMAND help` for detailed
 parameters and examples. Available commands are `install`, `uninstall`,
 `login`, `setup`, `mount`, `stop`, `status`, `update`, `location`, `folders`,
 `service`, `info`, `logs`, `trash`, and `empty-trash`. The `service` actions are
-`enable`, `disable`, `start`, `stop`, `restart`, and `status`. Current installer
+`install`, `enable`, `disable`, `start`, `stop`, `restart`, and `status`.
+Current installer
 and helper options remain supported; command-specific help is authoritative.
 `trash` lists account trash. `empty-trash` is a separate account-wide deletion
 command with its own confirmation behavior.

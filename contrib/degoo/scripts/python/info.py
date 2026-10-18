@@ -480,9 +480,19 @@ def service_status(root: Path, manifest: dict[str, Any]) -> str:
     active = "unknown"
     if enabled_result is not None and len(enabled_result.stdout) <= 256:
         value = enabled_result.stdout.decode("utf-8", errors="ignore").strip()
-        if value in {"enabled", "enabled-runtime", "linked", "linked-runtime"}:
+        if value in {"enabled", "enabled-runtime"}:
             enabled = "enabled"
-        elif value in {"disabled", "static", "indirect", "masked", "generated", "transient", "alias"}:
+        elif value in {
+            "disabled",
+            "linked",
+            "linked-runtime",
+            "static",
+            "indirect",
+            "masked",
+            "generated",
+            "transient",
+            "alias",
+        }:
             enabled = "disabled"
     if active_result is not None and len(active_result.stdout) <= 256:
         value = active_result.stdout.decode("utf-8", errors="ignore").strip()
@@ -771,7 +781,7 @@ def report(root: Path, manifest: dict[str, Any], *, check_remote: bool = False) 
         ("Rclone config", root / "config" / "rclone.conf", "contained remote and auth-file path"),
         ("Install manifest", root / "install.json", "local vault identity and owned systemd-link records"),
         ("User service unit", root / service_manager.UNIT_NAME, "mount startup, restart policy, and stop command"),
-        ("Service command", root / "degoo-rc", "service enable, disable, start, stop, and inspect the user service"),
+        ("Service command", root / "degoo-rc", "service install, enable, disable, start, stop, and inspect the user service"),
         ("Cache", cache_dir, "local cached file data and pending writes"),
         ("Logs", root / "logs", "contained command logs"),
     )

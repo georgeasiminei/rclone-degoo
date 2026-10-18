@@ -52,7 +52,7 @@ DETAILS = {
     "sync": "Use sync . from inside the mount, or pass an absolute mounted path. Refreshes remote directory metadata recursively; a file path refreshes its containing directory, and a missing path refreshes its nearest existing directory inside the mount. Preserves pending local writes. Reopen files to see changed content. This command does not upload, mirror, or download the whole directory.",
     "location": "Takes no positional parameters. Contacts Degoo and may renew account tokens. Returns the configured folder ancestry as JSON; does not download file contents.",
     "folders": "Uses the contained account authentication. Defaults to account root ID 0 to discover device folders. --parent-id ID lists children of that folder; output is JSON. Does not modify remote files.",
-    "service": "enable links and starts the owned user service; disable stops and unlinks it. start, stop, restart, and status operate on that service. Account lingering is configured separately with loginctl.",
+    "service": "install registers the owned user service without enabling or starting it. enable registers, enables, and starts it; disable stops and unlinks it. start, stop, restart, and status operate on the registered user service. Run without sudo. Account lingering is configured separately with loginctl.",
     "info": "The default report is local-only. --check-remote queries folder ancestry and may renew account tokens. Reports pending uploads separately from remote completion; never prints saved credentials.",
     "logs": "Shows recent mount, login, setup, status, and Degoo diagnostic messages plus an account-authentication summary. Cobra usage blocks are compacted to keep command errors visible. --follow watches for new lines; Ctrl+C exits. Recognized credential fields and signed URLs are redacted from displayed lines.",
 }
@@ -158,7 +158,7 @@ _degoo_rc()
     elif (( COMP_CWORD == 2 )); then
         case "${COMP_WORDS[1]}" in
             help) choices='@HELP_TOPICS@' ;;
-            service) choices='enable disable start stop restart status' ;;
+            service) choices='install enable disable start stop restart status' ;;
             benchmark) choices='read write' ;;
             completion) choices='bash' ;;
         esac

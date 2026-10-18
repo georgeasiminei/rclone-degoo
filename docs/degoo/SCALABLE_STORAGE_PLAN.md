@@ -837,3 +837,28 @@ shipping local-only authority would violate the explicit recovery requirement.
   affect maintenance helpers only. The scalable storage implementation and
   remaining remote recovery, publication, mounted fault and go-live gates
   retain their existing status.
+
+### 2026-10-18 — service registration after a fresh install
+
+- The user reinstalled and chose to edit the cache location and encryption
+  settings before starting. Declining startup must now register the user unit
+  without enabling or starting it; `service install` provides the same action
+  explicitly. A registered unit is reported as not enabled until automatic
+  startup is enabled. Existing enablement remains intact during upgrades.
+- A mistaken copy in the system manager was stopped, disabled and removed.
+  A local file written into the unmounted directory was preserved outside it,
+  the empty underlying directory was protected again, and the proper user
+  service started successfully. The kernel confirms a FUSE mount and local
+  statistics work. The recovered test file passed fsync/local readback and
+  VFS reports it uploaded; its private external recovery copy remains.
+- After changing the vault password, the user logged in again to save the
+  account credentials under the chosen key; offline decryption then succeeded.
+  This does not prove rejected-token recovery or independent cloud integrity.
+  No cache reset or remote-format redesign was part of the repair. The active
+  filesystem still uses the legacy crypt/chunker stack; P3 integration,
+  publication/recovery and remaining mounted/go-live gates stay open.
+- All 465 Python helper tests, compilation, Markdown/link checks and diff
+  checks passed. The validated maintenance helpers were applied under the
+  updater lock; the normal status command reports healthy, mounted and
+  `disabled; active`, with zero pending uploads. See
+  [VALIDATION.md](VALIDATION.md) for evidence and limits.
