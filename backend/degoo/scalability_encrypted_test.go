@@ -3,10 +3,14 @@ package degoo
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -199,9 +203,39 @@ func TestScalabilityPaginatedMutations(t *testing.T) {
 	})
 }
 
-func newEncryptedChunkerStack(t *testing.T, mock *mockDegoo) (*chunker.Fs, *Fs) {
+type encryptedChunkerStackOptions struct {
+	HashType     string
+	Transactions string
+	FailHard     bool
+	WrapHandler  func(http.Handler) http.Handler
+}
+
+var tracedEncryptedChunkerOptions = encryptedChunkerStackOptions{
+	HashType:     "md5",
+	Transactions: "rename",
+}
+
+var installedEncryptedChunkerOptions = encryptedChunkerStackOptions{
+	HashType:     "sha1all",
+	Transactions: "norename",
+	FailHard:     true,
+}
+
+func newEncryptedChunkerStack(t *testing.T, mock *mockDegoo, options encryptedChunkerStackOptions) (*chunker.Fs, *Fs) {
 	t.Helper()
-	base, server := newTestFs(t, mock)
+	var base *Fs
+	var server *httptest.Server
+	if options.WrapHandler == nil {
+		base, server = newTestFs(t, mock)
+	} else {
+		f, testServer, err := newTestFsAtRootIDWithHandler(t, options.WrapHandler(mock), "", "vault")
+		if err != nil {
+			testServer.Close()
+			t.Fatalf("NewFs with wrapped handler: %v", err)
+		}
+		base = f.(*Fs)
+		server = testServer
+	}
 	t.Cleanup(server.Close)
 
 	degooRemote := ":degoo," + (configmap.Simple{
@@ -223,8 +257,9 @@ func newEncryptedChunkerStack(t *testing.T, mock *mockDegoo) (*chunker.Fs, *Fs) 
 		"name_format":  "*.rclone_chunk.###",
 		"start_from":   "1",
 		"meta_format":  "simplejson",
-		"hash_type":    "md5",
-		"transactions": "rename",
+		"hash_type":    options.HashType,
+		"transactions": options.Transactions,
+		"fail_hard":    fmt.Sprint(options.FailHard),
 	})
 	if err != nil {
 		t.Fatalf("chunker.NewFs over crypt: %v", err)
@@ -310,9 +345,126 @@ func readObject(t *testing.T, obj fs.Object) []byte {
 }
 
 func TestScalabilityEncryptedChunkerTrace(t *testing.T) {
+	runEncryptedChunkerLifecycle(t, tracedEncryptedChunkerOptions)
+}
+
+func TestScalabilityEncryptedChunkerInstalledSettingsLifecycle(t *testing.T) {
+	runEncryptedChunkerLifecycle(t, installedEncryptedChunkerOptions)
+}
+
+type sourceFailureReader struct{}
+
+func (sourceFailureReader) Read([]byte) (int, error) {
+	return 0, errors.New("injected source failure")
+}
+
+func TestScalabilityEncryptedChunkerInstalledSettingsFailedOverwritePreservesOldVersion(t *testing.T) {
+	for _, failAfter := range []int{0, 127, 128, 129, 511, 623} {
+		t.Run(fmt.Sprint(failAfter), func(t *testing.T) {
+			ctx := context.Background()
+			mock := newMockDegoo()
+			stack, base := newEncryptedChunkerStack(t, mock, installedEncryptedChunkerOptions)
+			original := bytes.Repeat([]byte("old complete version;"), 31)
+			name := "generated-recovery-file"
+			info := func(size int) fs.ObjectInfo {
+				return object.NewStaticObjectInfo(name, time.Now(), int64(size), true, nil, stack)
+			}
+			if _, err := stack.Put(ctx, bytes.NewReader(original), info(len(original))); err != nil {
+				t.Fatalf("initial Put: %v", err)
+			}
+
+			replacement := bytes.Repeat([]byte("replacement;"), 60)
+			reader := io.MultiReader(bytes.NewReader(replacement[:failAfter]), sourceFailureReader{})
+			if _, err := stack.Put(ctx, reader, info(len(replacement))); err == nil {
+				t.Fatal("incomplete overwrite succeeded")
+			}
+			assertEncryptedReadback(t, stack, base, name, original, "failed source read")
+		})
+	}
+}
+
+func TestScalabilityEncryptedChunkerInstalledSettingsManifestPublishFailurePreservesOldVersion(t *testing.T) {
 	ctx := context.Background()
 	mock := newMockDegoo()
-	stack, base := newEncryptedChunkerStack(t, mock)
+	var armed, triggered atomic.Bool
+	var stagedObjects atomic.Int32
+	var target string
+	var originalObjectCount int
+	options := installedEncryptedChunkerOptions
+	options.WrapHandler = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if !armed.Load() || request.Method != http.MethodPost || request.URL.Path != "/" {
+				next.ServeHTTP(writer, request)
+				return
+			}
+			raw, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Errorf("read GraphQL request: %v", err)
+				http.Error(writer, "request read failed", http.StatusBadRequest)
+				return
+			}
+			request.Body = io.NopCloser(bytes.NewReader(raw))
+			var input struct {
+				Operation string                     `json:"operationName"`
+				Variables map[string]json.RawMessage `json:"variables"`
+			}
+			if json.Unmarshal(raw, &input) == nil && input.Operation == "SetRenameFile" {
+				var rows []struct {
+					Name string `json:"NewName"`
+				}
+				if json.Unmarshal(input.Variables["FileRenames"], &rows) == nil && len(rows) == 1 && rows[0].Name == target {
+					if count := mockVaultDataObjectCount(mock); count > originalObjectCount && triggered.CompareAndSwap(false, true) {
+						stagedObjects.Store(int32(count))
+						writeTestJSON(writer, map[string]any{"errors": []any{map[string]string{"message": "injected manifest publication failure"}}})
+						return
+					}
+				}
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}
+	stack, base := newEncryptedChunkerStack(t, mock, options)
+	name := "generated-manifest-recovery"
+	target = stack.UnWrap().(*crypt.Fs).EncryptFileName(name)
+	info := func(size int) fs.ObjectInfo {
+		return object.NewStaticObjectInfo(name, time.Now(), int64(size), true, nil, stack)
+	}
+	original := bytes.Repeat([]byte("old complete version;"), 31)
+	if _, err := stack.Put(ctx, bytes.NewReader(original), info(len(original))); err != nil {
+		t.Fatalf("initial Put: %v", err)
+	}
+	originalObjectCount = mockVaultDataObjectCount(mock)
+	armed.Store(true)
+	replacement := bytes.Repeat([]byte("replacement;"), 60)
+	if _, err := stack.Put(ctx, bytes.NewReader(replacement), info(len(replacement))); err == nil {
+		t.Fatal("manifest publication failure reported success")
+	}
+	if !triggered.Load() {
+		t.Fatal("manifest publication rejection was not injected after staging")
+	}
+	if got := int(stagedObjects.Load()); got <= originalObjectCount {
+		t.Fatalf("staged objects at manifest rejection = %d, want more than the original %d", got, originalObjectCount)
+	}
+	assertEncryptedReadback(t, stack, base, name, original, "failed manifest publication")
+}
+
+func assertEncryptedReadback(t *testing.T, stack *chunker.Fs, base *Fs, name string, want []byte, failure string) {
+	t.Helper()
+	base.DirCacheFlush()
+	recovered, err := stack.NewObject(context.Background(), name)
+	if err != nil {
+		t.Fatalf("old version absent after %s: %v", failure, err)
+	}
+	if got := readObject(t, recovered); !bytes.Equal(got, want) {
+		t.Fatalf("old version changed after %s: got %d bytes, want exact prior %d-byte version", failure, len(got), len(want))
+	}
+}
+
+func runEncryptedChunkerLifecycle(t *testing.T, options encryptedChunkerStackOptions) {
+	t.Helper()
+	ctx := context.Background()
+	mock := newMockDegoo()
+	stack, base := newEncryptedChunkerStack(t, mock, options)
 	name := "private-document.bin"
 	createdAt := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 	first := bytes.Repeat([]byte("generated-private-payload-"), 24)
@@ -359,8 +511,12 @@ func TestScalabilityEncryptedChunkerTrace(t *testing.T) {
 	}
 	warm := lookupTraceDelta(before, snapshotLookupTrace(base, mock))
 	logLookupTrace(t, "encrypted warm NewObject", warm)
-	if warm.listCalls != 0 || warm.getItemCalls != 0 || warm.downloadCalls != 0 {
-		t.Fatalf("warm encrypted lookup made remote requests: %+v", warm)
+	wantWarmDownloads := 0
+	if options.Transactions == "norename" {
+		wantWarmDownloads = 1 // No-rename transactions read their manifest to select the active chunks.
+	}
+	if warm.listCalls != 0 || warm.getItemCalls != 0 || warm.downloadCalls != wantWarmDownloads {
+		t.Fatalf("warm encrypted lookup made unexpected remote requests (downloads=%d, want %d): %+v", warm.downloadCalls, wantWarmDownloads, warm)
 	}
 	if got := warmObject.Size(); got != int64(len(first)) {
 		t.Fatalf("warm logical size = %d, want %d", got, len(first))

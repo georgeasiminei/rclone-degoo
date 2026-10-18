@@ -171,7 +171,13 @@ func validateSnapshot(s Snapshot) error {
 	}
 	return nil
 }
+
+const maxNamespaceJSONDepth = 16
+
 func decode(raw []byte, value any) error {
+	if len(raw) > vaultindex.MaxValueSize || rejectDuplicateJSONKeys(raw) != nil {
+		return ErrCorrupt
+	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
 	if err := d.Decode(value); err != nil {
@@ -182,6 +188,76 @@ func decode(raw []byte, value any) error {
 	}
 	return nil
 }
+
+// rejectDuplicateJSONKeys validates one bounded JSON value and rejects object
+// member names that encoding/json could match to the same field in these records.
+// Decoder.Token unescapes keys before comparison, and EqualFold matches its field
+// name folding, so escaped and case-folded aliases are rejected too.
+func rejectDuplicateJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := scanJSONValue(decoder, 0); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return ErrCorrupt
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder, depth int) error {
+	if depth > maxNamespaceJSONDepth {
+		return ErrCorrupt
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return ErrCorrupt
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		var seen []string
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return ErrCorrupt
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return ErrCorrupt
+			}
+			for _, previous := range seen {
+				if strings.EqualFold(previous, key) {
+					return ErrCorrupt
+				}
+			}
+			seen = append(seen, key)
+			if err := scanJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim('}') {
+			return ErrCorrupt
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim(']') {
+			return ErrCorrupt
+		}
+	default:
+		return ErrCorrupt
+	}
+	return nil
+}
+
 func (r inode) validate() error {
 	if r.Version != 1 || r.ID == ([16]byte{}) || r.Revision == 0 || r.Size < 0 {
 		return ErrCorrupt

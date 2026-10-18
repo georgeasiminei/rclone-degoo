@@ -294,6 +294,11 @@ fragments, JSON metadata, and repeated plaintext payload fragments in remote
 objects. Full reads and a range crossing chunk boundaries decrypt to the
 expected bytes. This fixture has a small remote parent; it does not combine
 the encrypted stack with the large-directory fixture or a mounted VFS.
+The historical counters below use `transactions=rename` and `hash_type=md5`.
+They do not represent the installed mount's `norename`, `sha1all` and
+`fail_hard=true` settings. Equivalent installed-settings lifecycle and failed
+overwrite coverage is tracked in the
+[integrity review](INTEGRITY_REVIEW.md).
 
 | Operation | Listing pages | Direct metadata reads | Payload reads | Snapshot hits / misses | Mutation / parent / global invalidations |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -957,6 +962,11 @@ read after a lost response cannot distinguish never accepted from accepted but
 not yet applied. Both traces retain the reservation and block dependent root
 publication; no blind retry is sent. Positive authenticated readback can adopt
 that exact transaction. Current/previous roots and their data remain protected.
+The integrity review found that current/previous-root checks alone missed
+data referenced by an unresolved root-create intent. Cleanup also needs to
+protect those references, and root reconciliation must refuse retired or
+delete-in-flight children. The review records the counterexample and permanent
+regressions; the original late-delete case tested a superseded object only.
 
 The finite fixture caps unresolved intents at two and lifetime allocations at
 sixteen. Lost deletes retain tombstones; their exact IDs and slots are never
@@ -1051,3 +1061,39 @@ The user now requires published-vault recovery with the encryption password
 alone after account authentication, without any local config/control backup.
 These components do not supply remote bootstrap discovery or verified latest
 root selection, and the local ledger cannot replace those requirements.
+
+### Cumulative integrity review corrections — 2026-10-18
+
+The [review](INTEGRITY_REVIEW.md) covers the changes from before PR #42 to
+PR #52. No active production data-loss regression was reproduced. The review
+did reproduce a cleanup-model counterexample and a namespace decoding
+ambiguity; the installed-settings fixture also needed permanent coverage.
+
+The single-host model now pins objects referenced by unresolved creates before
+retirement, and refuses reconciliation of retired or delete-in-flight children.
+The failing-before regression first reopens the registry, then overlaps a late
+root create with an exact-ID child delete. Both child disappearance and current
+root read failure are observed. Permanent recovery cases also cover persisted
+retirement alone, an unresolved deletion and an applied deletion while keeping
+the prior complete root readable. Exact IDs prevent substitution, not unsafe
+deletion of a still-referenced object.
+
+The installed-settings encrypted lifecycle shares the historical trace's
+setup and assertions. It exercises `norename`, `sha1all` and `fail_hard=true`.
+Six incomplete replacement sources and rejection of the final manifest
+publication must retain exact old-file readback after metadata-cache clearing.
+Manifest reads during no-rename lookup are expected and do not invalidate the
+historical rename-mode counters above. These generated tests do not establish
+live provider behavior, actual process/power loss, mounted VFS behavior or
+password-only recovery.
+
+Valid encrypted inode/link records with duplicate JSON keys previously decoded
+successfully, including a nested manifest-reference identity and an escaped
+spelling of the same key. Namespace decoding now performs bounded validation of
+duplicate/equivalent field keys before typed decoding. The 120-operation seeded
+namespace model compares the logical view and revisits prior snapshots.
+
+Final failing-before/passing-after evidence and checks are in
+[VALIDATION.md](VALIDATION.md). These corrections remain in PR #52; none closes
+the remote publication, allocator lifecycle, cleanup/pins, bootstrap or live
+acceptance gates.

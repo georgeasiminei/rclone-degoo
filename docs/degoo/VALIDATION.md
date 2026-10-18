@@ -1862,3 +1862,69 @@ password-only bootstrap, remote publication/fencing, sustainable allocator/
 inventory/cleanup, reader pins, mount integration, mounted faults/rebuild and
 live/soak acceptance remain open. The complete implementation goal is unfinished;
 this validation does not turn those gates into passed requirements.
+
+## Cumulative integrity review corrections — 2026-10-18
+
+Delivery remains [PR #52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
+The [review](INTEGRITY_REVIEW.md) covers the cumulative changes from before
+PR #42 through PR #52's initial head `e5012d922`. Its corrective branch starts
+from that PR head after fetching; current `origin/staging` is already an
+ancestor. No separate PR, reset or format activation is required.
+
+Failing-before evidence:
+
+- The single-host model let an unresolved root-create intent's child be
+  retired and deleted. After local registry reopen and delayed completion,
+  that root became current with missing data. Permanent tests fail against
+  the unchanged model, then pass when unresolved create references block
+  retirement and reconciliation refuses retired/delete-in-flight children.
+  Recovery fixtures cover retired-only, unresolved-delete and applied-delete
+  overlap without changing the intent or prior complete roots.
+- Authenticated inode/link values with duplicate JSON fields decoded
+  successfully. Escaped duplicate keys in a nested manifest identity also
+  passed. These regressions fail before the namespace scanner is added.
+  A separate test confirms Go's ordinary decoder accepts a Unicode long-s
+  alias for `size`, while namespace lookup rejects the ambiguous value.
+
+Permanent generated-data coverage:
+
+- The historical `rename`/`md5` lifecycle and installed
+  `norename`/`sha1all`/`fail_hard=true` lifecycle share setup and assertions.
+  No-rename manifest downloads are expected. Shared handler injection happens
+  before the HTTP server starts, avoiding copied auth setup and handler races.
+- Failed replacement sources at six offsets and rejection of final manifest
+  publication after additional objects were staged preserve exact old-file
+  readback after clearing metadata caches. These are error-injection tests,
+  not process/power-loss or live provider acceptance.
+- Namespace decoding is capped at 8 KiB and depth 16, with per-object decoded
+  field-name checks using Unicode case folding. The 120-step seeded model
+  compares lookup/list state and retained immutable snapshots.
+- Temporary `review_*` test files are removed; all useful cases have permanent
+  names. No intentionally failing review test remains in the suite.
+
+Final integrated checks:
+
+- Fresh full build to an owner-private temporary binary: passed. That binary
+  is first on `PATH` for the full test run; the installed runtime is untouched.
+- `CI=true RCLONE_CONFIG=/notfound go test -timeout 20m -count=1 ./...`:
+  all **195** test packages pass, exit zero, on the corrected source tree.
+  As in earlier validation, `TMPDIR`/`GOTMPDIR` are short owner-private paths
+  and `XDG_CACHE_HOME` is a private temporary runtime cache.
+- Focused single-host and encrypted-lifecycle tests pass normally and with
+  `-race`; namespace package tests and race tests also pass.
+- Final integrated scoped race run with `CI=true RCLONE_CONFIG=/notfound`:
+  `go test -race -p 1 ./backend/degoo/... ./lib/dircache -count=1` passed all
+  **12** scoped packages, exit zero, with the same private temporary environment
+  and corrected source as the full suite.
+- `RCLONE_CONFIG=/notfound go vet ./backend/degoo/... ./lib/dircache`: passed.
+- `golangci-lint run ./backend/degoo/... ./lib/dircache`, v2.14.0: zero issues.
+- Markdown lint passes on all six changed documents. All 83 relative links
+  across the seven handoff/review documents resolve, all 18 stable task IDs are
+  unique, and formatting/staged diff checks pass. The final Go source
+  fingerprint matches the tree used for integrated validation.
+
+No live Degoo/authentication request, installed-runtime or service change,
+reset, pending-write discard or user-data mutation was performed. The new
+format remains inactive. Password-only remote recovery, verified publication,
+allocator lifecycle, inventories, reader pins, cleanup and mounted/live/soak
+acceptance remain open. The user merges PR #52 into `staging`.

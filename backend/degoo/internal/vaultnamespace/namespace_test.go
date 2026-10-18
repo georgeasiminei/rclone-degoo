@@ -1,6 +1,7 @@
 package vaultnamespace
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -493,4 +494,140 @@ func TestLookupAndListRejectLinkAndInodeMismatches(t *testing.T) {
 	if _, err := f.ns.Lookup(f.ctx, badInodeSnapshot, "entry"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("lookup mismatched inode error = %v", err)
 	}
+}
+
+func TestLookupRejectsDuplicateInodeKeys(t *testing.T) {
+	f := newNamespaceFixture(t)
+	s := f.mkdir(t, f.init(t), "entry", 2)
+	entry := f.lookup(t, s, "entry")
+	if _, err := f.ns.load(f.ctx, s, entry.ID); err != nil {
+		t.Fatalf("decode valid inode before mutation: %v", err)
+	}
+	inodeBytes, err := f.index.Get(f.ctx, s.Root, f.ns.inodeKey(entry.ID))
+	if err != nil {
+		t.Fatalf("read valid inode: %v", err)
+	}
+	malformedInode := duplicateJSONKey(t, inodeBytes, `"version":1`, `"version":0,"version":1`)
+	inodeRoot, err := f.index.Put(f.ctx, s.Root, f.ns.inodeKey(entry.ID), malformedInode)
+	if err != nil {
+		t.Fatalf("stage authenticated duplicate-key inode: %v", err)
+	}
+	inodeSnapshot := s
+	inodeSnapshot.Root = inodeRoot
+	if _, err := f.ns.Lookup(f.ctx, inodeSnapshot, "entry"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("lookup duplicate-key inode error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestLookupRejectsCaseFoldedDuplicateInodeKeys(t *testing.T) {
+	f := newNamespaceFixture(t)
+	fileID := namespaceID(0x83)
+	s := f.createFile(t, f.init(t), "file", fileID, "data", 2)
+	raw, err := f.index.Get(f.ctx, s.Root, f.ns.inodeKey(fileID))
+	if err != nil {
+		t.Fatalf("read valid inode: %v", err)
+	}
+	malformed := duplicateJSONKey(t, raw, `"size":`, `"\u017fize":0,"size":`)
+
+	// encoding/json folds long-s to ASCII s when matching struct fields. Keep
+	// the canonical field last so the ordinary decoder still produces valid data.
+	var decoded inode
+	decoder := json.NewDecoder(bytes.NewReader(malformed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		t.Fatalf("standard decoder rejected folded field alias: %v", err)
+	}
+	var valid inode
+	if err := decode(raw, &valid); err != nil {
+		t.Fatalf("decode original inode: %v", err)
+	}
+	if decoded.Size != valid.Size {
+		t.Fatalf("alias changed decoded size to %d, want %d", decoded.Size, valid.Size)
+	}
+
+	root, err := f.index.Put(f.ctx, s.Root, f.ns.inodeKey(fileID), malformed)
+	if err != nil {
+		t.Fatalf("stage authenticated folded-alias inode: %v", err)
+	}
+	s.Root = root
+	if _, err := f.ns.Lookup(f.ctx, s, "file"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("lookup folded-alias inode error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestLookupAndListRejectDuplicateLinkKeys(t *testing.T) {
+	f := newNamespaceFixture(t)
+	s := f.mkdir(t, f.init(t), "entry", 2)
+	root, err := f.ns.load(f.ctx, s, s.RootID)
+	if err != nil {
+		t.Fatalf("decode valid root before mutation: %v", err)
+	}
+	linkKey := f.ns.childKey(root.ID, "entry")
+	linkBytes, err := f.index.Get(f.ctx, root.Children, linkKey)
+	if err != nil {
+		t.Fatalf("read valid link: %v", err)
+	}
+	var decodedLink link
+	if err := decode(linkBytes, &decodedLink); err != nil {
+		t.Fatalf("decode valid link before mutation: %v", err)
+	}
+	malformedLink := duplicateJSONKey(t, linkBytes, `"version":1`, `"version":0,"version":1`)
+	root.Children, err = f.index.Put(f.ctx, root.Children, linkKey, malformedLink)
+	if err != nil {
+		t.Fatalf("stage authenticated duplicate-key link: %v", err)
+	}
+	linkSnapshot, err := f.ns.write(f.ctx, s, root)
+	if err != nil {
+		t.Fatalf("stage duplicate-key link root: %v", err)
+	}
+	if _, err := f.ns.Lookup(f.ctx, linkSnapshot, "entry"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("lookup duplicate-key link error = %v, want ErrCorrupt", err)
+	}
+	if err := f.ns.List(f.ctx, linkSnapshot, "", func(Entry) error { return nil }); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("list duplicate-key link error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestLookupRejectsEscapedDuplicateNestedInManifestReference(t *testing.T) {
+	f := newNamespaceFixture(t)
+	fileID := namespaceID(0x82)
+	s := f.createFile(t, f.init(t), "file", fileID, "data", 2)
+	if _, err := f.ns.Lookup(f.ctx, s, "file"); err != nil {
+		t.Fatalf("lookup valid file before mutation: %v", err)
+	}
+	raw, err := f.index.Get(f.ctx, s.Root, f.ns.inodeKey(fileID))
+	if err != nil {
+		t.Fatalf("read file inode: %v", err)
+	}
+	malformed := duplicateJSONKey(t, raw, `"generation":1`, `"generation":0,"\u0067eneration":1`)
+	root, err := f.index.Put(f.ctx, s.Root, f.ns.inodeKey(fileID), malformed)
+	if err != nil {
+		t.Fatalf("stage authenticated nested duplicate-key inode: %v", err)
+	}
+	s.Root = root
+	if _, err := f.ns.Lookup(f.ctx, s, "file"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("lookup escaped nested duplicate-key identity error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestDecodeBoundsNamespaceJSON(t *testing.T) {
+	var value any
+	if err := decode(bytes.Repeat([]byte{' '}, vaultindex.MaxValueSize+1), &value); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("oversized JSON error = %v, want ErrCorrupt", err)
+	}
+	deep := bytes.Repeat([]byte{'['}, maxNamespaceJSONDepth+2)
+	deep = append(deep, '0')
+	deep = append(deep, bytes.Repeat([]byte{']'}, maxNamespaceJSONDepth+2)...)
+	if err := decode(deep, &value); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("overly nested JSON error = %v, want ErrCorrupt", err)
+	}
+}
+
+func duplicateJSONKey(t *testing.T, raw []byte, old, replacement string) []byte {
+	t.Helper()
+	malformed := bytes.Replace(raw, []byte(old), []byte(replacement), 1)
+	if bytes.Equal(malformed, raw) {
+		t.Fatalf("fixture did not find JSON fragment %q", old)
+	}
+	return malformed
 }

@@ -227,6 +227,13 @@ P3 protocol gates, including behavior after client crash or network partition.
 An append-only root history is not the recovery index.
 Superseded objects become candidates only after reference checks against all
 protected roots and authoritative publication reconciliation.
+An unresolved root-create intent protects its referenced data even before that
+root becomes current. Recovery must also reject a candidate that references
+retired or delete-in-flight data; a matching local allocation digest cannot
+make such a reference safe. Exact-ID deletion prevents identity substitution,
+but does not establish that the target is no longer referenced. The
+[integrity review](INTEGRITY_REVIEW.md) records the failing delayed-effect
+schedule that requires both checks.
 
 Each allocation must enter a bounded encrypted inventory before an uncertain
 remote side effect. Inventory pages and traversal checkpoints allow bounded

@@ -10,6 +10,11 @@ object limit. Requirements remain in [REQUIREMENTS.md](REQUIREMENTS.md); broader
 history is in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) and
 [VALIDATION.md](VALIDATION.md).
 
+The [integrity review and corrections](INTEGRITY_REVIEW.md) cover the cumulative
+changes from before PR #42 through PR #52. They distinguish active mount code,
+inactive components and test-only protocol models. Completing these corrections
+does not close the remote recovery, publication or go-live gates.
+
 ## Scope and operating rules
 
 - Linux mounted use remains the initial product target. Ordinary file and
@@ -90,16 +95,19 @@ bounded index pages for the requested path. A full index rebuild is a recovery
 operation, not a prerequisite for every mount or first file open. Measure both
 paths separately.
 
-The leading candidate for P1 evaluation is **adaptive ciphertext buckets with
-an encrypted, sharded remote index**. The index would map encrypted logical
-keys to opaque provider IDs and versioned data/manifest records. Bucket or
+The offline P1 comparison conditionally selected **adaptive ciphertext buckets
+with an encrypted, sharded remote index** for further implementation and
+experiments; see [SCALABILITY_DECISION.md](SCALABILITY_DECISION.md). The index
+would map encrypted logical keys to opaque provider IDs and versioned
+data/manifest records. Bucket or
 shard sizing would adapt to observed entry counts and object limits. The hot
 path would use the index and direct provider ID lookup where supported,
 without fetching every sibling. The index must encrypt names and user metadata,
 support bounded shard reads and writes, and rebuild from remote state after
-local cache loss. This is a candidate, not an architecture decision.
+local cache loss. Provider activation and the final production format remain
+blocked on the recorded live identity, publication and recovery evidence.
 
-P1 must compare it against at least these options:
+The P1 comparison covers at least these options:
 
 1. **Smaller listing pages.** Measure rate-limit behavior and page count. This
    may lower response size but can increase request count; it does not remove
@@ -780,3 +788,28 @@ no password-login hold was recorded. No provider/auth or installed-runtime
 operation was attempted. PR #52 remains for the user to merge. Further activation
 requires verified remote publication and password-only bootstrap/recovery;
 shipping local-only authority would violate the explicit recovery requirement.
+
+### 2026-10-18 — cumulative integrity review corrections in PR #52
+
+- Owner: coordinating Codex agent with independent cleanup-model,
+  installed-settings and namespace workers. After fetching, based a new fix
+  branch on the existing PR #52 head `e5012d922`; it already contains current
+  `origin/staging`. This exception preserves the requested single PR.
+- The cumulative review from before PR #42 reproduced a test-only cleanup
+  defect: an unresolved root-create intent did not protect its child from a
+  delayed exact-ID delete. The model now protects active create references and
+  refuses root reconciliation when a child is retired or delete-in-flight.
+  Intent and current/previous roots remain intact, including after reopening
+  overlapping state.
+- Shared encrypted lifecycle assertions cover the historical rename trace and
+  the installed `norename`/`sha1all`/`fail_hard=true` settings. Permanent generated
+  source-failure and final-manifest-publication regressions verify cold metadata
+  readback of the old complete file. This is not mounted/provider acceptance.
+- Namespace JSON decoding rejects duplicate and equivalent field keys. The
+  seeded namespace snapshot model has a permanent test name. Useful review
+  cases were integrated and temporary review-only test files removed.
+- [INTEGRITY_REVIEW.md](INTEGRITY_REVIEW.md) records scope, the counterexample
+  and remaining limits. [VALIDATION.md](VALIDATION.md) records final integrated
+  checks. No live request, runtime update, reset or pending-write discard is
+  part of this correction. P1 live evidence, P3 integration, P4/P6 acceptance
+  and explicit go-live remain open. The user merges PR #52 into `staging`.

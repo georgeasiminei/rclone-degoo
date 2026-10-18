@@ -1,6 +1,6 @@
 # Degoo private vault implementation plan
 
-**Active work (2026-10-15):** Follow
+**Active work (2026-10-18):** Follow
 [SCALABLE_STORAGE_PLAN.md](SCALABLE_STORAGE_PLAN.md) for the storage and metadata
 redesign, stable task IDs, progress, and the next-session handoff. Its planning
 task authorized documentation only; the follow-up implementation request
@@ -27,6 +27,14 @@ is not a prerequisite. See the binding
 [pre-live policy](REQUIREMENTS.md#pre-live-redesign-and-disposable-test-data).
 The sections below retain the previous implementation and validation history;
 they do not establish that the proposed redesign is implemented or validated.
+
+The [cumulative integrity review](INTEGRITY_REVIEW.md) records the review of
+PR #42 through PR #52 and its corrective scope. The cleanup model must protect
+unresolved root-create references and refuse adoption of retired children.
+Permanent Degoo-mock coverage must exercise the installed mount settings as
+well as the historical rename-mode trace. Namespace decoding must reject
+duplicate JSON keys. These corrections remain within PR #52 and do not activate
+a new format or complete remote recovery acceptance.
 
 **Status (2026-10-14):** The earlier core implementation passed offline
 validation, and limited live smoke checks passed against a dedicated
@@ -974,6 +982,11 @@ Extend the offline publication evidence without an assumed CAS or epoch service.
 Use unique immutable transaction locators, bounded durable intent, current and
 previous root protection, and delayed create/delete completions across disk
 reopen. Distinguish cache loss from loss of required authority/control state.
+Protect objects referenced by unresolved root-create intents before scheduling
+deletion. On reconciliation, refuse any candidate whose child is retired or
+has a pending delete; retain its unresolved intent and the complete roots.
+Exercise both protections across registry reopen, including a previously
+persisted overlapping create/delete state.
 Prove that unresolved operations block unsafe reuse/publication and that a late
 request cannot overwrite an immutable newer version. Keep the required local
 registry and remote-only freshness limitations explicit. The experiment cannot
@@ -1134,7 +1147,9 @@ invalid UTF-8) as JSON byte strings; reject NUL, slash, dot/dotdot, names over
 significant. IDs are nonzero 16-byte random values. File inodes bind their own
 ID/size to a manifest reference; directories have child-index references and
 zero logical file size. Root has no parent/name. Values remain under the index's
-8 KiB record limit. Version each encoded inode/link and decode strictly.
+8 KiB record limit. Version each encoded inode/link and decode strictly,
+including duplicate keys at every nested object level and escaped-equivalent
+property names.
 
 Operations consume an immutable snapshot and return a proposed new snapshot.
 No root is published or local pending data discarded here. Failed multi-record
