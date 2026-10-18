@@ -8,6 +8,40 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Wizard mount-directory selection — 2026-10-18
+
+The wizard offers the mount directory during local settings, defaulting to
+`/mnt/degoo` for a fresh install and the saved path for an upgrade. An explicit
+`--mountpoint PATH` takes precedence. Safe custom absolute paths, including
+spaces and expanded home paths, are normalized and saved in `install.json`;
+the generated launchers and service use the recorded selection. The legacy
+`mount` token remains accepted.
+
+Validation rejects relative/traversal/control-character paths, filesystem-root
+or program/cache overlap, symlink components, active targets, and nonempty
+directories before configuration is rewritten. A path change requires the old
+mount to be stopped and its underlying directory empty. Existing owner-private
+mode `0500` is preserved. The fixed privileged immutable helper remains limited
+to `/mnt/degoo`; custom paths use the ordinary directory guard.
+
+Generated fixtures cover fresh and upgrade wizard defaults, explicit arguments,
+invalid-answer retry, paths with spaces, safe stop ordering, unsafe path/cache
+overlap, staged updates preserving configuration and cached bytes, restore
+preserving the newly selected target while recovering pending cache data, and
+uninstall preserving external mount directories or refusing nonempty ones.
+No maintenance production change was needed outside the installer and wizard;
+the existing helpers consume the shared configured-mountpoint validation.
+No live mount, cache, credentials or provider data was changed for this work.
+This is offline maintenance coverage rather than a new live FUSE/provider gate.
+
+Validation passed: all 477 Python helper tests, including 54 installer tests,
+79 wizard tests and the custom-path maintenance regressions. Python
+compilation, Markdown lint for seven documents, 79 documentation targets
+(including three archive-relative targets), and `git diff --check` passed.
+The path-selection and maintenance regressions failed before the shared
+validator was added. A final integration check also rejects relative or
+traversing installer roots before normalization. No Go source was changed.
+
 ## User-service registration and mount recovery — 2026-10-18
 
 After a fresh installation, declining the wizard's enable/start prompt left

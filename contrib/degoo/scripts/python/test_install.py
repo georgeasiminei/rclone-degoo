@@ -77,6 +77,149 @@ class InstallTest(unittest.TestCase):
         wrapper = (self.root / "scripts/mount.sh").read_text(encoding="utf-8")
         self.assertIn(f"MOUNTPOINT={shlex.quote(install.DEFAULT_MOUNTPOINT)}", wrapper)
 
+    def test_validate_mountpoint_normalizes_safe_paths_and_rejects_unsafe_paths(self) -> None:
+        custom = self.home / "mount points" / "vault"
+        self.assertEqual(install.validate_mountpoint("mount", self.root), "mount")
+        self.assertEqual(install.validate_mountpoint(str(install.DEFAULT_MOUNTPOINT), self.root), install.DEFAULT_MOUNTPOINT)
+        self.assertEqual(install.validate_mountpoint("~/mount points/vault", self.root), str(custom))
+        self.assertEqual(install.validate_mountpoint(str(custom), self.root), str(custom))
+        self.assertEqual(install.validate_mountpoint(str(self.root / "mount"), self.root), "mount")
+
+        for root in (Path("relative"), self.home / ".." / "other"):
+            with self.subTest(root=root), self.assertRaises(install.InstallError):
+                install.validate_mountpoint(str(custom), root)
+            with self.subTest(root=root), self.assertRaises(install.InstallError):
+                install.configured_mountpoint(root, {"mountpoint": str(custom)})
+
+        for value in (
+            "relative/mount",
+            "../outside",
+            "/tmp/../outside",
+            "/",
+            str(self.root),
+            "//" + str(self.root).lstrip("/"),
+            str(self.root / "other"),
+            str(self.root / "cache"),
+            "//" + str(self.root / "cache").lstrip("/"),
+            str(self.home / "bad\nmount"),
+        ):
+            with self.subTest(value=value), self.assertRaises(install.InstallError):
+                install.validate_mountpoint(value, self.root)
+
+    def test_custom_mountpoint_install_and_upgrade_preserve_vault_and_cache(self) -> None:
+        custom = self.home / "My Vault Mount"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = install.main(
+                ["--binary", str(self.binary), "--folder-id", "dedicated-folder-123", "--mountpoint", "~/My Vault Mount"]
+            )
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertTrue(custom.is_dir())
+        self.assertEqual(stat.S_IMODE(custom.stat().st_mode), 0o700)
+        self.assertEqual(list(custom.iterdir()), [])
+        manifest_path = self.root / "install.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["mountpoint"], str(custom))
+        wrapper_path = self.root / "scripts/mount.sh"
+        self.assertIn(f"MOUNTPOINT={shlex.quote(str(custom))}", wrapper_path.read_text(encoding="utf-8"))
+        vault_before = (self.root / "config/vault.json").read_bytes()
+        pending = self.root / "cache/pending-marker"
+        pending.write_text("pending local bytes", encoding="utf-8")
+        pending.chmod(0o600)
+
+        custom.chmod(0o500)
+        self.write_binary(self.binary, "# upgraded binary\n")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = install.main(["--binary", str(self.binary), "--upgrade"])
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded["mountpoint"], str(custom))
+        self.assertEqual((self.root / "config/vault.json").read_bytes(), vault_before)
+        self.assertEqual(pending.read_text(encoding="utf-8"), "pending local bytes")
+        self.assertEqual(stat.S_IMODE(custom.stat().st_mode), 0o500)
+        self.assertIn(f"MOUNTPOINT={shlex.quote(str(custom))}", wrapper_path.read_text(encoding="utf-8"))
+
+    def test_custom_mountpoint_refuses_symlink_and_mounted_targets_before_install(self) -> None:
+        outside = self.base / "outside"
+        outside.mkdir(mode=0o700)
+        link = self.base / "linked"
+        link.symlink_to(outside, target_is_directory=True)
+        symlink_target = link / "vault"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = install.main(["--binary", str(self.binary), "--mountpoint", str(symlink_target)])
+        self.assertEqual(code, 2)
+        self.assertIn("symlink", stderr.getvalue())
+        self.assertNotIn("chattr", stderr.getvalue())
+        self.assertFalse(self.root.exists())
+        self.assertFalse((outside / "vault").exists())
+
+        target = self.base / "mounted-target"
+        with mock.patch.object(install.os.path, "ismount", side_effect=lambda value: Path(value) == target):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = install.main(["--binary", str(self.binary), "--mountpoint", str(target)])
+        self.assertEqual(code, 2)
+        self.assertIn("already mounted", stderr.getvalue())
+        self.assertFalse(self.root.exists())
+
+    def test_custom_mountpoint_refuses_occupied_target_without_rewriting_install(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        manifest_path = self.root / "install.json"
+        wrapper_path = self.root / "scripts/mount.sh"
+        vault_path = self.root / "config/vault.json"
+        originals = tuple(path.read_bytes() for path in (manifest_path, wrapper_path, vault_path))
+        target = self.home / "occupied mount"
+        target.mkdir(mode=0o700)
+        local_file = target / "keep.txt"
+        local_file.write_text("local-only data", encoding="utf-8")
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = install.main(
+                ["--binary", str(self.binary), "--upgrade", "--mountpoint", str(target)]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("must be empty", stderr.getvalue())
+        self.assertNotIn("chattr", stderr.getvalue())
+        self.assertEqual(tuple(path.read_bytes() for path in (manifest_path, wrapper_path, vault_path)), originals)
+        self.assertEqual(local_file.read_text(encoding="utf-8"), "local-only data")
+
+    def test_custom_mountpoint_cannot_overlap_configured_external_cache(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        external_cache = self.base / "external-cache"
+        external_cache.mkdir(mode=0o700)
+        vault_path = self.root / "config/vault.json"
+        vault = json.loads(vault_path.read_bytes())
+        vault["cache_dir"] = str(external_cache)
+        vault_path.write_text(json.dumps(vault), encoding="utf-8")
+        vault_path.chmod(0o600)
+        manifest_path = self.root / "install.json"
+        wrapper_path = self.root / "scripts/mount.sh"
+        originals = tuple(path.read_bytes() for path in (manifest_path, wrapper_path, vault_path))
+        target = external_cache / "mount"
+        secret = vault["password"]
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = install.main(
+                ["--binary", str(self.binary), "--upgrade", "--mountpoint", str(target)]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("vault cache path overlaps the mountpoint", stderr.getvalue())
+        self.assertNotIn(secret, stderr.getvalue())
+        self.assertEqual(tuple(path.read_bytes() for path in (manifest_path, wrapper_path, vault_path)), originals)
+        self.assertFalse(target.exists())
+
     def test_prepare_mountpoint_creates_private_directory(self) -> None:
         mountpoint = self.base / "external" / "degoo"
 

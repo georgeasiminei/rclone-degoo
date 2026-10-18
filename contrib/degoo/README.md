@@ -293,6 +293,13 @@ disposable account for destructive validation.
 
 ## Find your mount and logs
 
+The wizard offers a mount directory, defaulting to `/mnt/degoo` for a fresh
+install and the saved location for an upgrade. It accepts a safe custom
+absolute path; `--mountpoint PATH` selects it noninteractively. The choice is
+stored in `install.json` and written into the launchers. Custom directories
+use the ordinary FUSE helper and directory guard; the immutable helper still
+supports only `/mnt/degoo`.
+
 The wizard ends with the install and mount paths, actual mount state, helper
 commands, and log locations. The default mount is `/mnt/degoo`. Open that
 directory while it is mounted. New installs create it owner-private; if the

@@ -80,6 +80,34 @@ def _yes_no(label: str, *, default: bool, input_fn: Callable[[str], str] | None 
         print("Please answer yes or no.")
 
 
+def _choose_mountpoint(
+    root: Path,
+    manifest: dict[str, Any] | None,
+    *,
+    upgrade: bool,
+    supplied: str | None,
+    input_fn: Callable[[str], str],
+) -> str:
+    """Validate an explicit mountpoint or prompt with the saved/default path."""
+    default = manifest.get("mountpoint", installer.DEFAULT_MOUNTPOINT) if upgrade and manifest else installer.DEFAULT_MOUNTPOINT
+    if supplied is not None:
+        try:
+            return installer.validate_mountpoint(supplied, root)
+        except installer.InstallError as exc:
+            raise WizardError(str(exc)) from None
+
+    while True:
+        value = _prompt(
+            "Mount directory (absolute path; use 'mount' for the legacy contained path)",
+            default,
+            input_fn=input_fn,
+        )
+        try:
+            return installer.validate_mountpoint(value, root)
+        except installer.InstallError as exc:
+            print(f"That mount directory cannot be used: {exc}")
+
+
 def _size_bytes(value: str) -> int:
     if not SIZE_PATTERN.fullmatch(value):
         raise WizardError("enter a size such as 1Gi or 512Mi")
@@ -824,6 +852,14 @@ def _mount_preflight(root: Path, mountpoint: Path, *, systemd_available: bool = 
     if any(issue.startswith("immutable mountpoint unsupported:") for issue in issues):
         _print_command_block("Migrate the mountpoint while preserving the cache", _degoo_rc(root, "install", "--mountpoint", installer.DEFAULT_MOUNTPOINT))
     needs_helper_setup = any(issue.startswith(("immutable mount helper invalid:", "mountpoint missing:")) for issue in issues)
+    custom_mountpoint = mountpoint != Path(installer.DEFAULT_MOUNTPOINT)
+    if custom_mountpoint and (
+        needs_helper_setup or any(issue.startswith("immutable mountpoint unsupported:") for issue in issues)
+    ):
+        print(
+            "The privileged immutable mount helper only supports /mnt/degoo. "
+            "It is not configured for custom mount directories; choose /mnt/degoo to use protected-helper setup."
+        )
     if needs_helper_setup and mountpoint == Path(installer.DEFAULT_MOUNTPOINT):
         if any(issue.startswith("GCC missing:") for issue in issues):
             manager = _package_manager()
@@ -1261,7 +1297,14 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
     if configured_folder_id and installed_vault is None and imported is None:
         raise WizardError("this install is bound to a remote vault but its secret is missing; import the matching private vault.json")
 
-    print("Step 2 of 6: Set local cache and vault sizing.")
+    print("Step 2 of 6: Choose the mount directory and set local cache and vault sizing.")
+    mountpoint = _choose_mountpoint(
+        root,
+        manifest,
+        upgrade=upgrade,
+        supplied=getattr(args, "mountpoint", None),
+        input_fn=input_fn,
+    )
     mount_settings = _prompt_cache_settings(backup.mount_settings, input_fn=input_fn) if backup else _cache_settings(root, input_fn=input_fn)
     vault_sizes = _new_vault_sizes(imported, input_fn=input_fn) if installed_vault is None else None
     if imported is not None:
@@ -1271,6 +1314,7 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
 
     print("Step 3 of 6: Install or upgrade the private client.")
     staged_args = _install_args(binary, upgrade=upgrade)
+    staged_args.mountpoint = mountpoint
     if backup and configured_folder_id:
         staged_args.folder_id = configured_folder_id
         staged_args.folder_name = requested_folder_name

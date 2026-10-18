@@ -159,15 +159,24 @@ file contents. There is no restore operation.
 
 ## Mount, upgrade, and recover
 
+The wizard offers the mount directory, defaulting to `/mnt/degoo` on a fresh
+install and the saved path on an upgrade. A safe custom absolute path can be
+entered or supplied with `--mountpoint PATH`. The saved `install.json` path
+is propagated to the launchers and maintenance commands. A custom path uses
+ordinary FUSE directory protection; the immutable helper supports only
+`/mnt/degoo`.
+
 At the end of setup, the wizard prints the install directory, mount path,
 actual mount state, helper commands, and log locations. The `degoo-rc`
 command is installed on `PATH`; the default mount path is `/mnt/degoo`. Open
 that directory in your file manager or use it like any other directory while
-it is mounted. If the installer cannot prepare the owner-private directory, it
-prints the needed privileged `mkdir`, `chown`, `chmod 700`, and `chattr +i`
-commands. The mount refuses to hide local files and protects the underlying
-directory from unmounted writes. An older install keeps its saved mountpoint
-unless `--mountpoint /mnt/degoo` is selected explicitly. That migration is
+it is mounted. If the installer cannot prepare the default directory, it
+prints the needed privileged `mkdir`, `chown`, and `chmod 700` commands, plus
+`chattr +i` for `/mnt/degoo`. The mount refuses to hide local files and
+protects the underlying directory from unmounted writes. Prepare a custom
+directory with owner-private permissions first if creating it requires
+administrator access. An older install keeps its saved mountpoint
+unless another path is selected explicitly. Changing the path is
 refused while the old underlying directory contains files. Uninstall leaves
 the external mount directory in place. The privileged helper does not support
 an immutable legacy `mount/` target. For an install whose saved mountpoint is
