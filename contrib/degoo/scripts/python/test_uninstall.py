@@ -511,6 +511,90 @@ class UninstallTest(unittest.TestCase):
         self.assertTrue((cache / "vfs" / restore._cache_name() / "pending.bin").is_file())
         self.assertFalse(destination.exists())
 
+    def test_uninstall_accepts_metadata_writer_lock_with_nested_lock_suffix(self) -> None:
+        cache_name = uninstall._cache_name()
+        metadata_namespace = self.root / "cache" / "metadata" / cache_name
+        metadata_namespace.mkdir(parents=True, mode=0o700)
+        metadata_namespace.chmod(0o700)
+        metadata_namespace.parent.chmod(0o700)
+        lock = metadata_namespace / ".lock.lock"
+        self.write_private(lock, b"")
+
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()), \
+                mock.patch.object(uninstall, "_verify_cache_identity", side_effect=AssertionError("metadata lock is not cache data")):
+            code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("Removed the isolated local Degoo install", stdout)
+        self.assertFalse(self.root.exists())
+
+    def test_metadata_cache_lock_variants_are_excluded_from_the_8192_entry_limit(self) -> None:
+        cache_root = self.root / "cache"
+        namespace = cache_root / "metadata" / uninstall._cache_name()
+        namespace.mkdir(parents=True, mode=0o700)
+        namespace.chmod(0o700)
+        namespace.parent.chmod(0o700)
+        for number in range(uninstall.MAX_METADATA_CACHE_ENTRIES):
+            entry = namespace / f"{number:064x}.cache"
+            descriptor = os.open(entry, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+        for name in (".lock", ".lock.lock"):
+            self.write_private(namespace / name, b"")
+
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()):
+            self.assertTrue(uninstall._audit_cache_tree(namespace, cache_root, metadata=True))
+            # Keep the total name count within the 8192 files plus two lock
+            # names limit so the separate cache-record limit is exercised.
+            (namespace / ".lock.lock").unlink()
+            overflow = namespace / f"{uninstall.MAX_METADATA_CACHE_ENTRIES:064x}.cache"
+            descriptor = os.open(overflow, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            with self.assertRaisesRegex(uninstall.CleanupError, "bounded entry count"):
+                uninstall._audit_cache_tree(namespace, cache_root, metadata=True)
+
+    def test_metadata_cache_rejects_unsafe_lock_variants_and_unknown_files(self) -> None:
+        cache_root = self.root / "cache"
+        namespace = cache_root / "metadata" / uninstall._cache_name()
+        namespace.mkdir(parents=True, mode=0o700)
+        namespace.chmod(0o700)
+        namespace.parent.chmod(0o700)
+        lock = namespace / ".lock.lock"
+        target = self.base / "lock-target"
+        self.write_private(target, b"generated lock target")
+
+        self.write_private(lock, b"")
+        lock.chmod(0o644)
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()), \
+                self.assertRaisesRegex(uninstall.CleanupError, "unsafe ownership, permissions, or size"):
+            uninstall._audit_cache_tree(namespace, cache_root, metadata=True)
+        lock.unlink()
+
+        lock.symlink_to(target)
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()), \
+                self.assertRaisesRegex(uninstall.CleanupError, "unsafe ownership, permissions, or size"):
+            uninstall._audit_cache_tree(namespace, cache_root, metadata=True)
+        lock.unlink()
+
+        self.write_private(lock, b"")
+        alias = self.base / "lock-alias"
+        os.link(lock, alias)
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()), \
+                self.assertRaisesRegex(uninstall.CleanupError, "unsafe ownership, permissions, or size"):
+            uninstall._audit_cache_tree(namespace, cache_root, metadata=True)
+        alias.unlink()
+        lock.unlink()
+
+        self.write_private(lock, b"x" * 4097)
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()), \
+                self.assertRaisesRegex(uninstall.CleanupError, "unsafe ownership, permissions, or size"):
+            uninstall._audit_cache_tree(namespace, cache_root, metadata=True)
+        lock.unlink()
+
+        self.write_private(namespace / ".lock.lock.extra", b"")
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()), \
+                self.assertRaisesRegex(uninstall.CleanupError, "unknown file"):
+            uninstall._audit_cache_tree(namespace, cache_root, metadata=True)
+
     def test_external_uninstall_refuses_orphaned_vfs_data_before_stopping_runtime(self) -> None:
         cache = self.base / "external-cache"
         self.set_external_cache(cache)

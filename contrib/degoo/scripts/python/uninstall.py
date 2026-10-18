@@ -1156,12 +1156,15 @@ def _audit_cache_tree(path: Path, cache_dir: Path, *, metadata: bool = False) ->
     has_data = False
     if metadata:
         total_bytes = 0
+        metadata_locks = {".lock", ".lock.lock"}
         entries = sorted(os.scandir(path), key=lambda entry: entry.name)
-        if len(entries) > MAX_METADATA_CACHE_ENTRIES + 1:
+        if len(entries) > MAX_METADATA_CACHE_ENTRIES + len(metadata_locks):
+            raise CleanupError("the persistent metadata cache exceeds its bounded entry count")
+        if sum(entry.name not in metadata_locks for entry in entries) > MAX_METADATA_CACHE_ENTRIES:
             raise CleanupError("the persistent metadata cache exceeds its bounded entry count")
         for entry in entries:
             entry_path = path / entry.name
-            if entry.name == ".lock":
+            if entry.name in metadata_locks:
                 _check_cache_file(entry_path, maximum=4096)
                 continue
             if not METADATA_CACHE_FILE.fullmatch(entry.name):

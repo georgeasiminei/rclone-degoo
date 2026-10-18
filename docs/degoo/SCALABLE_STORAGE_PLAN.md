@@ -813,3 +813,27 @@ shipping local-only authority would violate the explicit recovery requirement.
   checks. No live request, runtime update, reset or pending-write discard is
   part of this correction. P1 live evidence, P3 integration, P4/P6 acceptance
   and explicit go-live remain open. The user merges PR #52 into `staging`.
+
+### 2026-10-18 — intentional pre-live uninstall for a fresh vault
+
+- The user deleted remote test contents, then explicitly selected no retention
+  and confirmed discarding the local vault secret and removing the install.
+  Uninstall initially refused a generated `.lock.lock` metadata-cache file.
+  The cleanup and retained-cache restore auditors now recognize that exact
+  current lock name and the legacy `.lock`, preserving private-file checks,
+  bounded metadata storage and pending-write recovery guards.
+- After advance notice, the corrected source helper completed the requested
+  local uninstall. The program, legacy crypt/chunker vault binding and secret,
+  cache identity/data, logs and owned service/command links were removed.
+  The pending-upload count was zero, independently checked against clean VFS
+  metadata. Only an empty external cache-lock sentinel remains. Old service
+  overrides were removed; the service is absent and inactive.
+- No remote request, remote deletion, replacement vault, format activation or
+  fresh install occurred during cleanup. The user must install again, create
+  a new dedicated test vault and copy source files again with rsync. Do not
+  attempt to resume the removed cache or reuse its deleted remote folder ID.
+- Validation: all 458 Python helper tests, compilation, Markdown/link checks
+  and diff checks passed; see [VALIDATION.md](VALIDATION.md). Source changes
+  affect maintenance helpers only. The scalable storage implementation and
+  remaining remote recovery, publication, mounted fault and go-live gates
+  retain their existing status.
