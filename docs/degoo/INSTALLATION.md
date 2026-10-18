@@ -661,6 +661,17 @@ managed payload already matches, the command is a true no-op: it leaves the
 service, configuration, install manifest, and cache alone, even when
 `--delete-cache` or either wait option is supplied.
 
+For a changed payload and a mounted vault, the updater also asks the verified
+candidate binary to read the configured remote root before preparing or
+stopping the mount. This read-only check uses the installation's account and
+vault configuration. It does not print the returned folder metadata. New
+packages support a single-root query; older compatible packages use the
+existing ancestry query. Failure or timeout leaves the running mount and
+installed program untouched. Authentication renewal and persisted provider
+cooldowns can still update their normal local state. This checks root access
+at that moment, not file contents, complete recoverability, or future provider
+availability. Inactive installations can still be updated for recovery.
+
 The install manifest records `build.version: 1`, `build.binary_sha256`, and
 `build.payload_sha256`, plus `build.commit` when a clean source commit is
 verified. The payload covers `bin/rclone`, `degoo-rc`, the managed shell and
@@ -706,6 +717,20 @@ for a service or `degoo-rc mount` for a manual mount. An abrupt process or
 system interruption can leave the snapshot behind; a later update refuses to
 overwrite it. Keep that directory intact and restore or resolve the program
 files from a verified package before retrying; crash recovery is not automatic.
+
+When a restarted mount cannot be confirmed, the updater reports a bounded
+failure summary from that restart's log entries, excluding earlier errors and
+private provider details. If the mount table confirms there is no mount, it
+stops the verified owned service without disabling it, preventing repeated
+restart attempts. A connected or uncertain mount is left alone. A provider
+failure after the preflight can still prevent restart; the installed package,
+configuration, and pending writes remain available for recovery.
+
+Deleting the configured vault folder remotely does not reset its local folder
+ID, encryption settings, or cache identity. An update preserves that binding
+and cannot recreate the deleted backup. See
+[recovering after remote deletion](USAGE.md#recovering-after-deleting-the-remote-vault)
+before starting a replacement vault.
 
 If a running mount predates safe update preparation, the updater refuses to
 stop it automatically. Unmount it normally with `degoo-rc stop` or

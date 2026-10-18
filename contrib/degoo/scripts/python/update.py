@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import install as installer
+import logs as log_reader
 import service
 import sync as mount_sync
 import uninstall
@@ -47,6 +48,9 @@ UPDATE_RESPONSE_LIMIT = 4096
 UPDATE_PREPARE_TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 UPDATE_PREPARATION_LEASE_SECONDS = 120
 MAX_INSTALLER_SOURCE_BYTES = 1024 * 1024
+MAX_PREFLIGHT_HELP_BYTES = 64 * 1024
+MAX_PREFLIGHT_ERROR_BYTES = 16 * 1024
+MAX_STARTUP_LOG_BYTES = 64 * 1024
 MANAGED_DIRECTORIES = ("bin", "scripts", "tools", "immutable-mount")
 MANAGED_FILES = ("degoo-rc", "install.json", "rclone-degoo.service",
                  *installer.COMPATIBILITY_SHELL_FILES, *installer.SOURCE_FILES)
@@ -959,6 +963,176 @@ def _wait_for_service_mount(root: Path, manifest: dict[str, Any], state: dict[st
     return refreshed
 
 
+def _safe_failure_diagnostics(data: bytes) -> str:
+    """Summarize known failure classes without exposing provider response text."""
+    summaries: list[str] = []
+    for raw in data[:MAX_STARTUP_LOG_BYTES].splitlines()[:32]:
+        line = log_reader._clean_line(raw)
+        if not re.search(r"\b(?:ERROR|CRITICAL)\s*:", line, re.IGNORECASE):
+            continue
+        if re.search(r"\bGetOverlay4\b", line, re.IGNORECASE):
+            if re.search(r"\bGraphQLException\b", line, re.IGNORECASE):
+                summary = "Degoo GetOverlay4 returned GraphQLException"
+            else:
+                summary = "Degoo GetOverlay4 root lookup failed"
+        elif re.search(r"\bGraphQLException\b", line, re.IGNORECASE):
+            summary = "Degoo returned GraphQLException"
+        elif re.search(r"\bdegoo login required\b|\blogin required\b", line, re.IGNORECASE):
+            summary = "Degoo login is required"
+        else:
+            status = re.search(r"\b(?:auth\s+)?HTTP(?:/\d(?:\.\d)?)?\s+([45]\d\d)\b", line, re.IGNORECASE)
+            if status:
+                summary = f"Degoo API returned HTTP {status.group(1)}"
+            elif re.search(r"connection (?:refused|reset)|no such host|i/o timeout|context deadline exceeded", line, re.IGNORECASE):
+                summary = "the Degoo API connection failed"
+            else:
+                summary = "rclone logged a startup error"
+        if summary not in summaries:
+            summaries.append(summary)
+        if len(summaries) == 3:
+            break
+    return "; ".join(summaries)
+
+
+def _candidate_command(root: Path, binary: Path, *arguments: str) -> list[str]:
+    """Build a candidate query with the install's explicit account config."""
+    return [str(binary), "--config", str(root / "config/rclone.conf"), "--log-level", "ERROR", *arguments]
+
+
+def preflight_candidate_vault(root: Path, package: Path, *, timeout: float = 30.0) -> None:
+    """Check the verified candidate can read the configured Degoo root before shutdown."""
+    binary = package / "bin/rclone"
+    vault = root / "config/vault.json"
+    cache_dir = installer.configured_cache_dir(root)
+    installer.check_directory(root / "tmp", private=True)
+    env = dict(os.environ)
+    env.setdefault("HOME", str(installer.home_directory()))
+    env["XDG_CONFIG_HOME"] = str(root / "config")
+    env["XDG_CACHE_HOME"] = str(cache_dir)
+    env["TMPDIR"] = str(root / "tmp")
+    env["PATH"] = "/usr/bin:/bin"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    try:
+        with tempfile.TemporaryFile(dir=root / "tmp") as help_output, \
+                tempfile.TemporaryFile(dir=root / "tmp") as help_error:
+            help_result = subprocess.run(
+                _candidate_command(root, binary, "degoo", "location", "--help"),
+                stdin=subprocess.DEVNULL, stdout=help_output, stderr=help_error, env=env,
+                timeout=timeout, check=False, umask=0o077,
+            )
+            help_output.seek(0)
+            help_text = help_output.read(MAX_PREFLIGHT_HELP_BYTES + 1)
+            help_error.seek(0)
+            help_text += help_error.read(MAX_PREFLIGHT_HELP_BYTES + 1)
+        if help_result.returncode != 0:
+            raise UpdateError("the candidate's local Degoo location help failed; the current mount and installed program were left untouched")
+        query = ["degoo", "location"]
+        if b"--root-only" in help_text:
+            query.append("--root-only")
+        query.append(str(vault))
+        with tempfile.TemporaryFile(dir=root / "tmp") as error:
+            result = subprocess.run(
+                _candidate_command(root, binary, *query),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=error, env=env,
+                timeout=timeout, check=False, umask=0o077,
+            )
+            error.seek(0)
+            error_data = error.read(MAX_PREFLIGHT_ERROR_BYTES + 1)
+    except subprocess.TimeoutExpired:
+        raise UpdateError("the candidate Degoo root check timed out; the current mount and installed program were left untouched") from None
+    except OSError:
+        raise UpdateError("the candidate Degoo root check could not start; the current mount and installed program were left untouched") from None
+    if result.returncode != 0:
+        summary = _safe_failure_diagnostics(error_data[:MAX_PREFLIGHT_ERROR_BYTES])
+        detail = f" ({summary})" if summary else ""
+        raise UpdateError(
+            "the candidate could not verify access to the configured Degoo root" + detail
+            + "; the current mount and installed program were left untouched. Verify account access; the configured remote folder may have been moved or removed. "
+            "Review degoo-rc location and degoo-rc setup --help before recovery; the updater will not create a replacement or change the configured folder"
+        )
+
+
+def _startup_log_snapshot(root: Path, name: str) -> tuple[Path, int | None, int | None, int] | None:
+    """Record a private startup log's position so old failures are excluded."""
+    path = root / "logs" / name
+    try:
+        fd = log_reader._open_log(path)
+    except log_reader.LogsError:
+        return None
+    if fd is None:
+        return (path, None, None, 0)
+    try:
+        info = os.fstat(fd)
+        return (path, info.st_dev, info.st_ino, info.st_size)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _fresh_startup_diagnostics(snapshot: tuple[Path, int | None, int | None, int] | None) -> str:
+    """Read only bounded log bytes appended since the current restart began."""
+    if snapshot is None:
+        return ""
+    path, old_device, old_inode, old_size = snapshot
+    try:
+        fd = log_reader._open_log(path)
+    except log_reader.LogsError:
+        return ""
+    if fd is None:
+        return ""
+    try:
+        info = os.fstat(fd)
+        size = info.st_size
+        if (old_device, old_inode) == (info.st_dev, info.st_ino) and size >= old_size:
+            offset = old_size
+        else:
+            offset = max(0, size - MAX_STARTUP_LOG_BYTES)
+        if size - offset > MAX_STARTUP_LOG_BYTES:
+            offset = size - MAX_STARTUP_LOG_BYTES
+        partial_first_line = False
+        if offset > 0:
+            os.lseek(fd, offset - 1, os.SEEK_SET)
+            partial_first_line = os.read(fd, 1) != b"\n"
+        os.lseek(fd, offset, os.SEEK_SET)
+        data = os.read(fd, MAX_STARTUP_LOG_BYTES)
+        if partial_first_line:
+            _, separator, data = data.partition(b"\n")
+            if not separator:
+                return ""
+        return _safe_failure_diagnostics(data)
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
+def _restart_failure(root: Path, state: dict[str, Any], snapshot: tuple[Path, int | None, int | None, int] | None,
+                     reason: str) -> UpdateError:
+    """Report a failed restart and stop only an owned service with no mount."""
+    diagnostic = _fresh_startup_diagnostics(snapshot)
+    service_action = ""
+    if state.get("service_owned"):
+        try:
+            manifest = installer.load_manifest(root)
+            mountpoint = installer.configured_mountpoint(root, manifest)
+            if wizard._mounted_state(mountpoint) == "not mounted":
+                stopped_units = uninstall._stop_owned_service(root, manifest, disable=False)
+                if stopped_units:
+                    service_action = " The owned service was stopped after the mount table confirmed no mount, to prevent repeated restart attempts."
+                else:
+                    service_action = " The service could not be reverified as owned, so it was left untouched; inspect degoo-rc service status."
+        except (installer.InstallError, uninstall.CleanupError, OSError):
+            service_action = " The owned service could not be safely stopped; inspect degoo-rc service status and degoo-rc logs."
+    detail = f" Fresh startup error: {diagnostic}." if diagnostic else " No safe fresh error detail was available; inspect degoo-rc logs."
+    recovery = "degoo-rc service start" if state.get("service_active") else "the manual mount"
+    return UpdateError(
+        f"{reason}.{detail}{service_action} The verified package remains installed; configuration and cached writes were preserved. "
+        f"Resolve the reported cause, then retry {recovery}"
+    )
+
+
 def _bounded_duration(value: str, *, allow_zero: bool, maximum: int, label: str) -> float:
     """Parse an rclone duration in seconds within an update timeout bound."""
     if value == "off" and allow_zero:
@@ -989,6 +1163,7 @@ def parse_upload_timeout(value: str) -> float:
 
 def start_runtime(root: Path, state: dict[str, Any]) -> None:
     """Restore the previous active state and confirm a connected local mount."""
+    startup_log = None
     if state["service_owned"]:
         result = service._systemctl(root, "daemon-reload")
         if result.returncode != 0:
@@ -997,9 +1172,13 @@ def start_runtime(root: Path, state: dict[str, Any]) -> None:
         print("Restarting the previously active user service.", flush=True)
         manifest = installer.load_manifest(root)
         service._require_loaded_unit(root, manifest)
-        result = service._systemctl(root, "start", service.UNIT_NAME)
+        startup_log = _startup_log_snapshot(root, "mount.log")
+        try:
+            result = service._systemctl(root, "start", service.UNIT_NAME)
+        except service.ServiceError:
+            raise _restart_failure(root, state, startup_log, "the updated service could not start") from None
         if result.returncode != 0:
-            raise UpdateError("the updated service could not start; inspect degoo-rc logs and retry degoo-rc service start")
+            raise _restart_failure(root, state, startup_log, "the updated service could not start")
     elif state["manual_arguments"]:
         print("Restarting the previous manual mount in the background.", flush=True)
         try:
@@ -1018,12 +1197,13 @@ def start_runtime(root: Path, state: dict[str, Any]) -> None:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             os.close(descriptor)
             raise UpdateError("the manual mount startup log is unsafe")
+        startup_log = _startup_log_snapshot(root, "update-mount.log")
         with os.fdopen(descriptor, "ab") as output:
             subprocess.Popen(state["manual_arguments"], stdin=subprocess.DEVNULL,
                              stdout=output, stderr=output, env=env, cwd=state.get("manual_directory"),
                              start_new_session=True, umask=0o077)
     if (state["service_active"] or state["manual_arguments"]) and wizard._wait_for_mount(root) != "mounted":
-        raise UpdateError("the restarted mount was not confirmed; inspect degoo-rc logs and degoo-rc info, then retry the mount")
+        raise _restart_failure(root, state, startup_log, "the restarted mount was not confirmed")
     if state["service_active"] or state["manual_arguments"]:
         print("Restart complete; the vault mount is connected.", flush=True)
 
@@ -1232,6 +1412,7 @@ def apply_update(root: Path, package: Path, identity: dict[str, Any], source: di
                                        systemd_available=state["service_active"]):
                 raise UpdateError("mount prerequisites need repair before updating; follow the setup commands above")
         if state["mounted"]:
+            preflight_candidate_vault(root, package)
             wait_for = "open handles and requested uploads" if upload_timeout > 0 else "open handles"
             print(f"Preparing the mounted vault; waiting for {wait_for} (handle/flush deadline: {writer_timeout:g}s).", flush=True)
             if upload_timeout > 0:

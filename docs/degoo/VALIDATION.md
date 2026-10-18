@@ -8,6 +8,47 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Update restart after remote deletion — 2026-10-18
+
+The update from successful staging build `39101975418` (`49d220745d31`)
+verified and installed its package, but the service exited before mounting.
+Fresh startup logs showed a configured-root `GetOverlay4` failure reported as
+`GraphQLException`. The saved access token had been renewed and was unexpired;
+the persisted provider cooldown had elapsed. Read-only API checks returned
+HTTP 200 with `Got empty result!` for that root and `Invalid input!` for its
+children, while account-root listing succeeded. Bounded, shallow discovery
+found no matching configured ID or cached vault name. The user confirmed
+deleting the remote contents to start fresh. No remote object was created,
+changed, or deleted during diagnosis.
+
+The owned service was stopped to end its restart loop; enablement, installed
+package, configuration and cache were preserved. The local pending-upload
+inventory reported zero; that is not proof that cached clean ranges can
+recover the deleted remote data. No rebind, cache reset, or remount was
+performed. Private folder IDs, account inventory and credentials are omitted.
+
+The follow-up adds a read-only candidate root check before mounted update
+preparation, a root-only `location` option, bounded fresh failure summaries,
+and stopping an owned service only when a failed restart leaves no mount.
+Offline validation passed:
+
+- Python helper discovery: all 454 tests. Regression cases cover candidate
+  root checks, older-candidate fallback, timeout/failure before shutdown,
+  unchanged-payload no-op, fresh sanitized errors, rotated/truncated logs,
+  and stopping only an owned service with a confirmed absent mount.
+- Fresh `go build` and the credential-free repository-wide Go suite: all
+  195 test packages, with isolated cache/configuration and `CI=true` for the
+  existing unreliable-network-test policy.
+- `go test -race -count=1 ./cmd/degoo`, `go vet ./cmd/degoo`, and
+  `golangci-lint run ./cmd/degoo`: passed. Root-only regressions cover one
+  request, unavailable ancestors, failed roots, and cancellation.
+- Python compilation, Markdown lint for the three changed documents,
+  36 relative documentation links, and `git diff --check`: passed.
+
+These checks do not establish live successful restart or restore deleted
+remote files. The safeguards have not been installed on the affected server;
+the service remains stopped pending deliberate fresh-vault recovery.
+
 ## Live selective rate-limit investigation — 2026-10-15
 
 The [incident record](RATE_LIMIT_INVESTIGATION.md) preserves the earlier live

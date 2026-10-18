@@ -156,7 +156,8 @@ func addSetupCommands(root *cobra.Command) {
 	create.Flags().StringVar(&createParent, "parent-id", "", "Parent device container or folder ID (required)")
 	create.Flags().StringVar(&name, "name", "", "New dedicated vault folder name (required)")
 	create.Flags().StringVar(&createVaultConfig, "vault-config", "", "Vault configuration containing encrypted account credentials")
-	location := &cobra.Command{Use: "location vault.json", Short: "Show the configured vault's remote ancestor folders.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
+	var rootOnly bool
+	location := &cobra.Command{Use: "location vault.json", Short: "Show the configured vault root or its remote ancestor folders.", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		if err := safeLogging(c.Context()); err != nil {
 			return err
 		}
@@ -176,14 +177,25 @@ func addSetupCommands(root *cobra.Command) {
 			return err
 		}
 		id, _ := m.Get("root_folder_id")
-		rfs.Logf(nil, "degoo: inspecting vault ancestry (configured folder ID %q)", id)
-		entries, err := ancestorFolders(c.Context(), client.GetItem, id)
+		var entries []folderLocation
+		if rootOnly {
+			rfs.Logf(nil, "degoo: inspecting configured vault folder (ID %q)", id)
+			entries, err = configuredRootFolder(c.Context(), client.GetItem, id)
+		} else {
+			rfs.Logf(nil, "degoo: inspecting vault ancestry (configured folder ID %q)", id)
+			entries, err = ancestorFolders(c.Context(), client.GetItem, id)
+		}
 		if err != nil {
 			return err
 		}
-		rfs.Logf(nil, "degoo: vault ancestry resolved (configured folder ID %q, %d folders)", id, len(entries))
+		if rootOnly {
+			rfs.Logf(nil, "degoo: configured vault folder resolved (ID %q)", id)
+		} else {
+			rfs.Logf(nil, "degoo: vault ancestry resolved (configured folder ID %q, %d folders)", id, len(entries))
+		}
 		return json.NewEncoder(c.OutOrStdout()).Encode(entries)
 	}}
+	location.Flags().BoolVar(&rootOnly, "root-only", false, "Inspect only the configured vault folder; do not request its ancestors")
 	root.AddCommand(folders, create, location)
 }
 
@@ -213,4 +225,21 @@ func ancestorFolders(ctx context.Context, get func(context.Context, string) (api
 		entries[left], entries[right] = entries[right], entries[left]
 	}
 	return entries, nil
+}
+
+func configuredRootFolder(ctx context.Context, get func(context.Context, string) (api.Item, error), id string) ([]folderLocation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(id) != id || id == "" || id == "0" {
+		return nil, errors.New("configured root_folder_id must identify a dedicated vault folder")
+	}
+	item, err := get(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("inspect root folder ID %q: %w", id, err)
+	}
+	if item.ID != id {
+		return nil, errors.New("degoo returned mismatched folder metadata")
+	}
+	return []folderLocation{{item.ID, item.Name, item.Category}}, nil
 }
