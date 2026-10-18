@@ -30,6 +30,13 @@ The initial external cache migration was SHA-256 verified and used a bind
 mount to retain the recorded cache path. Startup was guarded so the
 service only runs when that path is a mount point; see [VALIDATION.md](VALIDATION.md).
 
+The install wizard asks for a mount directory, with `/mnt/degoo` as the fresh
+default and the saved path as the upgrade default. Choose an empty dedicated
+absolute path or use `degoo-rc install --mountpoint PATH`. The choice is saved
+in `install.json` and propagated to the launchers and maintenance commands.
+Custom directories use the ordinary mount guard; the privileged helper for an
+immutable directory supports only `/mnt/degoo`.
+
 The contained installer and maintenance commands use one `degoo-rc` entrypoint.
 Start it from a source checkout with `./contrib/degoo/degoo-rc install`,
 from the archive root with `./degoo-rc install`, or use `degoo-rc help` after

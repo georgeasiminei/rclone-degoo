@@ -125,8 +125,13 @@ instead of weakening password-only recovery.
 
 ### Mountpoint safety and upload status
 
-- New contained installs use `/mnt/degoo` as the default mountpoint. An upgrade
-  keeps its recorded mountpoint unless the user explicitly changes it.
+- The install wizard offers the mount directory, defaulting to `/mnt/degoo`
+  for a fresh install and the recorded directory for an upgrade. A custom
+  absolute path is supported; `--mountpoint PATH` provides the same setting
+  noninteractively. The selected path is recorded in `install.json` and used
+  consistently by generated launchers, the service and maintenance commands.
+  Reject unsafe, nonempty or active targets and overlap with the install or
+  cache. An upgrade keeps its recorded mountpoint unless the user changes it.
 - The installer attempts to create `/mnt/degoo` as an owner-private directory.
   If it cannot, it prints `sudo mkdir`, `chown`, `chmod 700`, and `chattr +i`
   commands for the user to run. The mount refuses to cover ordinary local
@@ -171,7 +176,7 @@ instead of weakening password-only recovery.
   empty. This is a documented limitation of immutable legacy mounts.
 - Changing an existing install from the legacy in-install `mount` directory to
   `/mnt/degoo` is refused while the old directory contains files. The
-  installer and maintenance helpers accept only these two mountpoint choices.
+  installer and maintenance helpers also support safe custom absolute paths.
   Uninstall removes the contained client but preserves the external
   `/mnt/degoo` directory.
 - The generic VFS upload-status attribute is opt-in with

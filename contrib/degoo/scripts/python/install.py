@@ -227,7 +227,7 @@ def home_directory() -> Path:
     home = Path(os.path.expanduser("~"))
     if not home.is_absolute():
         raise InstallError("could not determine an absolute home directory")
-    return Path(os.path.normpath(str(home)))
+    return Path(os.path.normpath("/" + str(home).lstrip("/")))
 
 
 def expected_root() -> Path:
@@ -599,7 +599,8 @@ def load_manifest(root: Path) -> dict[str, Any]:
     manifest = parse_json_object(raw or b"", "the install manifest is invalid")
     if type(manifest.get("version")) is not int or manifest["version"] != 1 or manifest.get("remote_name") != REMOTE_NAME:
         raise InstallError("the existing install manifest is unsupported")
-    if not isinstance(manifest.get("mountpoint"), str) or manifest["mountpoint"] not in {"mount", DEFAULT_MOUNTPOINT} or manifest.get("cache_dir") != "cache":
+    mountpoint = manifest.get("mountpoint")
+    if not isinstance(mountpoint, str) or validate_mountpoint(mountpoint, root) != mountpoint or manifest.get("cache_dir") != "cache":
         raise InstallError("the existing install manifest contains unexpected paths")
     linked_path = manifest.get("path_link", "")
     if not isinstance(linked_path, str) or (linked_path and linked_path != str(expected_path_link())):
@@ -611,14 +612,21 @@ def load_manifest(root: Path) -> dict[str, Any]:
 
 
 def configured_mountpoint(root: Path, manifest: dict[str, Any] | None = None) -> Path:
-    """Return the recorded external mountpoint or the legacy contained path."""
+    """Return the normalized configured mountpoint."""
+    root = Path(root)
+    if not root.is_absolute() or ".." in root.parts:
+        raise InstallError("the install root must be absolute without parent traversal")
+    root = Path(os.path.normpath("/" + str(root).lstrip("/")))
     if manifest is None:
         raw = read_private_file(root / "install.json", 64 * 1024, missing_ok=True)
         manifest = parse_json_object(raw, "the install manifest is invalid") if raw else {}
     value = manifest.get("mountpoint", "mount")
-    if not isinstance(value, str) or value not in {"mount", DEFAULT_MOUNTPOINT}:
+    if not isinstance(value, str):
         raise InstallError("the install manifest contains an unexpected mountpoint")
-    return root / value
+    normalized = validate_mountpoint(value, root)
+    if normalized != value:
+        raise InstallError("the install manifest contains an unexpected mountpoint")
+    return root / "mount" if normalized == "mount" else Path(normalized)
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -626,7 +634,39 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
-def _validate_configured_cache_dir(value: Any, root: Path) -> Path:
+def validate_mountpoint(value: str, root: Path) -> str:
+    """Normalize a safe mountpoint while preserving the legacy manifest token."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(ord(character) < 0x20 or 0x7F <= ord(character) < 0xA0 for character in value)
+    ):
+        raise InstallError("the mountpoint path is invalid")
+    root = Path(root)
+    if not root.is_absolute() or ".." in root.parts:
+        raise InstallError("the install root must be absolute without parent traversal")
+    root = Path(os.path.normpath("/" + str(root).lstrip("/")))
+    if value == "mount":
+        return "mount"
+    expanded = os.path.expanduser(value)
+    path = Path(expanded)
+    if not path.is_absolute() or ".." in path.parts:
+        raise InstallError("the mountpoint path must be absolute and cannot contain parent traversal")
+    path = Path(os.path.normpath("/" + str(path).lstrip("/")))
+    if path == Path(path.anchor):
+        raise InstallError("the filesystem root cannot be used as a mountpoint")
+    legacy_mount = Path(os.path.normpath(str(root / "mount")))
+    if path == legacy_mount:
+        return "mount"
+    if _paths_overlap(path, root):
+        raise InstallError("the mountpoint path cannot overlap the contained install")
+    default_cache = Path(os.path.normpath(str(root / "cache")))
+    if _paths_overlap(path, default_cache):
+        raise InstallError("the mountpoint path cannot overlap the default vault cache")
+    return str(path)
+
+
+def _validate_configured_cache_dir(value: Any, root: Path, *, mountpoint: Path | None = None) -> Path:
     """Validate a vault cache path without creating it."""
     if (
         not isinstance(value, str)
@@ -660,8 +700,8 @@ def _validate_configured_cache_dir(value: Any, root: Path) -> Path:
         )
         if cache != default_cache and any(_paths_overlap(cache, path) for path in protected):
             raise InstallError("the vault cache path overlaps protected install files")
-    mountpoint = configured_mountpoint(root)
-    if _paths_overlap(cache, mountpoint):
+    selected_mountpoint = configured_mountpoint(root) if mountpoint is None else Path(os.path.normpath(str(mountpoint)))
+    if _paths_overlap(cache, selected_mountpoint):
         raise InstallError("the vault cache path overlaps the mountpoint")
 
     try:
@@ -691,13 +731,13 @@ def _validate_configured_cache_dir(value: Any, root: Path) -> Path:
     return cache
 
 
-def configured_cache_dir(root: Path) -> Path:
+def configured_cache_dir(root: Path, *, mountpoint: Path | None = None) -> Path:
     """Return the normalized, validated cache directory saved in vault.json."""
     root = Path(os.path.normpath(str(root)))
     raw = read_private_file(root / "config/vault.json", missing_ok=True)
     if raw is None:
-        return _validate_configured_cache_dir(str(root / "cache"), root)
-    config, _ = read_vault(raw, root, imported=False)
+        return _validate_configured_cache_dir(str(root / "cache"), root, mountpoint=mountpoint)
+    config, _ = read_vault(raw, root, imported=False, mountpoint=mountpoint)
     return Path(os.path.normpath(config["cache_dir"]))
 
 
@@ -712,20 +752,72 @@ def mountpoint_instructions(path: Path) -> str:
     )
 
 
+def _create_mountpoint_path(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            raise InstallError("a mountpoint directory could not be created safely") from None
+        try:
+            info = os.lstat(current)
+        except OSError:
+            raise InstallError("a mountpoint path component could not be inspected safely") from None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise InstallError("symlink or non-directory mountpoint components are not allowed")
+
+
 def prepare_mountpoint(path: Path) -> None:
-    """Create a mount directory or report the privileged setup commands."""
+    """Create or validate an empty, owner-private, unmounted mount directory."""
+    path = Path(os.path.normpath(str(path)))
+    is_default = path == Path(os.path.normpath(str(DEFAULT_MOUNTPOINT)))
     try:
         check_components(path, missing_ok=True)
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        check_directory(path, private=True)
-    except (InstallError, OSError):
-        raise InstallError(
-            f"mount directory {path} could not be created or is not owner-private. "
-            "Run these commands, then retry installation:\n" + mountpoint_instructions(path)
-        ) from None
+        if os.path.ismount(path):
+            raise InstallError("the selected mountpoint is already mounted; unmount it before installing")
+        if not os.path.lexists(path):
+            _create_mountpoint_path(path)
+        check_components(path)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise InstallError("the mountpoint could not be inspected safely") from None
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise InstallError("the mountpoint must be a real directory")
+        if info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_mode & 0o500 != 0o500:
+            raise InstallError("the mountpoint must be owned by this user, private, and owner-readable")
+        try:
+            with os.scandir(path) as entries:
+                if next(entries, None) is not None:
+                    raise InstallError(
+                        "the mountpoint must be empty; it contains ordinary local files that are not queued for upload"
+                    )
+        except OSError:
+            raise InstallError("the mountpoint contents could not be inspected safely") from None
+        if os.path.ismount(path):
+            raise InstallError("the selected mountpoint is already mounted; unmount it before installing")
+    except InstallError as exc:
+        if "already mounted" in str(exc) or "must be empty" in str(exc):
+            raise
+        if is_default:
+            raise InstallError(
+                f"mount directory {path} could not be created or is not owner-private. "
+                "Run these commands, then retry installation:\n" + mountpoint_instructions(path)
+            ) from None
+        raise InstallError(f"mount directory {path} is unsafe: {exc}") from None
+    except OSError:
+        if is_default:
+            raise InstallError(
+                f"mount directory {path} could not be created or is not owner-private. "
+                "Run these commands, then retry installation:\n" + mountpoint_instructions(path)
+            ) from None
+        raise InstallError(f"mount directory {path} could not be created safely") from None
 
 
-def read_vault(raw: bytes, root: Path, *, imported: bool) -> tuple[dict[str, Any], bytes]:
+def read_vault(raw: bytes, root: Path, *, imported: bool, mountpoint: Path | None = None) -> tuple[dict[str, Any], bytes]:
     config = parse_json_object(raw, "the vault configuration is invalid")
     allowed = {"version", "remote", "password", "password_salt", "cache_dir", "chunk_size", "max_object_size", "account_credentials"}
     if set(config) - allowed:
@@ -741,7 +833,7 @@ def read_vault(raw: bytes, root: Path, *, imported: bool) -> tuple[dict[str, Any
     if not imported:
         if config.get("remote") != f"{REMOTE_NAME}:":
             raise InstallError("the installed vault configuration points to another remote")
-        _validate_configured_cache_dir(config.get("cache_dir"), root)
+        _validate_configured_cache_dir(config.get("cache_dir"), root, mountpoint=mountpoint)
     else:
         remote = config.get("remote")
         if not isinstance(remote, str) or not remote.endswith(":") or not remote[:-1]:
@@ -1288,11 +1380,21 @@ def _install(args: argparse.Namespace) -> int:
     imported_vault = import_vault_config(args.vault_config, root) if args.vault_config else None
     existing_vault = read_private_file(root / "config/vault.json", missing_ok=True)
     if existing_vault is not None:
-        vault, _ = read_vault(existing_vault, root, imported=False)
+        vault, _ = read_vault(
+            existing_vault,
+            root,
+            imported=False,
+            mountpoint=configured_mountpoint(root, manifest),
+        )
         vault_bytes = existing_vault
     elif folder_id or imported_vault is not None:
         vault_bytes = create_vault_config(root, imported_vault)
-        vault, _ = read_vault(vault_bytes, root, imported=False)
+        vault, _ = read_vault(
+            vault_bytes,
+            root,
+            imported=False,
+            mountpoint=configured_mountpoint(root, manifest),
+        )
     else:
         vault_bytes = None
         vault = None
@@ -1463,9 +1565,30 @@ def _check_upgrade_mount_stopped(root: Path) -> None:
         raise InstallError(f"stop the contained mount before upgrading; run {stop_command}")
 
 
-def _acquire_upgrade_lock(root: Path) -> int:
+def _require_empty_old_mountpoint(path: Path) -> None:
+    """Refuse a mountpoint migration that could hide local files or a mounted tree."""
+    check_components(path, missing_ok=True)
+    if not os.path.lexists(path):
+        return
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise InstallError("the old mountpoint could not be inspected safely") from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise InstallError("the old mountpoint must be a real directory before it can be changed")
+    if os.path.ismount(path):
+        raise InstallError("stop the contained mount before changing its mountpoint")
+    try:
+        with os.scandir(path) as entries:
+            if next(entries, None) is not None:
+                raise InstallError("recover local files from the old mountpoint before changing it")
+    except OSError:
+        raise InstallError("the old mountpoint contents could not be inspected safely") from None
+
+
+def _acquire_upgrade_lock(root: Path, *, mountpoint: Path | None = None) -> int:
     _check_upgrade_mount_stopped(root)
-    cache = configured_cache_dir(root)
+    cache = configured_cache_dir(root, mountpoint=mountpoint)
     ensure_private_directory(cache)
     path = _upgrade_lock_path(root, cache_dir=cache)
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -1487,12 +1610,12 @@ def _acquire_upgrade_lock(root: Path) -> int:
     return fd
 
 
-def _validate_upgrade_lock_fd(root: Path, lock_fd: int) -> None:
+def _validate_upgrade_lock_fd(root: Path, lock_fd: int, *, mountpoint: Path | None = None) -> None:
     """Validate and lock the inherited descriptor for this install's cache."""
     _check_upgrade_mount_stopped(root)
     if type(lock_fd) is not int or lock_fd < 0:
         raise InstallError("the inherited cache-lock descriptor is invalid")
-    cache = configured_cache_dir(root)
+    cache = configured_cache_dir(root, mountpoint=mountpoint)
     check_directory(cache, private=True)
     path = _upgrade_lock_path(root, cache_dir=cache)
     try:
@@ -1540,25 +1663,40 @@ def install(args: argparse.Namespace) -> int:
     args.binary = str(_binary_source(args.binary))
     validate_binary(Path(args.binary))
     preflight_install_safety()
-    existing_manifest = load_manifest(expected_root()) if args.upgrade else None
-    selected_mountpoint = getattr(args, "mountpoint", None) or (existing_manifest["mountpoint"] if existing_manifest else DEFAULT_MOUNTPOINT)
-    if not args.upgrade:
-        if selected_mountpoint != "mount" and selected_mountpoint == DEFAULT_MOUNTPOINT:
-            prepare_mountpoint(Path(DEFAULT_MOUNTPOINT))
-        return _install(args)
     root = expected_root()
+    supplied_mountpoint = getattr(args, "mountpoint", None)
+    normalized_mountpoint = validate_mountpoint(supplied_mountpoint, root) if supplied_mountpoint is not None else None
+    existing_manifest = load_manifest(root) if args.upgrade else None
+    selected_mountpoint = normalized_mountpoint or (
+        existing_manifest["mountpoint"] if existing_manifest else DEFAULT_MOUNTPOINT
+    )
+    selected_mountpoint = validate_mountpoint(selected_mountpoint, root)
+    args.mountpoint = selected_mountpoint
+    selected_path = root / "mount" if selected_mountpoint == "mount" else Path(selected_mountpoint)
+    if not args.upgrade:
+        if os.path.lexists(root):
+            raise InstallError("the contained install already exists; use --upgrade to preserve it")
+        configured_cache_dir(root, mountpoint=selected_path)
+        if selected_mountpoint != "mount":
+            prepare_mountpoint(selected_path)
+        return _install(args)
     if not os.path.lexists(root):
         raise InstallError("--upgrade requires an existing contained install")
     check_directory(root, private=True)
     load_manifest(root)
     if upgrade_lock_fd is None:
-        lock = _acquire_upgrade_lock(root)
+        lock = _acquire_upgrade_lock(root, mountpoint=selected_path)
     else:
-        _validate_upgrade_lock_fd(root, upgrade_lock_fd)
+        _validate_upgrade_lock_fd(root, upgrade_lock_fd, mountpoint=selected_path)
         lock = None
     try:
-        if selected_mountpoint != "mount" and selected_mountpoint == DEFAULT_MOUNTPOINT:
-            prepare_mountpoint(Path(DEFAULT_MOUNTPOINT))
+        previous_mountpoint = configured_mountpoint(root, existing_manifest)
+        if selected_path != previous_mountpoint:
+            if _paths_overlap(selected_path, previous_mountpoint):
+                raise InstallError("the new mountpoint cannot overlap the current mountpoint")
+            _require_empty_old_mountpoint(previous_mountpoint)
+        if selected_mountpoint != "mount":
+            prepare_mountpoint(selected_path)
         return _install(args)
     finally:
         if lock is not None:
@@ -1571,7 +1709,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--wizard", action="store_true", help="ask for installation and vault settings step by step")
     mode.add_argument("--no-wizard", action="store_true", help="install without interactive setup (requires --binary)")
-    parser.add_argument("--mountpoint", choices=(DEFAULT_MOUNTPOINT, "mount"), help="mount at /mnt/degoo by default; upgrades keep the saved location; mount selects the legacy contained directory")
+    parser.add_argument(
+        "--mountpoint",
+        help="absolute owner-private mount directory; new installs default to /mnt/degoo, upgrades keep the saved path, and mount selects the legacy contained directory",
+    )
     parser.add_argument("--folder-id", help="ID of an existing dedicated Degoo folder (account root 0 is refused)")
     parser.add_argument("--folder-name", help="optional human-readable name for the dedicated folder")
     parser.add_argument("--vault-config", help="private existing vault configuration to import on another machine")

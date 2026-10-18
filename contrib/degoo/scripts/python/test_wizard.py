@@ -76,6 +76,20 @@ class WizardTest(unittest.TestCase):
         self.assertNotIn("chattr -i", text)
         run.assert_not_called()
 
+    def test_custom_mountpoint_warns_and_never_offers_privileged_helper_setup(self) -> None:
+        self.preflight.stop()
+        custom_mountpoint = Path("/tmp/custom vault mount")
+        with (
+            mock.patch.object(wizard, "_observed_mount_state", return_value="not mounted"),
+            mock.patch.object(wizard.mount_prerequisites, "check", return_value=["mountpoint missing: directory missing"]),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            issues = wizard._mount_preflight(Path("/private/install"), custom_mountpoint)
+
+        self.assertEqual(issues, ["mountpoint missing: directory missing"])
+        self.assertIn("only supports /mnt/degoo", output.getvalue())
+        self.assertNotIn("mount-setup", output.getvalue())
+
     def test_preflight_prints_compiler_package_configuration(self) -> None:
         self.preflight.stop()
         with (
@@ -433,11 +447,33 @@ class WizardTest(unittest.TestCase):
         self.assertTrue(installed)
         self.assertEqual(run.call_args.args[0], ["/usr/bin/apt-get", "install", "-y", "fuse3", "util-linux"])
 
-    def _run_default_flow(self, *, login_code: int = 0, setup_code: int = 0) -> tuple[int, mock.Mock, mock.Mock, mock.Mock, str]:
+    def _run_default_flow(
+        self,
+        *,
+        login_code: int = 0,
+        setup_code: int = 0,
+        mountpoint: str | None = None,
+        mountpoint_answers: tuple[str, ...] | None = None,
+    ) -> tuple[int, mock.Mock, mock.Mock, mock.Mock, mock.Mock, str, list[str]]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
-            answers = iter([""] * 11)
-            args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
+            mountpoint_answers_iter = iter(mountpoint_answers or ())
+            prompts: list[str] = []
+            args = type("Args", (), {
+                "binary": None,
+                "folder_id": "dedicated-id",
+                "folder_name": "Vault",
+                "vault_config": None,
+                "upgrade": False,
+                "mountpoint": mountpoint,
+            })()
+
+            def answer(prompt: str) -> str:
+                prompts.append(prompt)
+                if prompt.startswith("Mount directory") and mountpoint_answers is not None:
+                    return next(mountpoint_answers_iter)
+                return ""
+
             with (
                 mock.patch.object(wizard, "_check_runtime", return_value=(False, False)),
                 mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
@@ -462,19 +498,108 @@ class WizardTest(unittest.TestCase):
                 mock.patch.object(wizard, "_save_settings") as save_call,
                 contextlib.redirect_stdout(io.StringIO()) as output,
             ):
-                result = wizard._run(args, input_fn=lambda _: next(answers))
-        return result, login_call, setup_call, service_call, output.getvalue()
+                result = wizard._run(args, input_fn=answer)
+        return result, login_call, setup_call, service_call, install_call, output.getvalue(), prompts
 
     def test_default_answers_complete_staged_install(self) -> None:
-        result, login_call, setup_call, service_call, _ = self._run_default_flow()
+        result, login_call, setup_call, service_call, install_call, _, prompts = self._run_default_flow()
         self.assertEqual(result, 0)
         self.assertEqual(login_call.call_count, 2)
         setup_call.assert_called_once()
         self.assertEqual(setup_call.call_args.args[0].folder_id, "dedicated-id")
         service_call.assert_not_called()
+        self.assertEqual(install_call.call_args.args[0].mountpoint, wizard.installer.DEFAULT_MOUNTPOINT)
+        self.assertTrue(any(prompt.startswith("Mount directory") for prompt in prompts))
+
+    def test_mount_directory_prompt_accepts_custom_path_with_spaces_and_retries_invalid_input(self) -> None:
+        selected = "/tmp/degoo wizard mount"
+        result, _, _, _, install_call, output, prompts = self._run_default_flow(
+            mountpoint_answers=("relative/path", selected),
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(install_call.call_args.args[0].mountpoint, selected)
+        self.assertTrue(any(prompt.startswith("Mount directory") for prompt in prompts))
+        self.assertIn("That mount directory cannot be used", output)
+
+    def test_explicit_mountpoint_takes_precedence_without_a_prompt(self) -> None:
+        selected = "/tmp/degoo explicit mount"
+        result, _, _, _, install_call, _, prompts = self._run_default_flow(mountpoint=selected)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(install_call.call_args.args[0].mountpoint, selected)
+        self.assertFalse(any(prompt.startswith("Mount directory") for prompt in prompts))
+
+    def test_upgrade_mountpoint_defaults_to_saved_path_and_can_be_changed_after_safe_stop(self) -> None:
+        cases = (
+            ("mount", "", "mount"),
+            ("/mnt/saved vault", "", "/mnt/saved vault"),
+            ("/mnt/old vault", "/mnt/new vault", "/mnt/new vault"),
+        )
+        for saved, answer_value, expected in cases:
+            with self.subTest(saved=saved, selected=expected), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "install"
+                config_dir = root / "config"
+                config_dir.mkdir(parents=True, mode=0o700)
+                root.chmod(0o700)
+                self._write_private(config_dir / "vault.json", (json.dumps({
+                    "version": 1,
+                    "remote": "degoo-live-test:",
+                    "password": "test-only-upgrade-vault-secret",
+                    "cache_dir": str(root / "cache"),
+                    "account_credentials": "encrypted-account-credentials",
+                }, sort_keys=True) + "\n").encode())
+                self._write_private(config_dir / "auth.json", b'{"token":"test-only-account-token"}\n')
+                manifest = {
+                    "root_folder_id": "existing-vault-123",
+                    "mountpoint": saved,
+                    "service_links": [],
+                }
+                args = type("Args", (), {
+                    "binary": None,
+                    "folder_id": None,
+                    "folder_name": None,
+                    "vault_config": None,
+                    "upgrade": True,
+                    "mountpoint": None,
+                })()
+                events: list[str] = []
+                prompts: list[str] = []
+
+                def answer(prompt: str) -> str:
+                    prompts.append(prompt)
+                    if prompt.startswith("Mount directory"):
+                        return answer_value
+                    return ""
+
+                def record_install(install_args: argparse.Namespace) -> int:
+                    events.append("install")
+                    return 0
+
+                with (
+                    mock.patch.object(wizard.installer, "expected_root", return_value=root),
+                    mock.patch.object(wizard.installer, "load_manifest", return_value=manifest),
+                    mock.patch.object(wizard, "_prepare_upgrade_mount", side_effect=lambda *_args, **_kwargs: events.append("stop")),
+                    mock.patch.object(wizard, "_check_runtime", return_value=(True, False)),
+                    mock.patch.object(wizard, "_choose_binary", return_value=("/tmp/rclone", None)),
+                    mock.patch.object(wizard, "_cache_settings", return_value=wizard.installer.DEFAULT_MOUNT_SETTINGS),
+                    mock.patch.object(wizard.installer, "install", side_effect=record_install) as install_call,
+                    mock.patch.object(wizard.connection, "check_connection", return_value=[]),
+                    mock.patch.object(wizard, "_save_settings"),
+                    mock.patch.object(wizard, "_completion_summary", return_value="not mounted"),
+                ):
+                    result = wizard._run(args, input_fn=answer)
+
+                self.assertEqual(result, 0)
+                self.assertEqual(events, ["stop", "install"])
+                install_call.assert_called_once()
+                self.assertEqual(install_call.call_args.args[0].mountpoint, expected)
+                mountpoint_prompts = [prompt for prompt in prompts if prompt.startswith("Mount directory")]
+                self.assertEqual(len(mountpoint_prompts), 1)
+                self.assertIn(saved, mountpoint_prompts[0])
 
     def test_failed_login_stops_before_vault_setup(self) -> None:
-        result, _, setup_call, service_call, output = self._run_default_flow(login_code=2)
+        result, _, setup_call, service_call, _, output, _ = self._run_default_flow(login_code=2)
         self.assertEqual(result, 2)
         setup_call.assert_not_called()
         service_call.assert_not_called()
@@ -483,7 +608,7 @@ class WizardTest(unittest.TestCase):
         self.assertIn("degoo-rc login", output)
 
     def test_failed_setup_stops_before_mount_service(self) -> None:
-        result, _, setup_call, service_call, output = self._run_default_flow(setup_code=3)
+        result, _, setup_call, service_call, _, output, _ = self._run_default_flow(setup_code=3)
         self.assertEqual(result, 3)
         setup_call.assert_called_once()
         service_call.assert_not_called()
@@ -492,7 +617,7 @@ class WizardTest(unittest.TestCase):
         self.assertIn("degoo-rc setup help", output)
 
     def test_manual_flow_prints_completion_summary_when_dependencies_are_incomplete(self) -> None:
-        result, _, _, service_call, output = self._run_default_flow()
+        result, _, _, service_call, _, output, _ = self._run_default_flow()
         self.assertEqual(result, 0)
         service_call.assert_not_called()
         self.assertIn("Install root:", output)
@@ -521,7 +646,6 @@ class WizardTest(unittest.TestCase):
     def test_service_enable_times_out_without_claiming_mount_or_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install root"
-            answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
             error_output = io.StringIO()
@@ -541,7 +665,7 @@ class WizardTest(unittest.TestCase):
                 contextlib.redirect_stdout(output),
                 contextlib.redirect_stderr(error_output),
             ):
-                result = wizard._run(args, input_fn=lambda _: next(answers))
+                result = wizard._run(args, input_fn=lambda _: "")
 
         self.assertEqual(result, 2)
         service_call.assert_called_once_with(root, "enable")
@@ -562,7 +686,6 @@ class WizardTest(unittest.TestCase):
     def test_failed_service_start_keeps_nonzero_result_and_explains_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
-            answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
             error_output = io.StringIO()
@@ -582,7 +705,7 @@ class WizardTest(unittest.TestCase):
                 contextlib.redirect_stdout(output),
                 contextlib.redirect_stderr(error_output),
             ):
-                result = wizard._run(args, input_fn=lambda _: next(answers))
+                result = wizard._run(args, input_fn=lambda _: "")
 
         self.assertEqual(result, 2)
         self.assertIn("service is configured but the mount did not start", output.getvalue().lower())
@@ -596,7 +719,6 @@ class WizardTest(unittest.TestCase):
     def test_nonzero_service_start_result_is_reported_to_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
-            answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             error_output = io.StringIO()
             with (
@@ -614,7 +736,7 @@ class WizardTest(unittest.TestCase):
                 contextlib.redirect_stderr(error_output),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                result = wizard._run(args, input_fn=lambda _: next(answers))
+                result = wizard._run(args, input_fn=lambda _: "")
 
         self.assertEqual(result, 3)
         self.assertIn("Installation incomplete", error_output.getvalue())
@@ -624,7 +746,6 @@ class WizardTest(unittest.TestCase):
         for state in ("disconnected (ENOTCONN)", "unknown (mount table unavailable)"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / "install"
-                answers = iter([""] * 11)
                 args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
                 error_output = io.StringIO()
                 with (
@@ -643,7 +764,7 @@ class WizardTest(unittest.TestCase):
                     contextlib.redirect_stderr(error_output),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    result = wizard._run(args, input_fn=lambda _: next(answers))
+                    result = wizard._run(args, input_fn=lambda _: "")
 
                 self.assertEqual(result, 2)
                 self.assertIn("Installation incomplete", error_output.getvalue())
@@ -657,7 +778,6 @@ class WizardTest(unittest.TestCase):
         for waited_state, final_state, expected_code, error_state in cases:
             with self.subTest(waited_state=waited_state, final_state=final_state), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / "install"
-                answers = iter([""] * 11)
                 args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
                 error_output = io.StringIO()
                 with (
@@ -676,7 +796,7 @@ class WizardTest(unittest.TestCase):
                     contextlib.redirect_stderr(error_output),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    result = wizard._run(args, input_fn=lambda _: next(answers))
+                    result = wizard._run(args, input_fn=lambda _: "")
 
                 self.assertEqual(result, expected_code)
                 if error_state is None:
@@ -688,7 +808,6 @@ class WizardTest(unittest.TestCase):
     def test_missing_immutable_helper_blocks_service_start_before_mount_wait(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "install"
-            answers = iter([""] * 11)
             args = type("Args", (), {"binary": None, "folder_id": "dedicated-id", "folder_name": "Vault", "vault_config": None, "upgrade": False})()
             output = io.StringIO()
             error_output = io.StringIO()
@@ -709,7 +828,7 @@ class WizardTest(unittest.TestCase):
                 contextlib.redirect_stderr(error_output),
                 contextlib.redirect_stdout(output),
             ):
-                result = wizard._run(args, input_fn=lambda _: next(answers))
+                result = wizard._run(args, input_fn=lambda _: "")
 
         self.assertEqual(result, 2)
         service_call.assert_not_called()
@@ -1375,7 +1494,6 @@ class WizardTest(unittest.TestCase):
             )
             binary.chmod(0o700)
             args = type("Args", (), {"binary": None, "folder_id": None, "folder_name": None, "vault_config": None, "upgrade": False})()
-            answers = iter([""] * 13)
             login_vault_presence: list[bool] = []
 
             def login_after_setup(root: Path, *, clear_email: bool = False) -> int:
@@ -1392,7 +1510,7 @@ class WizardTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
-                result = wizard._run(args, input_fn=lambda _: next(answers))
+                result = wizard._run(args, input_fn=lambda _: "")
 
             root = home / ".local/share/rclone-degoo"
             self.assertEqual(result, 0)

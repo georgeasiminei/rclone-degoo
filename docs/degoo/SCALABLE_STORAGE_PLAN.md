@@ -862,3 +862,20 @@ shipping local-only authority would violate the explicit recovery requirement.
   updater lock; the normal status command reports healthy, mounted and
   `disabled; active`, with zero pending uploads. See
   [VALIDATION.md](VALIDATION.md) for evidence and limits.
+
+### 2026-10-18 — selectable mount directory in the wizard
+
+- The wizard offers the mount directory with `/mnt/degoo` as the fresh default
+  and the saved directory on upgrade. Safe absolute custom paths, including
+  spaces, flow through the installation manifest and generated launchers;
+  `--mountpoint PATH` takes precedence. The legacy contained path remains
+  compatible. The immutable helper is still restricted to `/mnt/degoo`.
+- Installer preflight refuses unsafe/occupied paths and overlap with program
+  or cache data. Path changes require a stopped old mount and an empty old
+  directory. Generated update, restoration and uninstall fixtures exercise
+  saved-path propagation, pending-data preservation and external-path safety.
+- This work changes installer/wizard behavior only. It makes no live mount,
+  cache, credential or remote change and activates no storage redesign.
+  All 477 Python helper tests, compilation, Markdown/link and diff checks
+  passed. Evidence and validation limits are recorded in
+  [VALIDATION.md](VALIDATION.md).

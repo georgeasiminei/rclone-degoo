@@ -329,6 +329,36 @@ class UpdateTest(unittest.TestCase):
         start.assert_called_once()
         self.assertFalse((self.root / "tmp/update-backup").exists())
 
+    def test_staged_update_preserves_custom_mountpoint_and_pending_bytes(self):
+        from unittest import mock
+        import install
+        import shlex
+
+        custom = self.home / "vault mount with spaces"
+        with self.output():
+            self.assertEqual(install.main([
+                "--binary", str(self.binary), "--upgrade", "--mountpoint", str(custom),
+            ]), 0)
+        custom.chmod(0o500)
+        config = {path.name: path.read_bytes() for path in (self.root / "config").iterdir()}
+        pending = self.root / "cache/generated-pending-file"
+        pending.write_bytes(b"generated local pending bytes")
+        self.write_binary("new")
+        self.package()
+
+        with mock.patch.object(update, "stop_runtime"), mock.patch.object(update, "start_runtime"):
+            code, output, error = self.invoke()
+
+        self.assertEqual(code, 0, output + error)
+        manifest = json.loads((self.root / "install.json").read_bytes())
+        self.assertEqual(manifest["mountpoint"], str(custom))
+        self.assertEqual(install.configured_mountpoint(self.root), custom)
+        for script in ("mount.sh", "stop.sh"):
+            self.assertIn(f"MOUNTPOINT={shlex.quote(str(custom))}", (self.root / "scripts" / script).read_text())
+        self.assertEqual(config, {path.name: path.read_bytes() for path in (self.root / "config").iterdir()})
+        self.assertEqual(pending.read_bytes(), b"generated local pending bytes")
+        self.assertEqual(custom.stat().st_mode & 0o777, 0o500)
+
     def test_candidate_vault_preflight_uses_root_only_and_hides_location_output(self):
         from unittest import mock
         candidate = self.base / "candidate"

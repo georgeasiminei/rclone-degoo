@@ -342,10 +342,19 @@ the offline migration steps in [USAGE.md](USAGE.md), preserving the vault key
 and complete pending data. Portable imported backups choose a destination
 cache instead of reusing another machine's absolute path.
 
-New contained installs mount at `/mnt/degoo`. The installer tries to create
-that directory with mode `0700`. If it cannot create or secure the path, it
-prints privileged commands for the selected mountpoint and current user, such
-as:
+The wizard asks for the mount directory during local settings. A fresh install
+defaults to `/mnt/degoo`; an upgrade shows its saved path. Enter a custom
+absolute path, such as `/home/USER/Degoo`, or accept the default. An explicit
+`--mountpoint PATH` selects the path without that prompt. The choice is saved
+as `mountpoint` in the installation root's `install.json` and written into
+the generated launchers, including `scripts/mount.sh` used by the service.
+Editing `install.json` alone does not regenerate those launchers.
+
+The installer tries to create the selected directory with mode `0700`. It
+requires an empty directory owned by the installing user, rejects symlinks,
+active mount targets and overlap with its program or cache, and preserves
+ordinary files when refusing a path. If it cannot create or secure the default
+path, it prints privileged commands for the current user, such as:
 
 ```sh
 sudo mkdir -p -- /mnt/degoo
@@ -372,13 +381,21 @@ itself runs as the ordinary user. When the flag is absent, the mount guard
 removes write permission through the retained directory handle after mounting
 and again on failure or unmount.
 
-The installer helpers accept `/mnt/degoo` or the legacy in-install `mount`
-directory. Upgrades preserve the recorded mountpoint by default. To migrate an
-older install to `/mnt/degoo`, pass `--mountpoint /mnt/degoo`; migration is
-refused while the old underlying `mount/` directory contains files. Move those
-files out and retry. The external `/mnt/degoo` directory is preserved during
-uninstall. The privileged helper does not support an immutable legacy
-`mount/` target. For an install whose saved mountpoint is immutable, run
+The installer helpers accept safe custom absolute paths and the legacy
+in-install `mount` directory (`--mountpoint mount`). Upgrades preserve the
+recorded mountpoint by default. Select another path in the wizard or pass
+`--mountpoint PATH` to regenerate the launchers. Changing the path requires
+the old mount to be stopped and its underlying directory empty; move ordinary
+files to a safe location before retrying. External mount directories are
+preserved during uninstall.
+
+Custom mount directories use the ordinary FUSE helper and the retained
+directory guard described above. Do not set `chattr +i` on a custom path:
+the privileged helper remains limited to `/mnt/degoo`. It also does not
+support an immutable legacy `mount/` target. If the custom location requires
+administrator access to create, prepare it as an empty directory owned by
+the mounting user with mode `0700`, then rerun installation. For an install
+whose saved mountpoint is immutable, run
 `degoo-rc install --mountpoint /mnt/degoo` to migrate the saved path while
 preserving the cache. The old underlying `mount/` directory must be empty.
 This migration does not clear an immutable flag; the root helper supports only
@@ -502,7 +519,8 @@ remains unconfirmed, installation reports an explicit error and returns a
 nonzero exit status. Completed configuration remains available for retry.
 Startup errors include commands to inspect status and logs. Choosing manual
 startup allows installation to finish without mounting. The default
-mount path is `/mnt/degoo`. Open that directory in a file manager or use it like
+mount path is `/mnt/degoo`; use the selected path shown in the summary if you
+changed it. Open that directory in a file manager or use it like
 any other directory while mounted. Ordinary files created there while the
 mount is absent remain local-only and are never uploaded; a mount refuses to
 cover a nonempty directory. The installed command dispatches
@@ -895,7 +913,7 @@ cleanup.
 Uninstall reports success only after verifying that the installation directory
 and its owned command and service links are absent. A cleanup failure returns
 a nonzero exit status and reports that uninstall is incomplete. Selected
-backups and the external `/mnt/degoo` mountpoint are preserved intentionally.
+backups and external mount directories are preserved intentionally.
 Interrupting cleanup also reports incomplete removal once deletion is requested.
 
 An older uninstaller can report `the persistent metadata cache contains an

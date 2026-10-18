@@ -897,23 +897,39 @@ class UninstallTest(unittest.TestCase):
             uninstall._verify_cleanup(self.root, [], False)
 
     def test_successful_uninstall_preserves_external_mountpoint(self) -> None:
-        external_mount = self.base / "mnt/degoo"
-        external_mount.mkdir(parents=True, mode=0o700)
+        external_mount = self.base / "custom mount"
+        external_mount.mkdir(mode=0o700)
         external_mount.chmod(0o500)
         manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
-        manifest["mountpoint"] = install.DEFAULT_MOUNTPOINT
+        manifest["mountpoint"] = str(external_mount)
         self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
 
-        with (
-            mock.patch.object(install, "configured_mountpoint", return_value=external_mount),
-            mock.patch.object(uninstall, "read_mountpoints", return_value=set()),
-        ):
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()):
             code, _, stderr = self.invoke("--delete-local", "--discard-vault-secret")
 
         self.assertEqual(code, 0, stderr)
         self.assertTrue(external_mount.is_dir())
         self.assertEqual(external_mount.stat().st_mode & 0o777, 0o500)
         self.assertFalse(self.root.exists())
+
+    def test_uninstall_refuses_nonempty_custom_external_mountpoint_without_touching_data(self) -> None:
+        external_mount = self.base / "custom mount"
+        external_mount.mkdir(mode=0o700)
+        payload = external_mount / "ordinary-local-file.txt"
+        payload.write_bytes(b"keep this data")
+        payload.chmod(0o600)
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        manifest["mountpoint"] = str(external_mount)
+        self.write_private(self.root / "install.json", json.dumps(manifest, sort_keys=True).encode() + b"\n")
+
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()):
+            code, stdout, stderr = self.invoke("--delete-local", "--discard-vault-secret")
+
+        self.assertEqual(code, 2)
+        self.assertIn("unmounted mount directory contains local files", stderr)
+        self.assertNotIn("Removed the isolated local Degoo install", stdout)
+        self.assertEqual(payload.read_bytes(), b"keep this data")
+        self.assertTrue(self.root.exists())
 
     def test_external_mount_selection_refuses_nonempty_contained_mount_before_cleanup(self) -> None:
         external_mount = self.base / "mnt/degoo"

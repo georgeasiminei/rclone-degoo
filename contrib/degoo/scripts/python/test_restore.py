@@ -159,6 +159,59 @@ class RestoreTest(unittest.TestCase):
         self.assertIn(self.folder_id, command)
         self.assertFalse((self.target / "install.json").exists())
 
+    def test_restore_keeps_selected_custom_mountpoint_and_recovers_pending_queue(self) -> None:
+        identity, pending, pending_bytes = self.add_cache_data()
+        identity_bytes = identity.read_bytes()
+        source_mount = self.base / "old selected mount"
+        source_mount.mkdir(mode=0o700)
+        (source_mount / "source-local-file").write_bytes(b"source mount data")
+        target_mount = self.base / "new selected mount"
+        target_mount.mkdir(mode=0o700)
+        target_mount.chmod(0o700)
+        target_payload = target_mount / "keep-local-file"
+        target_payload.write_bytes(b"target mount data")
+        target_payload.chmod(0o600)
+
+        source_manifest = json.loads((self.backup / "install.json").read_bytes())
+        source_manifest["mountpoint"] = str(source_mount)
+        source_manifest_bytes = (json.dumps(source_manifest, sort_keys=True) + "\n").encode()
+        self.write_private(
+            self.backup / "install.json",
+            source_manifest_bytes,
+        )
+        target_manifest = source_manifest | {
+            "mountpoint": str(target_mount),
+            "root_folder_id": self.folder_id,
+            "remote_folder_name": self.folder_name,
+            "remote_created_by_setup": True,
+            "remote_name": install.REMOTE_NAME,
+            "binary": "bin/rclone",
+            "vault_config": "config/vault.json",
+            "rclone_config": "config/rclone.conf",
+            "cache_dir": "cache",
+            "pidfile": "mount.pid",
+        }
+        target_manifest_bytes = (json.dumps(target_manifest, sort_keys=True) + "\n").encode()
+        self.write_private(self.target / "install.json", target_manifest_bytes)
+
+        backup = restore.inspect_backup(self.backup, self.target)
+        with mock.patch.object(restore.subprocess, "run", return_value=mock.Mock(returncode=0)):
+            restore.restore_to_install(backup, self.target)
+
+        restored_manifest = json.loads((self.target / "install.json").read_bytes())
+        self.assertEqual((self.target / "install.json").read_bytes(), target_manifest_bytes)
+        self.assertEqual((self.backup / "install.json").read_bytes(), source_manifest_bytes)
+        self.assertEqual(restored_manifest["mountpoint"], str(target_mount))
+        self.assertEqual(install.configured_mountpoint(self.target, restored_manifest), target_mount)
+        self.assertEqual(target_payload.read_bytes(), b"target mount data")
+        self.assertTrue((self.target / "cache" / "vfs" / self.cache_name / pending.name).is_file())
+        self.assertEqual((self.target / "cache" / "vfs" / self.cache_name / pending.name).read_bytes(), pending_bytes)
+        self.assertEqual((self.target / "cache" / f"{self.cache_name}.identity").read_bytes(), identity_bytes)
+        self.assertTrue(pending.is_file())
+        self.assertEqual(pending.read_bytes(), pending_bytes)
+        self.assertEqual(identity.read_bytes(), identity_bytes)
+        self.assertEqual((source_mount / "source-local-file").read_bytes(), b"source mount data")
+
     def test_metadata_cache_restores_to_target_configured_path_and_ignores_old_cache_decoy(self) -> None:
         self.add_cache_data()
         metadata_dir = self.backup / "cache" / "metadata" / self.cache_name
