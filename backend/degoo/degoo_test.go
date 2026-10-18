@@ -540,7 +540,12 @@ func newTestFsAtRoot(t *testing.T, mock *mockDegoo, root string) (fs.Fs, *httpte
 
 func newTestFsAtRootID(t *testing.T, mock *mockDegoo, root, rootID string, extras ...configmap.Simple) (fs.Fs, *httptest.Server, error) {
 	t.Helper()
-	server := httptest.NewServer(mock)
+	return newTestFsAtRootIDWithHandler(t, mock, root, rootID, extras...)
+}
+
+func newTestFsAtRootIDWithHandler(t *testing.T, handler http.Handler, root, rootID string, extras ...configmap.Simple) (fs.Fs, *httptest.Server, error) {
+	t.Helper()
+	server := httptest.NewServer(handler)
 	claims := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix())))
 	token := "header." + claims + ".signature"
 	authDir := t.TempDir()

@@ -1,13 +1,19 @@
 # Degoo scalable storage plan and progress
 
 **Plan date:** 2026-10-15; **Planning status:** complete; **Implementation
-status:** in progress (P2 directory bounds; inactive P3 page codec).
+status:** in progress (P2 directory bounds; inactive P3 encrypted trees,
+namespace, chunk I/O and local control components).
 
 This durable tracker records evidence, open decisions, validation gates, and
 next steps for large directories and logical files above Degoo's reported
 object limit. Requirements remain in [REQUIREMENTS.md](REQUIREMENTS.md); broader
 history is in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) and
 [VALIDATION.md](VALIDATION.md).
+
+The [integrity review and corrections](INTEGRITY_REVIEW.md) cover the cumulative
+changes from before PR #42 through PR #52. They distinguish active mount code,
+inactive components and test-only protocol models. Completing these corrections
+does not close the remote recovery, publication or go-live gates.
 
 ## Scope and operating rules
 
@@ -89,16 +95,19 @@ bounded index pages for the requested path. A full index rebuild is a recovery
 operation, not a prerequisite for every mount or first file open. Measure both
 paths separately.
 
-The leading candidate for P1 evaluation is **adaptive ciphertext buckets with
-an encrypted, sharded remote index**. The index would map encrypted logical
-keys to opaque provider IDs and versioned data/manifest records. Bucket or
+The offline P1 comparison conditionally selected **adaptive ciphertext buckets
+with an encrypted, sharded remote index** for further implementation and
+experiments; see [SCALABILITY_DECISION.md](SCALABILITY_DECISION.md). The index
+would map encrypted logical keys to opaque provider IDs and versioned
+data/manifest records. Bucket or
 shard sizing would adapt to observed entry counts and object limits. The hot
 path would use the index and direct provider ID lookup where supported,
 without fetching every sibling. The index must encrypt names and user metadata,
 support bounded shard reads and writes, and rebuild from remote state after
-local cache loss. This is a candidate, not an architecture decision.
+local cache loss. Provider activation and the final production format remain
+blocked on the recorded live identity, publication and recovery evidence.
 
-P1 must compare it against at least these options:
+The P1 comparison covers at least these options:
 
 1. **Smaller listing pages.** Measure rate-limit behavior and page count. This
    may lower response size but can increase request count; it does not remove
@@ -252,19 +261,27 @@ decision. The coordinating Codex agent owns the P1 baseline work started on
 **Gate:** Bounded objects/shards and crash-safe publication.
 
 - **P3-FORMAT** — Status: `in progress`; dependencies: P1-DECISION;
-  evidencePR: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
+  evidencePR: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51),
+  [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
   Specify the versioned encrypted object/index/manifest
   schema, key derivation and authenticated fields, shard addressing, maximum
   record size, chunk sizing after encryption overhead, and how a local cache
-  reconstructs from remote state. Do not add a single unbounded index.
-- **P3-PUBLISH** — Status: `not started`; dependencies: P3-FORMAT;
-  evidencePR: `TBD`. Implement staged upload and atomic logical-version
+  reconstructs from remote state. Password-only recovery must discover all
+  required bootstrap/KDF/control data remotely after account login. Do not add
+  a single unbounded index.
+- **P3-PUBLISH** — Status: `in progress`; dependencies: P3-FORMAT;
+  evidencePR: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
+  Local checkpoint/allocation intent components are inactive; remote publication
+  and authority remain blocked. Implement staged upload and atomic logical-version
   publication. Define idempotency, write authorization, version selection,
   overwrite behavior, and bounded temporary/backup/marker counts. Keep the
   last complete version readable until the new version is confirmed where
   supported.
-- **P3-SHARDS** — Status: `not started`; dependencies: P3-FORMAT;
-  evidencePR: `TBD`. Implement bounded index shards/buckets and their update,
+- **P3-SHARDS** — Status: `in progress`; dependencies: P3-FORMAT;
+  evidencePR: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
+  Inactive encrypted index/manifest trees and namespace are implemented;
+  physical allocation and mount integration remain open. Implement bounded
+  index shards/buckets and their update,
   split, merge, lookup, and invalidation rules. Prove that no single directory
   or index object grows without bound and that split headroom is sufficient
   for an interrupted update.
@@ -724,3 +741,75 @@ Delivery: [#51](https://github.com/georgeasiminei/rclone-degoo/pull/51).
 Targets `staging`.
 Source commit: `18bf74315`; integrated validation: `952acf6e3`. The user merges
 and removes the source branch. No merge was performed by the agent.
+
+### 2026-10-15 — encrypted component implementation and recovery clarification
+
+- Continued after PR #51's first validated cache/codec increment. Updated
+  [the plan](IMPLEMENTATION_PLAN.md) before implementing each component.
+  Added the real local checkpoint, bounded durable allocation ledger, shared
+  encrypted-page repository, compressed radix index, manifest tree, stable-ID
+  namespace, streaming data codec and logical-file composition. They remain
+  inactive: no new format, root publisher, runtime install or reset is enabled.
+- The user merged PR #51 at `5e945c0d7` while this follow-up was underway.
+  After fetching, preserved every pending edit on a new feature branch from
+  that current `origin/staging`. Its baseline tree equals PR #51's final head;
+  no reset, dropped work or source conflict was involved. Open a separate PR
+  for these components and leave merging/source-branch deletion to the user.
+- Focused component checks and an encrypted file/index/namespace integration
+  case pass. Known-snapshot graph traversal and synthetic >20 GiB splitting
+  are separate from cloud bootstrap/password-only recovery and live acceptance.
+  Detailed limits and failure coverage are in
+  [the evidence](SCALABILITY_EVIDENCE.md).
+- Delegated workers completed the checkpoint, index, manifest and namespace
+  tests. Subsequent worker usage limits interrupted final review/data/ledger
+  work; the coordinating agent preserved their partial files and completed
+  the remaining implementation, alias-regression correction and integration.
+- The user explicitly requires published-data recovery after Degoo login with
+  **the encryption password alone**, even after losing all local files. A
+  saved config/locator or intact local registry is not a prerequisite. The
+  local-only root registry experiment cannot be selected for production.
+  Requirements and decision now state that nonsecret KDF/bootstrap information
+  and the latest complete root must be recoverable remotely.
+- Read-only state inspection at 16:08 UTC still found the API hold expiring at
+  **21:30:29 UTC**, with no separate password-login hold. No live provider/auth
+  request, installed-runtime change, pending-data discard or reset occurred.
+- P3-SHARDS is active for the inactive trees/namespace, with physical placement
+  and filesystem integration unfinished. P3-PUBLISH is active for local intent
+  components only; remote publication/freshness remains unverified. No status
+  implies the full plan is complete. Provider identity/deletion evidence,
+  password-only bootstrap, remote publication/cleanup authority, persistent
+  inventory, reader pins, mounted fault/rebuild and live/soak gates remain open.
+
+Delivery: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52),
+implementation commit `f743fde44`. The final credential-free full suite passes
+all 195 test packages; scoped race/vet/lint, Markdown and link/task/diff checks
+pass. At 20:00 UTC, persisted API access was still held through 21:30:29 UTC;
+no password-login hold was recorded. No provider/auth or installed-runtime
+operation was attempted. PR #52 remains for the user to merge. Further activation
+requires verified remote publication and password-only bootstrap/recovery;
+shipping local-only authority would violate the explicit recovery requirement.
+
+### 2026-10-18 — cumulative integrity review corrections in PR #52
+
+- Owner: coordinating Codex agent with independent cleanup-model,
+  installed-settings and namespace workers. After fetching, based a new fix
+  branch on the existing PR #52 head `e5012d922`; it already contains current
+  `origin/staging`. This exception preserves the requested single PR.
+- The cumulative review from before PR #42 reproduced a test-only cleanup
+  defect: an unresolved root-create intent did not protect its child from a
+  delayed exact-ID delete. The model now protects active create references and
+  refuses root reconciliation when a child is retired or delete-in-flight.
+  Intent and current/previous roots remain intact, including after reopening
+  overlapping state.
+- Shared encrypted lifecycle assertions cover the historical rename trace and
+  the installed `norename`/`sha1all`/`fail_hard=true` settings. Permanent generated
+  source-failure and final-manifest-publication regressions verify cold metadata
+  readback of the old complete file. This is not mounted/provider acceptance.
+- Namespace JSON decoding rejects duplicate and equivalent field keys. The
+  seeded namespace snapshot model has a permanent test name. Useful review
+  cases were integrated and temporary review-only test files removed.
+- [INTEGRITY_REVIEW.md](INTEGRITY_REVIEW.md) records scope, the counterexample
+  and remaining limits. [VALIDATION.md](VALIDATION.md) records final integrated
+  checks. No live request, runtime update, reset or pending-write discard is
+  part of this correction. P1 live evidence, P3 integration, P4/P6 acceptance
+  and explicit go-live remain open. The user merges PR #52 into `staging`.

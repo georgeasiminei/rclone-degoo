@@ -294,6 +294,11 @@ fragments, JSON metadata, and repeated plaintext payload fragments in remote
 objects. Full reads and a range crossing chunk boundaries decrypt to the
 expected bytes. This fixture has a small remote parent; it does not combine
 the encrypted stack with the large-directory fixture or a mounted VFS.
+The historical counters below use `transactions=rename` and `hash_type=md5`.
+They do not represent the installed mount's `norename`, `sha1all` and
+`fail_hard=true` settings. Equivalent installed-settings lifecycle and failed
+overwrite coverage is tracked in the
+[integrity review](INTEGRITY_REVIEW.md).
 
 | Operation | Listing pages | Direct metadata reads | Payload reads | Snapshot hits / misses | Mutation / parent / global invalidations |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -941,8 +946,9 @@ with the envelope, crypt stream header and two authentication blocks, the
 complete largest page is exactly 131,072 bytes. One more payload byte fails.
 Concurrent seal/open tests pass with the race detector.
 
-This codec supplies no payload schema, index, manifest tree, remote locator,
-allocator, coordinator or mount adapter. It neither initializes a vault nor
+The initial codec increment supplied no payload schema, index, manifest tree,
+remote locator, allocator, coordinator or mount adapter; the follow-up components
+are described below. The codec neither initializes a vault nor
 changes the installed mount. Digest/identity checking does not prove root
 freshness or provider immutability. P3-FORMAT has started with this independent
 component; its full schema and integration gate remain unfinished.
@@ -956,6 +962,11 @@ read after a lost response cannot distinguish never accepted from accepted but
 not yet applied. Both traces retain the reservation and block dependent root
 publication; no blind retry is sent. Positive authenticated readback can adopt
 that exact transaction. Current/previous roots and their data remain protected.
+The integrity review found that current/previous-root checks alone missed
+data referenced by an unresolved root-create intent. Cleanup also needs to
+protect those references, and root reconciliation must refuse retired or
+delete-in-flight children. The review records the counterexample and permanent
+regressions; the original late-delete case tested a superseded object only.
 
 The finite fixture caps unresolved intents at two and lifetime allocations at
 sixteen. Lost deletes retain tombstones; their exact IDs and slots are never
@@ -973,3 +984,116 @@ cache. Host authority, required control-state backup/recovery, provider-assigned
 opaque IDs, real immutable create semantics, physical placement, active-reader
 pins, and terminal deletion remain integration or provider gates. No remote-only
 latest-root claim follows from this experiment.
+
+### Inactive encrypted trees, namespace and streaming file composition
+
+Delivery: [#52](https://github.com/georgeasiminei/rclone-degoo/pull/52).
+
+The follow-up to merged PR #51 implements the authenticated page-reference/store
+port, compressed radix-16 index, manifest tree and stable-ID namespace. None
+is connected to the installed mount or a new provider-backed format. The store
+port states adapter obligations (durable intent before creates, immutable
+non-reused locators, positive checksum confirmation and cooldown handling);
+these are not inferred Degoo guarantees.
+
+- Index leaves contain at most 64 records, each at most 8 KiB, and must fit the
+  128 KiB encrypted page cap. Branches have 16 optional child references with
+  strictly advancing, normalized hex prefixes. A point lookup reads at most
+  65 pages. Copy-on-write updates and bounded sibling merging preserve prior
+  roots. Tests cover count/encoded-byte splits, 1,000 records, maximum depth,
+  old roots after failed edits, cancellation and malformed authenticated nodes.
+- Manifests stream at most 64 chunks/references per page group and at most
+  eight branch levels. Lookup reads at most nine pages. A 262,145-chunk stream
+  produces 4,165 metadata pages through a discarding fake store; its post-GC
+  retained heap is asserted below 12 MiB. This is a retained-memory check,
+  not peak process RSS or a live provider scale claim.
+- Namespace records use keyed inode/child digests and encrypted exact Linux
+  name bytes. Directory rename preserves descendant IDs and data references.
+  Expected inode revisions refuse stale replacement/removal/movement. Tests
+  cover same/cross-parent rename, compatible replacement, cycles, nonempty
+  directories, invalid UTF-8 names, corrupt links and mid-edit failure; old
+  snapshots remain readable. Root publication and open-version pins are absent.
+- The data codec streams rclone crypt encryption with a 55-byte encrypted
+  vault/file/offset/size envelope. Logical chunks are at most 1 GiB and exact
+  stored sizes include the envelope and crypt framing. Trusted manifests bind
+  the full ciphertext digest and 32-byte crypt stream header. Range reads
+  verify that header and inner identity, then authenticate only the required
+  crypt blocks. Partial reads do not claim full SHA-256 verification. Tests
+  refuse valid same-key substitutions, changed authenticated identity, altered
+  ciphertext, truncation, cancellation and short/long source input.
+- File composition stages fixed-size chunks without whole-file buffering and
+  reads only overlapping chunks. A synthetic 21 GiB + 17-byte source produces
+  22 descriptors; the test does not encrypt/upload that volume. A separate
+  integration case uses real encrypted data, manifests, index and namespace,
+  discards their in-memory instances, resolves a renamed file from a known
+  trusted snapshot/key and reads identical bytes. This is graph traversal,
+  not bootstrap/latest-root or password-only recovery evidence.
+
+### Real checkpoint and bounded allocation ledger
+
+The Linux authority now stores a checksummed, explicitly initialized checkpoint
+with at most 64 KiB complete file size. One fixed temporary file bounds committed
+plus replacement checkpoint files to 128 KiB. Private-file/inode checks, file
+fsync, atomic rename and directory fsync enforce the local contract. Changed,
+unsafe or corrupt state is refused; ambiguous I/O poisons the lease until reopen.
+Tests inject failure before and after rename and verify actual disk state after
+reopen. The checksum detects corruption; a stale valid backup remains undetectable.
+Conditional replacement compares the expected local payload while holding the
+lease mutex, so two ledger instances cannot overwrite each other's intents.
+This local condition is not a Degoo conditional-write/fencing primitive.
+
+An inactive allocation ledger uses that checkpoint port. Reserve persists a
+unique attempt token and exact byte commitment before returning; reopen retains
+unknown outcomes. Exact positive confirmations must match length/digest and may
+not alias another physical locator. The alias regression failed before the
+correction. Concurrent reservations serialize, overflow/corruption are refused,
+and a real subprocess reopens a reservation from the actual authority files.
+It retains at most 32 records and encoded state at most 60 KiB. There is no
+retirement, expiry, replay or deletion API: capacity exhaustion stops work.
+This is not a sustainable production allocator or a remote cleanup inventory.
+Every ledger operation also refuses a checkpoint advanced by another instance;
+stale inventory reads cannot silently omit that instance's reservations. Tests
+exercise the conflict against both a fake port and the actual authority file
+before subprocess reopen. Earlier full suites passed; final integrated results
+are recorded in the validation document.
+
+The user now requires published-vault recovery with the encryption password
+alone after account authentication, without any local config/control backup.
+These components do not supply remote bootstrap discovery or verified latest
+root selection, and the local ledger cannot replace those requirements.
+
+### Cumulative integrity review corrections — 2026-10-18
+
+The [review](INTEGRITY_REVIEW.md) covers the changes from before PR #42 to
+PR #52. No active production data-loss regression was reproduced. The review
+did reproduce a cleanup-model counterexample and a namespace decoding
+ambiguity; the installed-settings fixture also needed permanent coverage.
+
+The single-host model now pins objects referenced by unresolved creates before
+retirement, and refuses reconciliation of retired or delete-in-flight children.
+The failing-before regression first reopens the registry, then overlaps a late
+root create with an exact-ID child delete. Both child disappearance and current
+root read failure are observed. Permanent recovery cases also cover persisted
+retirement alone, an unresolved deletion and an applied deletion while keeping
+the prior complete root readable. Exact IDs prevent substitution, not unsafe
+deletion of a still-referenced object.
+
+The installed-settings encrypted lifecycle shares the historical trace's
+setup and assertions. It exercises `norename`, `sha1all` and `fail_hard=true`.
+Six incomplete replacement sources and rejection of the final manifest
+publication must retain exact old-file readback after metadata-cache clearing.
+Manifest reads during no-rename lookup are expected and do not invalidate the
+historical rename-mode counters above. These generated tests do not establish
+live provider behavior, actual process/power loss, mounted VFS behavior or
+password-only recovery.
+
+Valid encrypted inode/link records with duplicate JSON keys previously decoded
+successfully, including a nested manifest-reference identity and an escaped
+spelling of the same key. Namespace decoding now performs bounded validation of
+duplicate/equivalent field keys before typed decoding. The 120-operation seeded
+namespace model compares the logical view and revisits prior snapshots.
+
+Final failing-before/passing-after evidence and checks are in
+[VALIDATION.md](VALIDATION.md). These corrections remain in PR #52; none closes
+the remote publication, allocator lifecycle, cleanup/pins, bootstrap or live
+acceptance gates.

@@ -332,6 +332,11 @@ func (s *shStore) reconcile(id string) error {
 	if i < 0 {
 		return errors.New("create intent missing")
 	}
+	for _, ref := range in.Refs {
+		if hasSH(s.s.Retired, ref) || hasSHDeleteIntent(s.s, ref) {
+			return errSHRetired
+		}
+	}
 	sealed, ok := s.r.get(id)
 	if !ok {
 		return errSHUnknown
@@ -370,7 +375,10 @@ func (s *shStore) retireDelete(id string) error {
 		return errSHIntent
 	}
 	if protectedSH(s.s, id) {
-		return errors.New("current/previous root references delete target")
+		return errors.New("current/previous root or unresolved create references delete target")
+	}
+	if hasSH(s.s.Retired, id) || hasSHDeleteIntent(s.s, id) {
+		return errSHRetired
 	}
 	o, ok := findSH(s.s.Objects, id)
 	if !ok {
@@ -441,6 +449,20 @@ func protectedSH(s shRegistry, id string) bool {
 	for _, rootID := range []string{s.Current, s.Previous} {
 		root, ok := findSH(s.Objects, rootID)
 		if ok && (root.ID == id || hasSH(root.Refs, id)) {
+			return true
+		}
+	}
+	for _, intent := range s.Intents {
+		if intent.Op == "create" && hasSH(intent.Refs, id) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSHDeleteIntent(s shRegistry, id string) bool {
+	for _, intent := range s.Intents {
+		if intent.Op == "delete" && intent.ID == id {
 			return true
 		}
 	}
@@ -606,6 +628,125 @@ func TestScalabilitySingleHostLateCreateAndColdCache(t *testing.T) {
 	}
 	if rs[0].gets != gets || rs[0].lists != lists {
 		t.Fatal("registry loss attempted remote-only bootstrap")
+	}
+}
+
+func TestScalabilitySingleHostRetireDeleteProtectsUnresolvedRootChild(t *testing.T) {
+	dir, remote := t.TempDir(), newSHRemote()
+	store, _ := seedSH(t, dir, remote)
+	current, previous := store.s.Current, store.s.Previous
+	child := dataSH(t, store, "candidate-data", "payload needed by candidate root")
+	root, err := store.createRoot("candidate-root", child, shDelayAccept)
+	if !errors.Is(err, errSHAck) {
+		t.Fatalf("candidate root did not remain unresolved: id=%q err=%v", root, err)
+	}
+
+	store, err = openSHStore(dir, remote)
+	checkSH(t, err)
+	if len(store.s.Intents) != 1 || store.s.Intents[0].ID != root || !hasSH(store.s.Intents[0].Refs, child) {
+		t.Fatalf("reopen lost the candidate root's child reference: %+v", store.s.Intents)
+	}
+	deleteCalls := remote.deletes
+	if err := store.retireDelete(child); err == nil {
+		t.Fatal("retiring a child of an unresolved root was not refused")
+	}
+	if len(store.s.Intents) != 1 || store.s.Intents[0].Op != "create" || store.s.Intents[0].ID != root || !hasSH(store.s.Intents[0].Refs, child) {
+		t.Fatalf("refused retirement did not retain the root intent: %+v", store.s.Intents)
+	}
+	if remote.deletes != deleteCalls || len(remote.deletePending) != 0 || hasSH(store.s.Retired, child) {
+		t.Fatalf("refused retirement scheduled a delete: calls=%d pending=%v retired=%v", remote.deletes, remote.deletePending, store.s.Retired)
+	}
+	if store.s.Current != current || store.s.Previous != previous {
+		t.Fatalf("refused retirement changed root history: current=%q previous=%q", store.s.Current, store.s.Previous)
+	}
+
+	if err := remote.applyLateCreate(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.reconcile(root); err != nil {
+		t.Fatalf("candidate root did not reconcile after protected child remained available: %v", err)
+	}
+	content, err := store.readCurrent()
+	if err != nil || string(content) != "payload needed by candidate root" {
+		t.Fatalf("reconciled root lost its child: content=%q err=%v", content, err)
+	}
+}
+
+func TestScalabilitySingleHostReconcileRefusesRetiredChildCandidates(t *testing.T) {
+	tests := []struct {
+		name       string
+		deleteMode int // 0 means retired only, 1 means deletion is unresolved, 2 means it applied
+	}{
+		{name: "retired"},
+		{name: "delete unresolved", deleteMode: 1},
+		{name: "delete applied", deleteMode: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, remote := t.TempDir(), newSHRemote()
+			store, _ := seedSH(t, dir, remote)
+			current, previous := store.s.Current, store.s.Previous
+			child := dataSH(t, store, "candidate-data", "candidate payload")
+			root, err := store.createRoot("candidate-root", child, shDelayAccept)
+			if !errors.Is(err, errSHAck) {
+				t.Fatalf("candidate root did not remain unresolved: id=%q err=%v", root, err)
+			}
+			childRecord, ok := findSH(store.s.Objects, child)
+			if !ok {
+				t.Fatalf("candidate child %q is absent from the safety registry", child)
+			}
+
+			// Persist overlapping intents to verify recovery refuses a candidate
+			// whose child is already retired.
+			unsafe := store.s
+			unsafe.Retired = append(append([]string(nil), store.s.Retired...), child)
+			if test.deleteMode != 0 {
+				unsafe.Intents = append(append([]shIntent(nil), store.s.Intents...), shIntent{
+					Op: "delete", Tx: "delete-" + child, ID: child, Slot: childRecord.Slot,
+				})
+			}
+			checkSH(t, store.save(unsafe))
+			store, err = openSHStore(dir, remote)
+			checkSH(t, err)
+			if test.deleteMode != 0 {
+				delayed := test.deleteMode == 1
+				err := remote.deleteExact(child, delayed)
+				if delayed && !errors.Is(err, errSHAck) || !delayed && err != nil {
+					t.Fatalf("could not install legacy delete outcome: delayed=%v err=%v", delayed, err)
+				}
+			}
+			if err := remote.applyLateCreate(root); err != nil {
+				t.Fatal(err)
+			}
+
+			before, err := json.Marshal(store.s)
+			checkSH(t, err)
+			err = store.reconcile(root)
+			if !errors.Is(err, errSHRetired) {
+				t.Errorf("reconcile accepted candidate root with retired/deleting child: %v", err)
+			}
+			after, marshalErr := json.Marshal(store.s)
+			checkSH(t, marshalErr)
+			if !bytes.Equal(before, after) {
+				t.Errorf("refused candidate reconciliation mutated the safety registry")
+			}
+			if store.s.Current != current || store.s.Previous != previous {
+				t.Errorf("candidate reconciliation changed root history: current=%q previous=%q", store.s.Current, store.s.Previous)
+			}
+			if len(store.s.Intents) == 0 || store.s.Intents[0].ID != root || !hasSH(store.s.Intents[0].Refs, child) {
+				t.Errorf("candidate reconciliation discarded its unresolved root intent: %+v", store.s.Intents)
+			}
+
+			if test.deleteMode == 1 {
+				if err := remote.applyLateDelete(child); err != nil {
+					t.Fatal(err)
+				}
+			}
+			content, readErr := store.readCurrent()
+			if readErr != nil || string(content) != "remote encrypted content" {
+				t.Errorf("candidate reconciliation damaged the prior current root: content=%q err=%v", content, readErr)
+			}
+		})
 	}
 }
 
