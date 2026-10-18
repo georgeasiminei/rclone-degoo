@@ -1491,6 +1491,42 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             if mount_state != "mounted":
                 _report_startup_failure(root, mountpoint, startup_wait_state=mount_state)
             return 0 if mount_state == "mounted" else 2
+        try:
+            service_result = service.run(root, "install")
+            service_error = None
+        except service.ServiceError as exc:
+            service_result = 2
+            service_error = "".join(character for character in str(exc) if character.isprintable())[:300]
+        if service_error or service_result != 0:
+            command = _degoo_rc(root, "service", "install")
+            detail = f" Service detail: {service_error}." if service_error else ""
+            code = f" (exit code {service_result})" if not service_error else ""
+            print(
+                f"Installation incomplete: the Degoo user service could not be registered{code}.{detail}",
+                file=sys.stderr,
+            )
+            print(f"  Resolve the issue and retry with `{command}`.", file=sys.stderr)
+            print("  The installed client, vault configuration, and local cache are preserved.", file=sys.stderr)
+            _completion_summary(
+                root,
+                mount_ready=mount_ready,
+                systemd_available=systemd_available,
+                note="User-service registration did not complete; the mount was not started.",
+                show_commands=False,
+            )
+            return service_result if service_result != 0 else 2
+        service_command = _degoo_rc(root, "service", "start")
+        _completion_summary(
+            root,
+            mount_ready=mount_ready,
+            systemd_available=systemd_available,
+            note=(
+                "The user service is registered but was not enabled or started by the wizard. "
+                "Existing service enablement was preserved; on a fresh install it remains disabled and inactive (stopped). "
+                f"After editing the cache and vault encryption settings, start it with `{service_command}`."
+            ),
+        )
+        return 0
     else:
         if not systemd_available:
             print("A systemd user manager is unavailable; start the mount manually when ready.")

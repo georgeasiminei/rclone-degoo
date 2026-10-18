@@ -46,9 +46,28 @@ maintenance entrypoint. Examples here use `degoo-rc`.
 The command set is `install`, `update`, `uninstall`, `backup-config`, `login`, `setup`,
 `mount`, `stop`, `status`, `stats`, `benchmark`, `sync`, `location`, `folders`,
 `service`, `info`, `logs`, `trash`, `empty-trash`, and `completion`.
-Service actions are `enable`, `disable`, `start`, `stop`, `restart`, and `status`.
+Service actions are `install`, `enable`, `disable`, `start`, `stop`, `restart`,
+and `status`.
 Existing command options remain available. `trash` lists account trash; `empty-trash`
 separately performs account-wide deletion.
+
+Declining service startup in the wizard registers the user unit without
+enabling or starting it. After editing configuration, run
+`degoo-rc service start` without sudo. On an older installation with no
+registered unit, first run `degoo-rc service install`. Use `service enable`
+when automatic startup is
+wanted. The generated service belongs to the user's systemd manager; copying
+it into `/etc/systemd/system` makes it run as root and fail private ownership
+checks. See [service setup](INSTALLATION.md#login-mount-and-recovery).
+
+For a fresh, unused vault, choose its encryption settings before the first
+write. After manually changing the vault password or salt following account
+login, run `degoo-rc login` again: the saved account password is encrypted with
+those settings and must be saved under the chosen key. Valid tokens can keep
+mounting while masking unusable saved credentials. Existing encrypted data
+requires its original password and salt; editing these fields is not a rekey
+operation. A populated cache location requires the documented cache migration,
+not merely changing `cache_dir`.
 
 For the recommended contained installer, persistent user service, cached-email
 login, mount settings, and complete local cleanup, see

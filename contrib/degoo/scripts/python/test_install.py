@@ -1126,7 +1126,10 @@ class ServiceTest(unittest.TestCase):
             self.assertTrue(self.wanted_link.is_symlink())
             manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
             self.assertEqual(set(manifest["service_links"]), {str(self.unit_link), str(self.wanted_link)})
-            self.assertEqual(service.run(self.root, "stop"), 0)
+            with contextlib.redirect_stdout(io.StringIO()) as stop_output:
+                self.assertEqual(service.run(self.root, "stop"), 0)
+            self.assertIn("registration and enablement were left unchanged", stop_output.getvalue())
+            self.assertNotIn("remains enabled", stop_output.getvalue())
             self.assertEqual(service.run(self.root, "start"), 0)
             self.assertEqual(service.run(self.root, "restart"), 0)
             self.assertEqual(service.run(self.root, "status"), 0)
@@ -1135,6 +1138,86 @@ class ServiceTest(unittest.TestCase):
         self.assertFalse(self.wanted_link.exists())
         self.assertEqual(unrelated.read_text(encoding="ascii"), "keep")
         self.assertEqual(json.loads((self.root / "install.json").read_text(encoding="utf-8"))["service_links"], [])
+
+    def test_install_registers_without_enabling_or_starting(self) -> None:
+        with mock.patch.object(service.subprocess, "run", side_effect=self.fake_systemctl):
+            self.assertEqual(service.run(self.root, "install"), 0)
+
+        self.assertTrue(self.unit_link.is_symlink())
+        self.assertFalse(self.wanted_link.exists())
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["service_links"], [str(self.unit_link)])
+        self.assertEqual(manifest["service_config_home"], str(self.home / ".config"))
+        actions = [call[0] for call in self.calls]
+        self.assertEqual(actions, ["link", "daemon-reload", "show"])
+        self.assertNotIn("enable", actions)
+        self.assertNotIn("start", actions)
+        self.assertNotIn("stop", actions)
+        self.assertEqual(service.build_parser().parse_args(["--root", str(self.root), "install"]).action, "install")
+
+    def test_install_preserves_existing_enablement_without_starting_or_stopping(self) -> None:
+        self.unit_link.parent.mkdir(parents=True, exist_ok=True)
+        self.wanted_link.parent.mkdir(parents=True, exist_ok=True)
+        for directory in (self.home / ".config", self.home / ".config/systemd", self.unit_link.parent, self.wanted_link.parent):
+            directory.chmod(0o700)
+        self.unit_link.symlink_to(self.root / service.UNIT_NAME)
+        self.wanted_link.symlink_to(self.root / service.UNIT_NAME)
+        manifest_path = self.root / "install.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["service_config_home"] = str(self.home / ".config")
+        manifest["service_links"] = [str(self.unit_link), str(self.wanted_link)]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_path.chmod(0o600)
+
+        with mock.patch.object(service.subprocess, "run", side_effect=self.fake_systemctl):
+            self.assertEqual(service.run(self.root, "install"), 0)
+
+        self.assertTrue(self.unit_link.is_symlink())
+        self.assertTrue(self.wanted_link.is_symlink())
+        stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(set(stored["service_links"]), {str(self.unit_link), str(self.wanted_link)})
+        actions = [call[0] for call in self.calls]
+        self.assertEqual(actions, ["daemon-reload", "show"])
+        self.assertFalse({"enable", "start", "stop", "disable"} & set(actions))
+
+    def test_install_refuses_preexisting_unowned_service_link(self) -> None:
+        self.unit_link.parent.mkdir(parents=True, exist_ok=True)
+        for directory in (self.home / ".config", self.home / ".config/systemd", self.unit_link.parent):
+            directory.chmod(0o700)
+        other_unit = self.base / "other.service"
+        other_unit.write_text("[Service]\n", encoding="ascii")
+        self.unit_link.symlink_to(other_unit)
+
+        with mock.patch.object(service.subprocess, "run", side_effect=self.fake_systemctl):
+            with self.assertRaises(service.ServiceError):
+                service.run(self.root, "install")
+
+        self.assertEqual(os.readlink(self.unit_link), str(other_unit))
+        self.assertEqual(self.calls, [])
+
+    def test_install_reload_failure_keeps_registered_link_for_retry(self) -> None:
+        def failed_reload(command: list[str], **kwargs: object):
+            result = self.fake_systemctl(command, **kwargs)
+            if command[2:] == ["daemon-reload"]:
+                return service.subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"failure")
+            return result
+
+        with mock.patch.object(service.subprocess, "run", side_effect=failed_reload):
+            with self.assertRaisesRegex(service.ServiceError, "could not reload"):
+                service.run(self.root, "install")
+
+        self.assertTrue(self.unit_link.is_symlink())
+        manifest = json.loads((self.root / "install.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["service_links"], [str(self.unit_link)])
+        actions = [call[0] for call in self.calls]
+        self.assertEqual(actions, ["link", "daemon-reload"])
+        self.assertFalse({"enable", "start", "stop"} & set(actions))
+
+    def test_status_without_registered_unit_suggests_install_or_enable(self) -> None:
+        with self.assertRaises(service.ServiceError) as raised:
+            service.run(self.root, "status")
+        self.assertIn("service install", str(raised.exception))
+        self.assertIn("service enable", str(raised.exception))
 
     def test_enable_refuses_preexisting_unowned_service_link(self) -> None:
         self.unit_link.parent.mkdir(parents=True, exist_ok=True)

@@ -112,7 +112,7 @@ class BashCompletionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
         service = self.complete(result.stdout, ["degoo-rc", "service", ""], 2)
-        self.assertEqual(set(service), {"enable", "disable", "start", "stop", "restart", "status"})
+        self.assertEqual(set(service), {"install", "enable", "disable", "start", "stop", "restart", "status"})
         self.assertEqual(set(self.complete(result.stdout, ["degoo-rc", "benchmark", ""], 2)), {"read", "write"})
         self.assertEqual(self.complete(result.stdout, ["degoo-rc", "completion", ""], 2), ["bash"])
 

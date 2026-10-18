@@ -40,7 +40,7 @@ def _root(value: str) -> Path:
         if not manifest.get("root_folder_id"):
             raise ServiceError(
                 "configure a dedicated vault folder with "
-                f"{_degoo_rc(root, 'setup', 'help')} before enabling its service"
+                f"{_degoo_rc(root, 'setup', 'help')} before installing or enabling its service"
             )
         if installer.read_private_file(root / "config/vault.json", missing_ok=True) is None:
             raise ServiceError("the vault configuration is missing")
@@ -203,7 +203,11 @@ def _systemctl(root: Path, *arguments: str, capture: bool = True) -> subprocess.
 def _require_loaded_unit(root: Path, manifest: dict[str, Any]) -> None:
     result = _systemctl(root, "show", "--property=FragmentPath", "--value", UNIT_NAME)
     if result.returncode != 0:
-        raise ServiceError(f"the Degoo user service is not loaded; run {_degoo_rc(root, 'service', 'enable')} first")
+        raise ServiceError(
+            "the Degoo user service is not loaded; run "
+            f"{_degoo_rc(root, 'service', 'install')} to register it, or "
+            f"{_degoo_rc(root, 'service', 'enable')} to register and start it"
+        )
     try:
         fragment = Path(result.stdout.decode("utf-8").strip())
     except UnicodeDecodeError:
@@ -220,8 +224,8 @@ def _require_loaded_unit(root: Path, manifest: dict[str, Any]) -> None:
         raise ServiceError("systemd resolved this service name to a different unit")
 
 
-def enable(root: Path) -> int:
-    manifest = _load_manifest(root)
+def _register_unit(root: Path, manifest: dict[str, Any]) -> None:
+    """Link and reload the contained unit without changing its enablement or state."""
     if not manifest.get("service_config_home"):
         manifest["service_config_home"] = str(_config_home(root, manifest))
     unit = _unit_path(root)
@@ -248,6 +252,18 @@ def enable(root: Path) -> int:
     if result.returncode != 0:
         raise ServiceError("systemd could not reload the user-service units")
     _require_loaded_unit(root, manifest)
+
+
+def install(root: Path) -> int:
+    manifest = _load_manifest(root)
+    _register_unit(root, manifest)
+    print("The Degoo user service is registered. This command did not enable or start it.")
+    return 0
+
+
+def enable(root: Path) -> int:
+    manifest = _load_manifest(root)
+    _register_unit(root, manifest)
     result = _systemctl(root, "enable", "--now", UNIT_NAME)
     _store_links(root, manifest, present=True)
     if result.returncode != 0:
@@ -272,7 +288,11 @@ def disable(root: Path) -> int:
     if reload_result.returncode != 0:
         raise ServiceError("systemd could not reload after disabling the Degoo user service")
     _store_links(root, manifest, present=False)
-    print(f"The Degoo user service is stopped and disabled. Run {_degoo_rc(root, 'service', 'enable')} to link it again.")
+    print(
+        "The Degoo user service is stopped and disabled. Run "
+        f"{_degoo_rc(root, 'service', 'install')} to register it without enabling it, or "
+        f"{_degoo_rc(root, 'service', 'enable')} to register and start it."
+    )
     return 0
 
 
@@ -280,7 +300,11 @@ def status(root: Path) -> int:
     manifest = _load_manifest(root)
     direct, _ = _owned_paths(root, manifest)
     if str(direct) not in manifest.get("service_links", []) or not _validate_owned_link(direct, _unit_path(root)):
-        raise ServiceError(f"the Degoo user service has not been linked; run {_degoo_rc(root, 'service', 'enable')}")
+        raise ServiceError(
+            "the Degoo user service has not been linked; run "
+            f"{_degoo_rc(root, 'service', 'install')} to register it, or "
+            f"{_degoo_rc(root, 'service', 'enable')} to register and start it"
+        )
     _require_loaded_unit(root, manifest)
     result = _systemctl(root, "status", UNIT_NAME, capture=False)
     return result.returncode
@@ -290,13 +314,17 @@ def service_action(root: Path, action: str) -> int:
     manifest = _load_manifest(root)
     direct, _ = _owned_paths(root, manifest)
     if str(direct) not in manifest.get("service_links", []) or not _validate_owned_link(direct, _unit_path(root)):
-        raise ServiceError(f"the Degoo user service is not linked; run {_degoo_rc(root, 'service', 'enable')} first")
+        raise ServiceError(
+            "the Degoo user service is not linked; run "
+            f"{_degoo_rc(root, 'service', 'install')} to register it, or "
+            f"{_degoo_rc(root, 'service', 'enable')} to register and start it"
+        )
     _require_loaded_unit(root, manifest)
     result = _systemctl(root, action, UNIT_NAME)
     if result.returncode != 0:
         raise ServiceError(f"systemd could not {action} the Degoo user service")
     if action == "stop":
-        print("The Degoo user service stopped. It remains enabled for the next user-service start.")
+        print("The Degoo user service stopped. Its registration and enablement were left unchanged.")
     elif action == "start":
         print("The Degoo user service was asked to start.")
     else:
@@ -306,6 +334,8 @@ def service_action(root: Path, action: str) -> int:
 
 def run(root: Path, action: str) -> int:
     root = _root(str(root))
+    if action == "install":
+        return install(root)
     if action == "enable":
         return enable(root)
     if action == "disable":
@@ -320,7 +350,7 @@ def run(root: Path, action: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, help="contained install root")
-    parser.add_argument("action", choices=("enable", "disable", "start", "stop", "restart", "status"))
+    parser.add_argument("action", choices=("install", "enable", "disable", "start", "stop", "restart", "status"))
     return parser
 
 

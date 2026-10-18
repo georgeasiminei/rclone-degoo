@@ -99,6 +99,11 @@ instead of weakening password-only recovery.
 ### Linux mount
 
 - Linux is the primary platform for the initial implementation and acceptance.
+- When a systemd user manager is available, declining the install wizard's
+  enable/start prompt must still register the user unit without enabling or
+  starting it. This permits configuration edits before `degoo-rc service start`.
+  Registration during an upgrade preserves existing enablement. The generated
+  unit runs through the installing user's manager, without sudo.
 - Provide a normal, writable Degoo filesystem mount using FUSE or an
   equivalent Linux mechanism. The rclone-based approach is recommended below.
 - Mounted paths should behave like ordinary files for common operations:

@@ -8,6 +8,55 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## User-service registration and mount recovery — 2026-10-18
+
+After a fresh installation, declining the wizard's enable/start prompt left
+the generated service definition unregistered. The user copied that user unit
+into the system manager and enabled it. With no `User=` setting, it ran as
+root and failed the private-file ownership checks before mounting. The user
+then made the ordinary underlying mount directory writable and created a
+small local test file there. That file was not in the vault or upload queue.
+
+The correction adds `degoo-rc service install`, sharing enable's verified
+linking, ownership recording, daemon reload and fragment checks while issuing
+no enable/start/stop request. Declining startup invokes registration only;
+fresh installations stay stopped and without automatic startup. Existing
+enablement is preserved. Registration failures return a nonzero result and
+recovery instructions. The CLI help, completion, requirements and usage docs
+describe the new action and ordinary-user manager. The status helper also
+reports systemd's `linked` states as not enabled, instead of mistaking unit
+registration for automatic startup.
+
+Live repair stopped and disabled the mistaken system unit, confirmed its
+definition matched the generated user unit, removed that copy, and reloaded
+the system manager. The local test file was copied to a private recovery
+directory and verified before removal from the underlying mountpoint. That
+directory was made empty and protected with mode `0500`. The corrected helper
+registered the user unit; an ordinary-user start produced an active
+`fuse.rclone` mount. The unit is linked without a default-target enablement
+link. Local statistics work, with no pending or retrying uploads.
+
+The recovered test file was copied through the confirmed FUSE mount; fsync
+and local readback matched, and VFS subsequently reported `uploaded`. The
+private recovery copy remains. This does not independently establish cold
+remote recovery or general cloud integrity. An offline check found that the
+manual vault-password edit had invalidated saved account-credential
+decryption. The user completed login again; a repeat offline check confirmed
+the credentials decrypt under the current chosen password and salt. No
+credentials or plaintext file contents were printed. Forced password fallback
+after rejected renewal remains untested in this repair.
+
+Validation passed: all 465 Python helper tests, including 49 installer/service
+tests, 75 wizard tests and 26 information-helper tests; Python compilation;
+Markdown lint for seven documents; 77 documentation targets (including three
+archive-relative targets); and `git diff --check`. The generated regressions
+failed before the relevant fixes. There is no Go source change in this work.
+After validation, the four changed Python helpers were applied to the live
+installation while holding the updater lock and checking each original against
+the branch base. `degoo-rc status --json` then reported healthy, mounted,
+`disabled; active`, and zero pending uploads. `service help` exposes the new
+registration action. No mount restart was needed for these helper updates.
+
 ## Uninstall metadata lock mismatch — 2026-10-18
 
 An explicitly requested fresh uninstall, with all retention options declined
