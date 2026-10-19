@@ -243,6 +243,15 @@ Falling back to SHA1 if unsupported.`,
 				},
 			},
 		}, {
+			Name:     "rmdir_cleanup",
+			Advanced: true,
+			Default:  false,
+			Help: `Remove recognized orphan and temporary chunks when removing a logically empty directory.
+
+Enable this only when this chunker mount is the exclusive writer to the wrapped
+remote. A separate writer could be uploading a chunk that this option would
+remove.`,
+		}, {
 			Name:     "transactions",
 			Advanced: true,
 			Default:  "rename",
@@ -371,6 +380,7 @@ type Options struct {
 	MetaFormat   string        `config:"meta_format"`
 	HashType     string        `config:"hash_type"`
 	FailHard     bool          `config:"fail_hard"`
+	RmdirCleanup bool          `config:"rmdir_cleanup"`
 	Transactions string        `config:"transactions"`
 }
 
@@ -394,6 +404,9 @@ type Fs struct {
 	features     *fs.Features   // optional features
 	dirSort      bool           // reserved for future, ignored
 	useNoRename  bool           // can be set with the transactions option
+	cleanupMu    sync.Mutex
+	cleanupFiles map[string]int
+	cleanupDirs  map[string]struct{}
 }
 
 // configure sets up chunker for given name format, meta format and hash type.
@@ -1155,6 +1168,12 @@ func (f *Fs) put(
 	ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options []fs.OpenOption,
 	basePut putFn, action string, target fs.Object,
 ) (obj fs.Object, err error) {
+	releaseMutation, err := f.beginCleanupMutation(remote)
+	if err != nil {
+		return nil, fmt.Errorf("%s refused: %w", action, err)
+	}
+	defer releaseMutation()
+
 	// Perform consistency checks
 	if err := f.forbidChunk(src, remote); err != nil {
 		return nil, fmt.Errorf("%s refused: %w", action, err)
@@ -1574,6 +1593,11 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	if do == nil {
 		return nil, errors.New("can't PutUnchecked")
 	}
+	releaseMutation, err := f.beginCleanupMutation(src.Remote())
+	if err != nil {
+		return nil, fmt.Errorf("can't PutUnchecked: %w", err)
+	}
+	defer releaseMutation()
 	// TODO: handle range/limit options and really chunk stream here!
 	o, err := do(ctx, in, f.wrapInfo(src, "", -1))
 	if err != nil {
@@ -1596,10 +1620,108 @@ func (f *Fs) Hashes() hash.Set {
 	return hash.NewHashSet() // can't provide strong guarantees
 }
 
+func cleanupPathWithin(remote, dir string) bool {
+	if dir == "" {
+		return true
+	}
+	return remote == dir || strings.HasPrefix(remote, dir+"/")
+}
+
+func cleanupPathsOverlap(a, b string) bool {
+	return cleanupPathWithin(a, b) || cleanupPathWithin(b, a)
+}
+
+// beginCleanupMutation prevents mutations from racing with opt-in Rmdir cleanup.
+func (f *Fs) beginCleanupMutation(remotes ...string) (func(), error) {
+	if !f.opt.RmdirCleanup {
+		return func() {}, nil
+	}
+	paths := make(map[string]struct{}, len(remotes))
+	for _, remote := range remotes {
+		paths[remote] = struct{}{}
+	}
+
+	f.cleanupMu.Lock()
+	defer f.cleanupMu.Unlock()
+	for remote := range paths {
+		for dir := range f.cleanupDirs {
+			if cleanupPathsOverlap(remote, dir) {
+				return nil, fs.ErrorDirectoryNotEmpty
+			}
+		}
+	}
+	if f.cleanupFiles == nil {
+		f.cleanupFiles = make(map[string]int)
+	}
+	for remote := range paths {
+		f.cleanupFiles[remote]++
+	}
+	return func() {
+		f.cleanupMu.Lock()
+		defer f.cleanupMu.Unlock()
+		for remote := range paths {
+			f.cleanupFiles[remote]--
+			if f.cleanupFiles[remote] == 0 {
+				delete(f.cleanupFiles, remote)
+			}
+		}
+	}, nil
+}
+
+// beginCleanupTransfer reserves both paths for a copy or move, including cross-Fs operations.
+func (f *Fs) beginCleanupTransfer(src *Fs, srcRemote, dstRemote string) (func(), error) {
+	if src == f {
+		return f.beginCleanupMutation(srcRemote, dstRemote)
+	}
+	releaseDst, err := f.beginCleanupMutation(dstRemote)
+	if err != nil {
+		return nil, err
+	}
+	releaseSrc, err := src.beginCleanupMutation(srcRemote)
+	if err != nil {
+		releaseDst()
+		return nil, err
+	}
+	return func() {
+		releaseSrc()
+		releaseDst()
+	}, nil
+}
+
+// beginCleanupRmdir reserves a directory while hidden chunks are enumerated and removed.
+func (f *Fs) beginCleanupRmdir(dir string) (func(), error) {
+	f.cleanupMu.Lock()
+	defer f.cleanupMu.Unlock()
+	for remote := range f.cleanupFiles {
+		if cleanupPathsOverlap(remote, dir) {
+			return nil, fs.ErrorDirectoryNotEmpty
+		}
+	}
+	for removingDir := range f.cleanupDirs {
+		if cleanupPathsOverlap(removingDir, dir) {
+			return nil, fs.ErrorDirectoryNotEmpty
+		}
+	}
+	if f.cleanupDirs == nil {
+		f.cleanupDirs = make(map[string]struct{})
+	}
+	f.cleanupDirs[dir] = struct{}{}
+	return func() {
+		f.cleanupMu.Lock()
+		defer f.cleanupMu.Unlock()
+		delete(f.cleanupDirs, dir)
+	}, nil
+}
+
 // Mkdir makes the directory (container, bucket)
 //
 // Shouldn't return an error if it already exists
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	releaseMutation, err := f.beginCleanupMutation(dir)
+	if err != nil {
+		return fmt.Errorf("can't mkdir: %w", err)
+	}
+	defer releaseMutation()
 	if err := f.forbidChunk(dir, dir); err != nil {
 		return fmt.Errorf("can't mkdir: %w", err)
 	}
@@ -1608,6 +1730,11 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // MkdirMetadata makes the root directory of the Fs object
 func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata) (fs.Directory, error) {
+	releaseMutation, err := f.beginCleanupMutation(dir)
+	if err != nil {
+		return nil, fmt.Errorf("can't mkdir: %w", err)
+	}
+	defer releaseMutation()
 	if do := f.base.Features().MkdirMetadata; do != nil {
 		return do(ctx, dir, metadata)
 	}
@@ -1618,6 +1745,48 @@ func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata
 //
 // Return an error if it doesn't exist or isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if !f.opt.RmdirCleanup {
+		return f.base.Rmdir(ctx, dir)
+	}
+
+	releaseRmdir, err := f.beginCleanupRmdir(dir)
+	if err != nil {
+		return err
+	}
+	defer releaseRmdir()
+
+	entries, err := f.List(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return fs.ErrorDirectoryNotEmpty
+	}
+
+	entries, err = f.base.List(ctx, dir)
+	if err != nil {
+		return err
+	}
+	chunks := make([]fs.Object, 0, len(entries))
+	for _, entry := range entries {
+		if _, isDir := entry.(fs.Directory); isDir {
+			return fs.ErrorDirectoryNotEmpty
+		}
+		obj, ok := entry.(fs.Object)
+		if !ok {
+			return fs.ErrorDirectoryNotEmpty
+		}
+		mainRemote, _, _, _ := f.parseChunkName(obj.Remote())
+		if mainRemote == "" {
+			return fs.ErrorDirectoryNotEmpty
+		}
+		chunks = append(chunks, obj)
+	}
+	for _, chunk := range chunks {
+		if err := chunk.Remove(ctx); err != nil {
+			return err
+		}
+	}
 	return f.base.Rmdir(ctx, dir)
 }
 
@@ -1632,6 +1801,11 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 // As a result it removes not only composite chunker files with their
 // active chunks but also all hidden temporary chunks in the directory.
 func (f *Fs) Purge(ctx context.Context, dir string) error {
+	releaseMutation, err := f.beginCleanupMutation(dir)
+	if err != nil {
+		return fmt.Errorf("can't purge: %w", err)
+	}
+	defer releaseMutation()
 	do := f.base.Features().Purge
 	if do == nil {
 		return fs.ErrorCantPurge
@@ -1673,6 +1847,12 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // rclone version with unexpected results. This can be helped by
 // the `delete hidden` flag above or at least the user has been warned.
 func (o *Object) Remove(ctx context.Context) (err error) {
+	releaseMutation, err := o.f.beginCleanupMutation(o.Remote())
+	if err != nil {
+		return err
+	}
+	defer releaseMutation()
+
 	if err := o.f.forbidChunk(o, o.Remote()); err != nil {
 		// operations.Move can still call Remove if chunker's Move refuses
 		// to corrupt file in hard mode. Hence, refuse to Remove, too.
@@ -1703,6 +1883,12 @@ func (o *Object) Remove(ctx context.Context) (err error) {
 
 // copyOrMove implements copy or move
 func (f *Fs) copyOrMove(ctx context.Context, o *Object, remote string, do copyMoveFn, md5, sha1, opName string) (fs.Object, error) {
+	releaseTransfer, beginErr := f.beginCleanupTransfer(o.f, o.Remote(), remote)
+	if beginErr != nil {
+		return nil, fmt.Errorf("can't %s: %w", opName, beginErr)
+	}
+	defer releaseTransfer()
+
 	if err := f.forbidChunk(o, remote); err != nil {
 		return nil, fmt.Errorf("can't %s: %w", opName, err)
 	}
@@ -1930,11 +2116,21 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		fs.Debugf(srcFs, "Can't move directory - not same remote type")
 		return fs.ErrorCantDirMove
 	}
+	releaseTransfer, err := f.beginCleanupTransfer(srcFs, srcRemote, dstRemote)
+	if err != nil {
+		return fmt.Errorf("can't move directory: %w", err)
+	}
+	defer releaseTransfer()
 	return do(ctx, srcFs.base, srcRemote, dstRemote)
 }
 
 // DirSetModTime sets the directory modtime for dir
 func (f *Fs) DirSetModTime(ctx context.Context, dir string, modTime time.Time) error {
+	releaseMutation, err := f.beginCleanupMutation(dir)
+	if err != nil {
+		return err
+	}
+	defer releaseMutation()
 	if do := f.base.Features().DirSetModTime; do != nil {
 		return do(ctx, dir, modTime)
 	}
@@ -2158,6 +2354,11 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 
 // SetModTime sets the modification time of the file
 func (o *Object) SetModTime(ctx context.Context, mtime time.Time) error {
+	releaseMutation, err := o.f.beginCleanupMutation(o.Remote())
+	if err != nil {
+		return err
+	}
+	defer releaseMutation()
 	if err := o.readMetadata(ctx); err != nil {
 		return err // refuse to act on unsupported format
 	}

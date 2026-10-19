@@ -390,6 +390,35 @@ client's upload or immediate replacement of an application's open buffers.
 See rclone's [directory cache documentation](https://rclone.org/commands/rclone_mount/#vfs-directory-cache)
 for the underlying expiry behavior.
 
+## Deleting files and directories
+
+Use ordinary Linux deletion commands through the mounted folder:
+
+```sh
+rm -- /mnt/degoo/generated-file
+rm -r -- /mnt/degoo/generated-directory
+rmdir -- /mnt/degoo/generated-empty-directory
+```
+
+Deleting a closed dirty file cancels its queued upload and removes its local
+pending state. An upload already in progress may have sent encrypted bytes;
+cancellation cannot undo those transfers. Recursive directory removal applies
+the same behavior to its files. `rmdir` still rejects directories containing
+visible files, whether their data is clean or dirty.
+
+The contained mount also cleans recognized orphan chunks and unpublished
+staged uploads when deleting a directory whose logical view is empty. This
+handles remnants left by interrupted uploads. It checks the entries before
+deleting them, preserves unrecognized contents, and reports provider or cleanup
+failures. A failed listing is never treated as an empty directory. Removed
+remote objects go to Degoo's recycle bin.
+
+This cleanup assumes the contained mount is the vault's exclusive writer.
+The `rmdir_cleanup` options on standalone chunker and Degoo remotes default to
+false; the contained mount enables them. Separate mounts or clients must not
+write to the same vault concurrently. Use the mounted paths for deletion;
+removing backing cache files directly does not perform filesystem deletion.
+
 ## Persistence and recovery
 
 `fsync` syncs the local VFS cache. Close queues an asynchronous upload. Neither

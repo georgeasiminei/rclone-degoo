@@ -99,6 +99,11 @@ func init() {
 			Help:     "Skip the full download and hash readback before publishing an upload. Registered metadata and the canonical published listing are still checked, but Degoo may store bytes that differ from the upload.",
 			Default:  false,
 			Advanced: true,
+		}, {
+			Name:     "rmdir_cleanup",
+			Help:     "Remove abandoned staged uploads when deleting an otherwise empty directory. Enable only when this filesystem is the vault's sole writer.",
+			Default:  false,
+			Advanced: true,
 		}},
 	})
 }
@@ -114,6 +119,7 @@ type Options struct {
 	APIURL                 string `config:"api_url"`                  // APIURL is the GraphQL endpoint.
 	RESTURL                string `config:"rest_url"`                 // RESTURL is the authentication endpoint base URL.
 	SkipUploadVerification bool   `config:"skip_upload_verification"` // SkipUploadVerification disables full payload readback after upload.
+	RmdirCleanup           bool   `config:"rmdir_cleanup"`            // RmdirCleanup permits removing abandoned uploads under a single writer.
 }
 
 // Fs represents a Degoo vault root.
@@ -345,13 +351,17 @@ func (f *Fs) RequestStats() api.RequestStats { return f.api.RequestStats() }
 func (f *Fs) TransferStats() api.TransferStats { return f.api.TransferStats() }
 
 func (f *Fs) acquirePathLocks(ctx context.Context, remotes ...string) (func(), error) {
+	return f.pathLockManager().acquireMany(ctx, remotes...)
+}
+
+func (f *Fs) pathLockManager() *pathLockManager {
 	f.pathLocksMu.Lock()
 	if f.pathLocks == nil {
 		f.pathLocks = newPathLockManager()
 	}
 	locks := f.pathLocks
 	f.pathLocksMu.Unlock()
-	return locks.acquireMany(ctx, remotes...)
+	return locks
 }
 
 func (f *Fs) uploadBatchCoordinator() *uploadBatchCoordinator {
@@ -1303,11 +1313,16 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	if err := validateRemote(dir); err != nil {
 		return err
 	}
+	releasePath, err := f.acquirePathLocks(ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer releasePath()
 	if dir == "" {
 		_, err := f.findDir(ctx, "", true)
 		return err
 	}
-	_, err := f.findDir(ctx, dir, true)
+	_, err = f.findDir(ctx, dir, true)
 	return err
 }
 
@@ -1319,6 +1334,11 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if dir == "" {
 		return errors.New("degoo: refusing to remove the configured vault root")
 	}
+	releaseDirectory, err := f.pathLockManager().beginDirectoryRemoval(dir)
+	if err != nil {
+		return err
+	}
+	defer releaseDirectory()
 	parentPath, leaf := dircache.SplitPath(dir)
 	parentID, err := f.findDir(ctx, parentPath, false)
 	if err != nil {
@@ -1345,30 +1365,35 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	for _, placeholder := range retired {
 		ids = append(ids, placeholder.ID)
 	}
-	markerNames := make(map[string]struct{}, len(ids))
+	var internalObjects []api.Item
 	for _, id := range ids {
-		markerNames[directoryMarkerName(id)] = struct{}{}
-	}
-	var markers []api.Item
-	for _, id := range ids {
-		children, err := f.listDir(ctx, id)
+		children, err := f.listDirFresh(ctx, id)
 		if err != nil && !isNotFoundError(err) {
 			return err
 		}
 		for _, child := range children {
-			if _, isMarker := markerNames[child.Name]; !isMarker {
+			if !removableDirectoryMarker(child, id) && !(f.opt.RmdirCleanup && removableStagedUpload(child, id)) {
 				return fs.ErrorDirectoryNotEmpty
 			}
-			markers = append(markers, child)
+			if child.Size == 0 {
+				contents, err := f.listDirFresh(ctx, child.ID)
+				if err != nil && !isNotFoundError(err) {
+					return err
+				}
+				if len(contents) != 0 {
+					return fs.ErrorDirectoryNotEmpty
+				}
+			}
+			internalObjects = append(internalObjects, child)
 		}
 	}
-	for _, marker := range markers {
-		if err := f.api.Delete(ctx, marker.ID, false); err != nil {
-			return fmt.Errorf("degoo: remove directory marker: %w", err)
+	for _, item := range internalObjects {
+		if err := f.api.Delete(ctx, item.ID, false); err != nil {
+			return fmt.Errorf("degoo: remove abandoned directory object: %w", err)
 		}
 	}
-	if err := f.waitForIDsGoneInDirs(ctx, ids, itemIDs(markers), 20*time.Second); err != nil {
-		return fmt.Errorf("degoo: wait for directory markers to be removed: %w", err)
+	if err := f.waitForIDsGoneInDirs(ctx, ids, itemIDs(internalObjects), 20*time.Second); err != nil {
+		return fmt.Errorf("degoo: wait for abandoned directory objects to be removed: %w", err)
 	}
 	for _, id := range ids {
 		if err := f.api.Delete(ctx, id, false); err != nil && !isNotFoundError(err) {
@@ -1377,6 +1402,25 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 	f.dirCache.FlushDir(dir)
 	return nil
+}
+
+func removableDirectoryMarker(item api.Item, parentID string) bool {
+	if item.ParentID != parentID || item.Size != 0 || (item.Category != 0 && item.Category != 6) || !strings.HasPrefix(item.Name, directoryMarkerPrefix) {
+		return false
+	}
+	return internalHexSuffix(strings.TrimPrefix(item.Name, directoryMarkerPrefix))
+}
+
+func removableStagedUpload(item api.Item, parentID string) bool {
+	if item.ParentID != parentID || item.Size < 0 || (item.Category != 0 && item.Category != 6) || !strings.HasPrefix(item.Name, temporaryPrefix) || !strings.HasSuffix(item.Name, ".bin") {
+		return false
+	}
+	return internalHexSuffix(strings.TrimSuffix(strings.TrimPrefix(item.Name, temporaryPrefix), ".bin"))
+}
+
+func internalHexSuffix(suffix string) bool {
+	decoded, err := hex.DecodeString(suffix)
+	return err == nil && len(decoded) == 16
 }
 
 func (f *Fs) findRetiredPlaceholders(ctx context.Context, parentID string, directory api.Item) ([]api.Item, error) {
