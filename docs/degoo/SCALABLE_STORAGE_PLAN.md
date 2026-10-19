@@ -879,3 +879,21 @@ shipping local-only authority would violate the explicit recovery requirement.
   All 477 Python helper tests, compilation, Markdown/link and diff checks
   passed. Evidence and validation limits are recorded in
   [VALIDATION.md](VALIDATION.md).
+
+### 2026-10-19 — setup without a saved vault configuration
+
+- The wizard accepts a chosen encryption password when no `vault.json` is
+  supplied and establishes that private key before account login. Folder
+  selection supports creating a vault and reopening a compatible encrypted
+  folder. Imported and installed encryption settings remain preserved.
+- Password-based existing-folder selection requires a bounded read-only
+  encrypted-content check before binding or writable startup. Failure or an
+  inconclusive result blocks setup. Apparently empty folders need explicit
+  initialization confirmation because their password cannot be authenticated.
+- This feature operates on the active legacy crypt/chunker stack. It does not
+  activate the storage redesign or close password-only bootstrap, authoritative
+  latest-version recovery, full-integrity or mounted/live acceptance gates.
+  No live runtime or provider data was changed. All 496 Python tests, the full
+  195-package offline Go suite, scoped race/vet/lint and documentation checks
+  pass. Evidence and the staged-install resume correction are recorded in
+  [VALIDATION.md](VALIDATION.md).

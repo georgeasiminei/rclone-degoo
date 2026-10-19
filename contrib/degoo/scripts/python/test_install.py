@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -60,6 +61,13 @@ class InstallTest(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = install.main(["--binary", str(self.binary), "--mountpoint", "mount", *args])
         return code, stdout.getvalue(), stderr.getvalue()
+
+    def internal_install_args(self, password: object, *args: str) -> argparse.Namespace:
+        parsed = install.build_parser().parse_args(
+            ["--binary", str(self.binary), "--mountpoint", "mount", *args]
+        )
+        parsed.vault_password = password
+        return parsed
 
     def test_new_install_defaults_to_external_mountpoint(self) -> None:
         stdout = io.StringIO()
@@ -642,6 +650,187 @@ class InstallTest(unittest.TestCase):
         self.assertFalse((self.root / "config/rclone.conf").exists())
         self.assertTrue((self.root / "scripts/login.sh").exists())
         self.assertTrue((self.root / "scripts/setup.sh").exists())
+
+    def test_internal_chosen_password_creates_private_unbound_vault_config(self) -> None:
+        password = "  exact chosen password  "
+        args = self.internal_install_args(password)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = install.install(args)
+
+        self.assertEqual(result, 0, stderr.getvalue())
+        vault_path = self.root / "config/vault.json"
+        self.assertTrue(vault_path.is_file())
+        self.assertEqual(stat.S_IMODE(vault_path.stat().st_mode), 0o600)
+        vault = json.loads(vault_path.read_bytes())
+        self.assertEqual(vault["password"], password)
+        self.assertNotIn("password_salt", vault)
+        self.assertEqual(vault["remote"], install.REMOTE_NAME + ":")
+        self.assertEqual(vault["cache_dir"], str(self.root / "cache"))
+        self.assertFalse((self.root / "config/rclone.conf").exists())
+        manifest = json.loads((self.root / "install.json").read_bytes())
+        self.assertEqual(manifest["root_folder_id"], "")
+        self.assertIn("no vault folder is configured yet", stdout.getvalue())
+        self.assertNotIn(password, stdout.getvalue())
+        self.assertNotIn(password, stderr.getvalue())
+
+    def test_internal_custom_password_salt_is_preserved_exactly(self) -> None:
+        password = " chosen password "
+        password_salt = "  exact salt  "
+        args = self.internal_install_args(password)
+        args.vault_password_salt = password_salt
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = install.install(args)
+
+        self.assertEqual(result, 0, stderr.getvalue())
+        vault = json.loads((self.root / "config/vault.json").read_bytes())
+        self.assertEqual(vault["password"], password)
+        self.assertEqual(vault["password_salt"], password_salt)
+        self.assertNotIn(password, stdout.getvalue())
+        self.assertNotIn(password_salt, stdout.getvalue())
+
+    def test_internal_chosen_password_cannot_replace_an_existing_vault_on_upgrade(self) -> None:
+        initial = self.internal_install_args("original exact password")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(install.install(initial), 0)
+        vault_path = self.root / "config/vault.json"
+        original = vault_path.read_bytes()
+
+        replacement = install.build_parser().parse_args(
+            ["--binary", str(self.binary), "--mountpoint", "mount", "--upgrade"]
+        )
+        replacement.vault_password = "replacement password"
+        with self.assertRaisesRegex(install.InstallError, "cannot replace an existing vault configuration"):
+            install.install(replacement)
+
+        self.assertEqual(vault_path.read_bytes(), original)
+
+    def test_internal_password_resumes_manifested_unbound_staged_install(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            staged_code = install.main(
+                ["--binary", str(self.binary), "--mountpoint", "mount", "--no-wizard"]
+            )
+        self.assertEqual(staged_code, 0, stderr.getvalue())
+        manifest_path = self.root / "install.json"
+        manifest_before = json.loads(manifest_path.read_bytes())
+        self.assertEqual(manifest_before["root_folder_id"], "")
+        self.assertFalse((self.root / "config/vault.json").exists())
+        self.assertFalse((self.root / "config/rclone.conf").exists())
+
+        password = "  resumed exact password  "
+        password_salt = "resumed legacy salt"
+        args = self.internal_install_args(password, "--upgrade")
+        args.vault_password_salt = password_salt
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = install.install(args)
+
+        self.assertEqual(result, 0, stderr.getvalue())
+        vault_path = self.root / "config/vault.json"
+        self.assertTrue(vault_path.is_file())
+        self.assertEqual(stat.S_IMODE(vault_path.stat().st_mode), 0o600)
+        vault = json.loads(vault_path.read_bytes())
+        self.assertEqual(vault["password"], password)
+        self.assertEqual(vault["password_salt"], password_salt)
+        self.assertFalse((self.root / "config/rclone.conf").exists())
+        manifest_after = json.loads(manifest_path.read_bytes())
+        self.assertEqual(manifest_after["root_folder_id"], "")
+        self.assertNotIn(password, stdout.getvalue())
+        self.assertNotIn(password, stderr.getvalue())
+        self.assertNotIn(password_salt, stdout.getvalue())
+        self.assertNotIn(password_salt, stderr.getvalue())
+
+    def test_internal_password_refuses_bound_install_with_missing_vault(self) -> None:
+        code, _, stderr = self.invoke("--folder-id", "dedicated-folder-123")
+        self.assertEqual(code, 0, stderr)
+        vault_path = self.root / "config/vault.json"
+        vault_path.unlink()
+        manifest_path = self.root / "install.json"
+        rclone_path = self.root / "config/rclone.conf"
+        manifest_before = manifest_path.read_bytes()
+        rclone_before = rclone_path.read_bytes()
+        binary_before = (self.root / "bin/rclone").read_bytes()
+
+        attempts = (
+            self.internal_install_args("cannot restore bound key", "--upgrade"),
+            install.build_parser().parse_args(
+                ["--binary", str(self.binary), "--mountpoint", "mount", "--upgrade"]
+            ),
+        )
+        for args in attempts:
+            with self.assertRaisesRegex(install.InstallError, "bound vault configuration is missing"):
+                install.install(args)
+
+        self.assertFalse(vault_path.exists())
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(rclone_path.read_bytes(), rclone_before)
+        self.assertEqual((self.root / "bin/rclone").read_bytes(), binary_before)
+
+    def test_internal_password_refuses_unbound_stage_with_existing_rclone_config(self) -> None:
+        code, _, stderr = self.invoke()
+        self.assertEqual(code, 0, stderr)
+        manifest_path = self.root / "install.json"
+        manifest_before = manifest_path.read_bytes()
+        rclone_path = self.root / "config/rclone.conf"
+        rclone_before = b"[degoo-live-test]\ntype = degoo\n"
+        install.write_private_file(rclone_path, rclone_before)
+
+        args = self.internal_install_args("cannot replace a prior binding", "--upgrade")
+        with self.assertRaisesRegex(install.InstallError, "only before the staged install has been bound"):
+            install.install(args)
+
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(rclone_path.read_bytes(), rclone_before)
+        self.assertFalse((self.root / "config/vault.json").exists())
+
+    def test_internal_chosen_password_cannot_be_combined_with_imported_vault(self) -> None:
+        backup = self.home / "vault backup.json"
+        backup.write_text(
+            json.dumps({
+                "version": 1,
+                "remote": "old-machine:",
+                "password": "imported password",
+                "cache_dir": "/old/machine/cache",
+                "chunk_size": "512Mi",
+                "max_object_size": "18Gi",
+            }),
+            encoding="utf-8",
+        )
+        backup.chmod(0o600)
+        args = self.internal_install_args("chosen password", "--vault-config", str(backup))
+
+        with self.assertRaisesRegex(install.InstallError, "cannot be combined with an imported vault"):
+            install.install(args)
+
+        self.assertFalse(self.root.exists())
+        self.assertEqual(json.loads(backup.read_text(encoding="utf-8"))["password"], "imported password")
+
+    def test_empty_or_non_string_internal_password_is_rejected_before_install(self) -> None:
+        cases = (
+            ("", None, "password must be a nonempty string"),
+            (17, None, "password must be a nonempty string"),
+            (None, "salt only", "requires a chosen vault password"),
+            ("valid", 17, "salt must be a string"),
+        )
+        for password, password_salt, expected_error in cases:
+            with self.subTest(password_type=type(password).__name__, salt_type=type(password_salt).__name__):
+                args = self.internal_install_args(password)
+                if password_salt is not None:
+                    args.vault_password_salt = password_salt
+                with self.assertRaisesRegex(install.InstallError, expected_error):
+                    install.install(args)
+                self.assertFalse(self.root.exists())
+
+    def test_password_has_no_public_install_cli_flag(self) -> None:
+        help_text = install.build_parser().format_help()
+        self.assertNotIn("--vault-password", help_text)
+        self.assertNotIn("--vault-password-salt", help_text)
 
     def test_setup_creates_remote_identity_and_finishes_staged_install(self) -> None:
         code, _, stderr = self.invoke()

@@ -196,7 +196,7 @@ func addSetupCommands(root *cobra.Command) {
 		return json.NewEncoder(c.OutOrStdout()).Encode(entries)
 	}}
 	location.Flags().BoolVar(&rootOnly, "root-only", false, "Inspect only the configured vault folder; do not request its ancestors")
-	root.AddCommand(folders, create, location)
+	root.AddCommand(folders, create, location, newCheckVaultCommand(setupAPI))
 }
 
 func validSetupName(name string) bool {

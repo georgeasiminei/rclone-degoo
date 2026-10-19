@@ -860,17 +860,69 @@ def import_vault_config(path_arg: str, root: Path) -> bytes:
     return rewritten
 
 
-def create_vault_config(root: Path, imported: bytes | None) -> bytes:
+def _validate_vault_password_inputs(password: Any, password_salt: Any) -> tuple[str | None, str | None]:
+    """Validate an internally supplied vault password and optional exact salt."""
+    if password is not None and (not isinstance(password, str) or password == ""):
+        raise InstallError("the chosen vault password must be a nonempty string")
+    if password_salt is not None and not isinstance(password_salt, str):
+        raise InstallError("the chosen vault password salt must be a string")
+    if password is None and password_salt not in (None, ""):
+        raise InstallError("a vault password salt requires a chosen vault password")
+    return password, password_salt or None
+
+
+def _install_vault_password_inputs(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Validate the wizard-only vault secret handoff without exposing it in CLI options."""
+    password, password_salt = _validate_vault_password_inputs(
+        getattr(args, "vault_password", None),
+        getattr(args, "vault_password_salt", None),
+    )
+    if password is not None and getattr(args, "vault_config", None):
+        raise InstallError("a chosen vault password cannot be combined with an imported vault configuration")
+    return password, password_salt
+
+
+def _validate_upgrade_vault_state(
+    root: Path,
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+    password: str | None,
+) -> None:
+    """Allow a first key only on an unbound staged install with no prior vault files."""
+    existing_vault = read_private_file(root / "config/vault.json", missing_ok=True)
+    if password is not None and existing_vault is not None:
+        raise InstallError("a chosen vault password cannot replace an existing vault configuration")
+
+    folder_id = manifest.get("root_folder_id", "")
+    existing_rclone_config = read_private_file(root / "config/rclone.conf", missing_ok=True)
+    if folder_id and existing_vault is None and not getattr(args, "vault_config", None):
+        raise InstallError("the bound vault configuration is missing; import the matching private vault configuration")
+    if password is not None and (folder_id or existing_rclone_config is not None):
+        raise InstallError("a chosen vault password is allowed only before the staged install has been bound")
+
+
+def create_vault_config(
+    root: Path,
+    imported: bytes | None,
+    *,
+    password: str | None = None,
+    password_salt: str | None = None,
+) -> bytes:
+    password, password_salt = _validate_vault_password_inputs(password, password_salt)
     if imported is not None:
+        if password is not None or password_salt is not None:
+            raise InstallError("a chosen vault password cannot replace an imported vault configuration")
         return imported
     config = {
         "version": 1,
         "remote": f"{REMOTE_NAME}:",
-        "password": secrets.token_urlsafe(32),
+        "password": password if password is not None else secrets.token_urlsafe(32),
         "cache_dir": str(root / "cache"),
         "chunk_size": "128Mi",
         "max_object_size": "19Gi",
     }
+    if password_salt is not None:
+        config["password_salt"] = password_salt
     return (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -1290,6 +1342,7 @@ def package_identity(binary: Path, source_root: Path) -> dict[str, str]:
 
 
 def _install(args: argparse.Namespace) -> int:
+    vault_password, vault_password_salt = _install_vault_password_inputs(args)
     root = expected_root()
     ensure_parent_directories(root)
     _preflight_path_link(root)
@@ -1299,6 +1352,7 @@ def _install(args: argparse.Namespace) -> int:
             raise InstallError("--upgrade requires an existing contained install")
         check_directory(root, private=True)
         manifest = load_manifest(root)
+        _validate_upgrade_vault_state(root, manifest, args, vault_password)
         legacy_wrappers = tuple(
             name
             for name in LEGACY_GENERATED_SHELL_FILES
@@ -1387,8 +1441,13 @@ def _install(args: argparse.Namespace) -> int:
             mountpoint=configured_mountpoint(root, manifest),
         )
         vault_bytes = existing_vault
-    elif folder_id or imported_vault is not None:
-        vault_bytes = create_vault_config(root, imported_vault)
+    elif folder_id or imported_vault is not None or vault_password is not None:
+        vault_bytes = create_vault_config(
+            root,
+            imported_vault,
+            password=vault_password,
+            password_salt=vault_password_salt,
+        )
         vault, _ = read_vault(
             vault_bytes,
             root,
@@ -1641,6 +1700,7 @@ def _validate_upgrade_lock_fd(root: Path, lock_fd: int, *, mountpoint: Path | No
 
 
 def install(args: argparse.Namespace) -> int:
+    _install_vault_password_inputs(args)
     upgrade_lock_fd = getattr(args, "upgrade_lock_fd", None)
     if upgrade_lock_fd is not None and not args.upgrade:
         raise InstallError("--upgrade-lock-fd can only be used with --upgrade")
@@ -1683,7 +1743,9 @@ def install(args: argparse.Namespace) -> int:
     if not os.path.lexists(root):
         raise InstallError("--upgrade requires an existing contained install")
     check_directory(root, private=True)
-    load_manifest(root)
+    existing_manifest = load_manifest(root)
+    vault_password, _ = _install_vault_password_inputs(args)
+    _validate_upgrade_vault_state(root, existing_manifest, args, vault_password)
     if upgrade_lock_fd is None:
         lock = _acquire_upgrade_lock(root, mountpoint=selected_path)
     else:

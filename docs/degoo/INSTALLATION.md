@@ -238,33 +238,39 @@ or as the create parent.
 You may select an existing dedicated folder instead of creating a new one.
 At the folder-name step, the wizard lists folders under the selected parent and
 reports whether the suggested name already exists. Existing native Degoo files
-are not encrypted-vault files and cannot be read as such. If a folder with the
-chosen name already exists, use its matching private `vault.json` to open an
-encrypted vault or choose another name for a new vault. The wizard will not
-overwrite an existing encrypted folder with a newly generated key.
+are not encrypted-vault files and cannot be read as such.
 
-The wizard generates a cryptographically random vault encryption password for
-a new vault. Use `degoo-rc backup-config` to keep a private configuration backup
-outside the install before saving important data. This removes account
-credentials while retaining the vault key. Degoo account credentials and the
-vault password serve separate purposes. Once the vault configuration exists,
-`degoo-rc login`
-saves the account credentials encrypted with the vault data key, enabling
-automatic password login after rejected token renewal. Existing installations
-need one successful login after upgrading to populate this encrypted field.
-The wizard installs a supplied vault configuration before account login when
-it is already known. If a new vault is created or an existing vault file is
-selected after the first login, the wizard asks you to sign in again after
-setup to save the password encrypted with that vault's key. It verifies that
-the encrypted credential is saved before offering mount startup. A failed
-login preserves the vault and cache and leaves startup for a later retry.
+Importing `vault.json` is optional. Without a saved configuration, the wizard
+asks privately for the encryption password and confirmation before account
+login. The same flow supports creating a new vault and opening an existing
+compatible encrypted folder. Preserve any custom encryption salt and use the
+original format settings for an existing vault. Passwords are stored in the
+owner-private local vault configuration, not passed as command arguments.
+Imported configurations and ordinary upgrades preserve their existing keys.
 
-To use an existing compatible encrypted vault on another machine, import its
-private vault configuration and select the same dedicated folder. The password,
-optional salt, chunk size, and object cap are preserved; local remote and cache
-paths are adapted. The password alone is not enough to locate or decrypt a
-vault: keep its folder ID and format settings together. Only one machine should
-write to a vault at a time.
+Before binding an existing folder without an imported configuration, the wizard
+runs a read-only check of encrypted remote names and authenticated content.
+Wrong keys, observed native plaintext names, network errors and inconclusive
+checks block setup and writable startup. An apparently empty folder can
+initialize a vault after confirmation. An existing folder with no
+authenticatable content needs its original private
+configuration. This bounded check verifies a sample, not every file or the
+freshness/completeness of provider listings. Only one machine should write to
+a vault at a time. Direct `degoo-rc setup` remains the manual binding command;
+use the wizard for this checked password-based flow.
+
+Use `degoo-rc backup-config` to keep a private configuration backup outside the
+install before saving important data. This excludes account credentials while
+retaining the vault key. Degoo account credentials and vault encryption serve
+separate purposes. The wizard installs the chosen or imported key before login
+so saved account credentials are encrypted with that key. Startup is offered
+only after the encrypted credential is saved; login failure preserves
+configuration and cache.
+
+This legacy crypt/chunker setup does not complete the scalable storage plan's
+password-only remote bootstrap or verified latest-version recovery gates.
+Keep the dedicated folder identity, custom salt and format settings with your
+configuration backup until those gates are implemented and validated.
 
 Provide the existing folder and configuration when starting the wizard:
 
@@ -320,9 +326,9 @@ the password prompt after a successful listing. If Degoo rejects the saved
 login, the wizard asks you to log in and tests the connection again.
 Provider or network errors stop setup with their connection
 failure; they are not reported as a wrong password. This check verifies Degoo
-account authentication, not the vault password or the ability to decrypt
-remote files. Restoring an existing encrypted folder requires its original
-`vault.json`; the wizard cannot replace its encryption settings with a new key.
+account authentication. Opening an existing folder without a configuration
+uses the separate bounded encryption check described above. Restoration from
+a configuration backup preserves the original encryption settings.
 
 ## Defaults
 

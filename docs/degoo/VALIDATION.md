@@ -8,6 +8,69 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Optional vault import and chosen encryption password — 2026-10-19
+
+A fresh wizard installation accepts a chosen encryption password without a
+saved `vault.json`. Hidden entry and confirmation happen before account login;
+the private unbound configuration is created first so automatic-login
+credentials use the chosen data key. Imports and ordinary upgrades preserve
+existing encryption settings. Remote folder selection supports both a new
+child folder and an existing dedicated folder.
+
+Existing folders selected without an imported configuration require a separate
+read-only encrypted-content check before local binding or writable startup.
+The check uses direct metadata and range-download APIs, without constructing
+the mutating filesystem backend. It authenticates a bounded encrypted sample.
+Provider failures, wrong encryption parameters and inconclusive results stop
+setup. An apparently empty listing cannot verify the password and requires
+explicit initialization confirmation.
+
+This is a legacy crypt/chunker setup feature. It is not an integrity audit of
+the entire vault, proof of fresh provider listings, or completion of the
+scalable plan's remote bootstrap/latest-version recovery gates. Custom salts
+and format settings still need to be retained. No live credentials, service,
+cache, mount or provider data was changed during implementation.
+
+Python validation passed: all 496 helper tests, including 63 installer tests
+and 89 wizard tests, plus compilation of the changed helpers. Generated
+fixtures verify exact secret storage, preservation of imported settings,
+create/check/bind ordering, explicit empty-folder confirmation, and failed
+checks blocking binding and service startup. A real staged-install regression
+failed before the resume fix and now confirms that an unbound install can save
+its first chosen key before login. Bound installs with a missing key and any
+attempt to replace an existing key remain refused.
+
+The verifier bounds work to 45 seconds, 32 pages of at most 128 items, 1,024
+listed records, 32 directories and depth eight below the vault root. It
+downloads at most the crypt header and first authenticated block (65,584 bytes)
+of one candidate object. Placeholder probes share the listing budget and
+require the exact SHA-256-derived self-marker before treating a zero-byte
+provider item as a directory. The first candidate authentication failure stops
+the check; a later healthy sibling cannot hide an observed corrupt block. Empty
+encrypted files alone cannot authenticate a password.
+
+Generated Go fixtures cover custom salts, changed names/metadata, malformed
+responses, mixed plaintext/encrypted entries, damaged and truncated content,
+ignored ranges, cancellation, pagination/traversal limits and both promoted
+and self-marked directory representations. No test contacts Degoo.
+An existing populated-cache capacity test initially failed under race-detector
+load because its five-second snapshots expired during measurement. The fixture
+now extends snapshot expiry while measuring capacity and eviction; production
+expiry and separate expiry tests are unchanged.
+
+Final validation passed:
+
+- A fresh Go build and the full credential-free Go suite: 195 test packages.
+- Race tests and `go vet` for `./cmd/degoo` and `./backend/degoo/api`.
+- Scoped `golangci-lint`: zero issues.
+- All 496 Python helper tests and Python compilation.
+- Markdown lint on seven changed documents, 97 relative documentation targets,
+  and staged diff checks.
+
+Go checks use `CI=true`, `RCLONE_CONFIG=/notfound`, short private temporary and
+cache paths, and the fresh binary on `PATH`. These offline results do not add
+a live FUSE/provider acceptance claim.
+
 ## Wizard mount-directory selection — 2026-10-18
 
 The wizard offers the mount directory during local settings, defaulting to

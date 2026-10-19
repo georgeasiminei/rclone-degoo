@@ -1425,6 +1425,57 @@ func (c *Client) ListDir(ctx context.Context, parentID string) ([]Item, error) {
 	return c.listDir(ctx, parentID, false)
 }
 
+// ListDirPage loads one bounded page of a directory without caching or following
+// its continuation cursor.
+func (c *Client) ListDirPage(ctx context.Context, parentID string, limit int, pageToken string) ([]Item, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if limit < 1 || limit > maxLimit {
+		return nil, "", &Error{operation: "GetFileChildren5", message: fmt.Sprintf("page limit must be between 1 and %d", maxLimit)}
+	}
+	if len(pageToken) > 4096 {
+		return nil, "", &Error{operation: "GetFileChildren5", message: "pagination cursor exceeds 4 KiB"}
+	}
+	if err := c.checkRateLimit(ctx, "GetFileChildren5"); err != nil {
+		return nil, "", err
+	}
+	var response struct {
+		GetFileChildren5 *struct {
+			Items     []Item `json:"Items"`
+			NextToken string `json:"NextToken"`
+		} `json:"getFileChildren5"`
+	}
+	variables := map[string]any{"ParentID": parentID, "Limit": limit, "Order": 3}
+	if pageToken != "" {
+		variables["NextToken"] = pageToken
+	}
+	if err := c.graphql(ctx, "GetFileChildren5", getFileChildrenQuery, variables, &response, false); err != nil {
+		return nil, "", err
+	}
+	if response.GetFileChildren5 == nil || response.GetFileChildren5.Items == nil {
+		return nil, "", &Error{operation: "GetFileChildren5", message: "response did not contain a complete item page"}
+	}
+	items := response.GetFileChildren5.Items
+	if len(items) > limit {
+		return nil, "", &Error{operation: "GetFileChildren5", message: "response exceeded the requested page limit"}
+	}
+	if len(response.GetFileChildren5.NextToken) > 4096 {
+		return nil, "", &Error{operation: "GetFileChildren5", message: "response contained an oversized pagination cursor"}
+	}
+	seenIDs := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item.ID == "" {
+			return nil, "", &Error{operation: "GetFileChildren5", message: "response contained an item with an empty ID"}
+		}
+		if _, exists := seenIDs[item.ID]; exists {
+			return nil, "", &Error{operation: "GetFileChildren5", message: fmt.Sprintf("response contained duplicate item ID %q", item.ID)}
+		}
+		seenIDs[item.ID] = struct{}{}
+	}
+	return cloneItems(items), response.GetFileChildren5.NextToken, nil
+}
+
 // ListDirFresh loads every item under parentID without reading or storing a
 // cached snapshot. It invalidates only that directory before and after loading.
 func (c *Client) ListDirFresh(ctx context.Context, parentID string) ([]Item, error) {

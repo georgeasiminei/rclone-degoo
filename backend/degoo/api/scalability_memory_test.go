@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -251,6 +252,14 @@ func checkScalabilitySnapshot(t *testing.T, client *Client, parent string, entri
 	if entries > 0 && (items[0].ID != scalabilityOccupancyID(parent, 0) || items[0].Name != scalabilityOccupancyName(parent, 0) || items[0].ParentID != parent || items[entries-1].ID != scalabilityOccupancyID(parent, entries-1) || items[entries-1].ParentID != parent) {
 		t.Fatalf("ListDir(%q) returned unexpected boundary metadata", parent)
 	}
+	// This measurement checks capacity eviction, not whether a large fixture can
+	// be populated before the production five-second expiry under scheduler load.
+	client.metadataMu.Lock()
+	if entry, ok := client.metadataCache[parent]; ok {
+		entry.expires = time.Now().Add(time.Hour)
+		client.metadataCache[parent] = entry
+	}
+	client.metadataMu.Unlock()
 }
 
 func TestScalabilityPopulatedMetadataSnapshots(t *testing.T) {

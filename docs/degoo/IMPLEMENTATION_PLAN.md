@@ -625,9 +625,12 @@ build if it finds no binary.
 
 The wizard first offers a retained backup directory for fresh installation.
 An early vault import is installed before account login so the fresh account
-password is encrypted with the imported data key. New vaults and imports
-selected later require a final login after setup when the encrypted account
-credential is missing. Startup is offered only after that credential is saved;
+password is encrypted with the imported data key. With no import, hidden
+password entry and confirmation create the private unbound vault configuration
+before login. Existing remote folders selected with these recovered encryption
+settings must pass a bounded read-only authenticated-content check before
+binding or writable startup. Startup is offered only after the encrypted
+account credential is saved;
 failure preserves completed configuration and pending cache data. Ordinary
 upgrades reuse existing saved credentials. Imported account credentials and
 tokens remain excluded from restoration.
@@ -637,7 +640,10 @@ Original vault settings remain fixed. Retained cache data is copied privately;
 an offline `degoo restore-cache` command verifies the original identity and
 changes only its cache-path binding. Existing installs use the upgrade flow
 rather than merging retained caches. Remote folder-name discovery reports
-collisions and requires the matching vault configuration to reuse a folder.
+collisions and permits reuse with the matching configuration or a successful
+read-only encryption check. Inconclusive checks block password-based reuse;
+this check does not establish full integrity, listing freshness or the planned
+password-only bootstrap/latest-root recovery guarantee.
 `degoo-rc backup-config` creates the same portable configuration layout without
 uninstalling. File data, cache, and pending uploads are excluded. This supports
 opening the same remote vault on another computer while pending uploads remain

@@ -290,6 +290,12 @@ form, and access/refresh tokens. Restoring a backup requires a fresh login.
 - Provide Linux installer and uninstaller wizards with step by step prompts.
   Suggest defaults for settings that can be inferred; account email and
   password have no invented defaults.
+- A fresh install must not require a saved `vault.json`. When no configuration
+  is imported, ask privately for the vault encryption password and offer remote
+  folder selection for either a new vault or an existing encrypted vault.
+  Preserve imported and installed encryption settings. Check the supplied key
+  against authenticated remote content before binding a recovered existing
+  folder; unknown or failed checks must leave writable startup blocked.
 - List dependencies even when installed, and offer to install missing ones.
 - Before each action that depends on local prerequisites, check them for the
   selected install, build, mount, or service path. Report which requirements
