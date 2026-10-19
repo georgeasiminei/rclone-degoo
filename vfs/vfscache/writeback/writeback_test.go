@@ -13,6 +13,7 @@ import (
 	"slices"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -346,6 +347,109 @@ func TestWriteBackAddFailRetry(t *testing.T) {
 	waitUntilNoTransfers(t, wb)
 	checkNotOnHeap(t, wb, wbItem)
 	checkNotInLookup(t, wb, wbItem)
+}
+
+func TestWriteBackHonorsWrappedRetryAfterDeadline(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+
+	pi := newPutItem(t)
+	id := wb.Add(0, "rate-limited", 10, true, pi.put)
+	<-pi.started
+	retryAt := time.Now().Add(2 * time.Second)
+	pi.finish(fmt.Errorf("upload failed: %w", fserrors.ErrorRetryAfter(retryAt)))
+	waitUntilNoTransfers(t, wb)
+
+	wb.mu.Lock()
+	item := wb.lookup[id]
+	if item == nil {
+		wb.mu.Unlock()
+		t.Fatal("retry-after item is missing from lookup")
+	}
+	gotExpiry := item.expiry
+	gotDelay := item.delay
+	wb.mu.Unlock()
+	assert.GreaterOrEqual(t, gotExpiry, retryAt, "scheduled expiry must include the provider's absolute deadline")
+	assert.Equal(t, 200*time.Millisecond, gotDelay, "ordinary exponential delay remains tracked separately")
+
+	select {
+	case <-pi.started:
+		t.Fatal("writeback retried before RetryAfter")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	start := time.Now()
+	assert.True(t, wb.Remove(id), "retry item should remain removable while waiting")
+	assert.Less(t, time.Since(start), 500*time.Millisecond, "removing a delayed retry should not wait for its deadline")
+	assert.Empty(t, wb.Queue())
+}
+
+func TestWriteBackExpiredRetryAfterUsesExponentialBackoff(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+
+	pi := newPutItem(t)
+	id := wb.Add(0, "expired-rate-limit", 10, true, pi.put)
+	<-pi.started
+	retryAt := time.Now().Add(-time.Second)
+	failureAt := time.Now()
+	pi.finish(fmt.Errorf("upload failed: %w", fserrors.ErrorRetryAfter(retryAt)))
+	waitUntilNoTransfers(t, wb)
+
+	wb.mu.Lock()
+	item := wb.lookup[id]
+	if item == nil {
+		wb.mu.Unlock()
+		t.Fatal("retry item is missing from lookup")
+	}
+	gotExpiry := item.expiry
+	gotDelay := item.delay
+	wb.mu.Unlock()
+	assert.Equal(t, 200*time.Millisecond, gotDelay)
+	assert.True(t, gotExpiry.After(failureAt), "an expired server deadline should not make the retry immediate")
+	assert.Less(t, gotExpiry.Sub(failureAt), time.Second, "an expired deadline should use the ordinary exponential delay")
+
+	select {
+	case <-pi.started:
+	case <-time.After(time.Second):
+		t.Fatal("writeback did not retry after the ordinary backoff")
+	}
+	pi.finish(nil)
+	waitUntilNoTransfers(t, wb)
+}
+
+func TestWriteBackRenameReschedulesRetryAfterItem(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+
+	pi := newPutItem(t)
+	id := wb.Add(0, "old-name", 10, true, pi.put)
+	<-pi.started
+	retryAt := time.Now().Add(5 * time.Second)
+	pi.finish(fmt.Errorf("upload failed: %w", fserrors.ErrorRetryAfter(retryAt)))
+	waitUntilNoTransfers(t, wb)
+
+	renamedAt := time.Now()
+	wb.Rename(id, "new-name")
+	wb.mu.Lock()
+	item := wb.lookup[id]
+	if item == nil {
+		wb.mu.Unlock()
+		t.Fatal("renamed retry item is missing from lookup")
+	}
+	gotName, gotExpiry := item.name, item.expiry
+	wb.mu.Unlock()
+	assert.Equal(t, "new-name", gotName)
+	assert.True(t, gotExpiry.Before(retryAt), "rename should replace the old provider deadline with normal writeback scheduling")
+
+	select {
+	case <-pi.started:
+	case <-time.After(time.Second):
+		t.Fatal("renamed item remained blocked by its prior RetryAfter deadline")
+	}
+	assert.Less(t, time.Since(renamedAt), time.Second)
+	pi.finish(nil)
+	waitUntilNoTransfers(t, wb)
 }
 
 // Now test the upload being cancelled by another upload being added

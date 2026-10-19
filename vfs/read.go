@@ -19,6 +19,7 @@ import (
 // ReadFileHandle is an open for read file handle on a File
 type ReadFileHandle struct {
 	baseHandle
+	maintenance *maintenanceHandle
 	done        func(ctx context.Context, err error)
 	mu          sync.Mutex
 	cond        sync.Cond // cond lock for out of sequence reads
@@ -412,6 +413,7 @@ func (fh *ReadFileHandle) close() error {
 		return ECLOSED
 	}
 	fh.closed = true
+	defer fh.maintenance.release()
 
 	if fh.opened {
 		var err error
@@ -467,6 +469,7 @@ func (fh *ReadFileHandle) Release() error {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 	if !fh.opened {
+		fh.maintenance.release()
 		return nil
 	}
 	if fh.closed {

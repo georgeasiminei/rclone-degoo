@@ -1,30 +1,146 @@
 # AGENTS.md
 
-This file provides guidance to AI coding agents (e.g. Claude Code, Codex, Cursor, Gemini CLI, and similar tools) when working with code in this repository.
+## Degoo fork handoff
 
-Rclone welcomes AI-assisted contributions, but the expectation is that you, the human submitter, understand every line you propose and have compiled and tested it against real rclone code - not just generated it. See the "AI-assisted contributions" section of [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+This is
+[georgeasiminei/rclone-degoo](https://github.com/georgeasiminei/rclone-degoo),
+a fork of rclone for an encrypted, writable Degoo mount on Linux.
+The Degoo backend and encrypted vault command are implemented in
+`backend/degoo` and `cmd/degoo`. Offline validation and remaining live
+acceptance gates are recorded in `docs/degoo`.
+
+Read these documents before starting Degoo work:
+
+1. [Project requirements](docs/degoo/REQUIREMENTS.md): the user's desired
+   behavior, scope, and acceptance criteria.
+2. [Implementation plan](docs/degoo/IMPLEMENTATION_PLAN.md): advisory design,
+   discovery work, and suggested delivery stages.
+3. [Scalable storage plan](docs/degoo/SCALABLE_STORAGE_PLAN.md): the active
+   redesign backlog, progress, evidence gates, and cross-session handoff.
+4. The upstream rclone guidance below and [CONTRIBUTING.md](CONTRIBUTING.md).
+
+The requirements record the user's intent. The plan is advice, not a binding
+architecture or fixed task sequence. Future agents may change libraries,
+interfaces, layering, defaults, and sequencing when evidence supports a better
+approach. Explain material tradeoffs and update the plan. Ask the user about
+changes to required behavior rather than quietly weakening it.
+
+### Pre-live development policy
+
+As of 2026-10-15, this project is not live. The user has identified all current
+Degoo data and pending uploads as disposable tests. Future implementation may
+redesign the format, discard pending test uploads, reset the test cache, and
+remove Degoo test data when necessary. Preserving the current format, draining
+the current queue, and migrating existing test data are not delivery gates.
+Notify the user before a reset, naming its scope, what will be lost, and what
+must be copied again with rsync. This is standing authorization for announced
+pre-live resets, not a requirement to ask for the same approval again.
+
+Keep resets scoped to the intended test vault by default. If an account-wide
+test-data reset is necessary, announce that broader scope explicitly. Protect
+source files outside the mount, unrelated local data, and credentials. The
+ordinary filesystem must still preserve pending writes through failures and
+restarts; an intentional test reset is a separate maintenance action. End this
+exception when the user explicitly declares go-live, and update the requirements
+and active tracker together. The initial planning task on 2026-10-15 authorizes
+documentation only; implementation and resets belong to later tasks.
+
+### Project priorities
+
+- Linux is the primary platform; Windows support is not required initially.
+- Provide an ordinary writable mount. File purpose does not alter the contract.
+- Encrypt user content before transmission and decrypt locally, transparently.
+  Encrypt remote file names and any chunk manifests holding user metadata.
+- Support logical files larger than Degoo's per-object limit through splitting
+  or another proven mechanism. Account for encryption overhead in stored sizes.
+- A simple local password or secret in a permission-protected file is sufficient
+  on the user's trusted machine. Do not require a keyring or secrets service.
+- Separate vault encryption from Degoo account authentication. Renew account
+  tokens automatically and support explicit login when renewal is rejected.
+- Preserve pending local changes across restarts and authentication outages.
+  Describe local persistence and remote upload completion separately.
+
+### Working in this fork
+
+Use [cligoo](https://github.com/georgeasiminei/cligoo) as an API reference. Its
+Python implementation and observed endpoints are evidence to verify, not a
+guarantee of current Degoo behavior. It is not a filesystem implementation.
+Keep handoff documents portable: no dependence on another chat, Windows paths,
+local credentials, or a particular developer's environment.
+
+The `staging` branch is the integration branch for this fork. It was initialized
+from `feat/degoo-vault` at the user's request; subsequent work starts from
+`origin/staging` and returns through a pull request targeting `staging`.
+
+Fetch before creating each feature branch and base it on the latest
+`origin/staging`. Make changes on feature branches and open a pull request to
+`staging` in the user's fork. The user will merge each pull request and delete
+its source branch; do not merge pull requests or delete their source branches.
+Keep this fork's pull requests directed to the fork; submitting changes to
+upstream rclone is a separate decision.
+
+For documentation-only work, check Markdown and `git diff --check`. For source
+changes, follow the build, lint, and test guidance below. Report checks that
+could not run; never present a proposed implementation as validated.
+
+Never commit credentials, vault passwords, token files, local caches, or private
+account listings. Use generated data in a dedicated test vault for live write
+tests. Do not use existing customer files for destructive testing. Keep pending
+files available when uploads fail; do not fall back to plaintext cloud uploads.
+
+## Upstream rclone guidance
+
+This file provides guidance to AI coding agents (e.g. Claude Code, Codex,
+Cursor, Gemini CLI, and similar tools) when working with code in this
+repository.
+
+Rclone welcomes AI-assisted contributions, but the expectation is that you, the
+human submitter, understand every line you propose and have compiled and tested
+it against real rclone code - not just generated it. See the "AI-assisted
+contributions" section of [CONTRIBUTING.md](CONTRIBUTING.md) before opening a
+pull request.
 
 ## Project Overview
 
-Rclone is a command-line program to sync files and directories to and from cloud storage providers. It's written in Go and supports 70+ backends (cloud storage systems). Think "rsync for cloud storage".
+Rclone is a command-line program to sync files and directories to and from cloud
+storage providers. It's written in Go and supports 70+ backends (cloud storage
+systems). Think "rsync for cloud storage".
 
 ## General Notes
 
-**We take backwards compatibility very seriously.** PRs should not change the observable behaviour of existing commands, flags or rc API without very good reason. Rclone does not try to preserve a stable Go API but try not to change it gratuitously.
+**We take backwards compatibility very seriously.** PRs should not change the
+observable behaviour of existing commands, flags or rc API without very good
+reason. Rclone does not try to preserve a stable Go API but try not to change it
+gratuitously.
 
-Rclone operates with a lot of different backends, so **compatibility is key**. It is the backend integration tests which guarantee that compatibility. Changes should consider both known and unknown backends and should take care not to break functionality of existing installations.
+Rclone operates with a lot of different backends, so **compatibility is key**.
+It is the backend integration tests which guarantee that compatibility. Changes
+should consider both known and unknown backends and should take care not to
+break functionality of existing installations.
 
-The core parts of rclone under `fs` and `vfs` need to work with all backends and **backend specific hacks won't be merged**. Fixes likely need to go in the relevant backend or if new behaviour is really needed, a new Feature flag needs to be added.
+The core parts of rclone under `fs` and `vfs` need to work with all backends and
+**backend specific hacks won't be merged**. Fixes likely need to go in the
+relevant backend or if new behaviour is really needed, a new Feature flag needs
+to be added.
 
-**Changes should be kept to the minimum.** Work hard to make the most elegant, smallest change you can. Do not refactor or re-order code unless necessary as this makes review more challenging. Re-use existing test scaffolding, existing or library routines (e.g. `lib`) where possible.
+**Changes should be kept to the minimum.** Work hard to make the most elegant,
+smallest change you can. Do not refactor or re-order code unless necessary as
+this makes review more challenging. Re-use existing test scaffolding, existing
+or library routines (e.g. `lib`) where possible.
 
-Make sure added tests **actually test the code you have written** and test the intention behind the change. If you are fixing a problem, write the tests first to reproduce the problem before starting on the fix.
+Make sure added tests **actually test the code you have written** and test the
+intention behind the change. If you are fixing a problem, write the tests first
+to reproduce the problem before starting on the fix.
 
-Tests in `fs/operations`, `fs/sync`, `cmd/bisync`, `cmd/gitannex` and `vfs` (the definitive list is in `fstest/test_all/config.yaml`) are run on the integration test machine against **all** the backends, so they **must be prepared to run on backends with limited functionality**. Ideally tests, or parts of tests, should be skipped using the `Fs.Features()` flags on backends which can't support them.
+Tests in `fs/operations`, `fs/sync`, `cmd/bisync`, `cmd/gitannex` and `vfs` (the
+definitive list is in `fstest/test_all/config.yaml`) are run on the integration
+test machine against **all** the backends, so they **must be prepared to run on
+backends with limited functionality**. Ideally tests, or parts of tests, should
+be skipped using the `Fs.Features()` flags on backends which can't support them.
 
 ## Build and Test Commands
 
-```bash
+```sh
 # Build rclone (simple)
 go build
 
@@ -64,29 +180,44 @@ go run ./fstest/test_all -backends drive
 
 ### Entry Point and Plugin Registration
 
-`rclone.go` is the main entry point. It imports `backend/all` and `cmd/all` which use Go's `init()` pattern to register all backends and commands. Each backend calls `fs.Register()` with a `fs.RegInfo` struct during init.
+`rclone.go` is the main entry point. It imports `backend/all` and `cmd/all`
+which use Go's `init()` pattern to register all backends and commands. Each
+backend calls `fs.Register()` with a `fs.RegInfo` struct during init.
 
 ### Core Interfaces (`fs/`)
 
 The `fs` package defines the core abstractions:
-- **`fs.Fs`** (`fs/types.go`): The filesystem interface every backend must implement (List, NewObject, Put, Mkdir, Rmdir).
-- **`fs.Object`** (`fs/types.go`): Interface for a file/object (Open, Update, Remove, SetModTime).
-- **`fs.Features`** (`fs/features.go`): Optional capabilities a backend can declare (Purge, Copy, Move, DirMove, etc.). Backends set function pointers for operations they support; nil means not supported.
-- **`fs.RegInfo`** (`fs/registry.go`): Registration metadata for a backend including its name, config options, and NewFs constructor.
+
+- **`fs.Fs`** (`fs/types.go`): The filesystem interface every backend must
+  implement (List, NewObject, Put, Mkdir, Rmdir).
+- **`fs.Object`** (`fs/types.go`): Interface for a file/object (Open, Update,
+  Remove, SetModTime).
+- **`fs.Features`** (`fs/features.go`): Optional capabilities a backend can
+  declare (Purge, Copy, Move, DirMove, etc.). Backends set function pointers for
+  operations they support; nil means not supported.
+- **`fs.RegInfo`** (`fs/registry.go`): Registration metadata for a backend
+  including its name, config options, and NewFs constructor.
 
 ### Backend Structure (`backend/`)
 
-Each backend is a single Go package (e.g., `backend/s3/`, `backend/drive/`). Key conventions:
-- Main implementation in a single file (e.g., `s3.go`) - **do not** split into `fs.go`/`object.go`.
+Each backend is a single Go package (e.g., `backend/s3/`, `backend/drive/`). Key
+conventions:
+
+- Main implementation in a single file (e.g., `s3.go`) - **do not** split into
+  `fs.go`/`object.go`.
 - API types go in a separate `api/types.go` file.
-- Test file (e.g., `s3_test.go`) uses `fstests.Run()` from `fstest/fstests` for standardized integration tests.
+- Test file (e.g., `s3_test.go`) uses `fstests.Run()` from `fstest/fstests` for
+  standardized integration tests.
 - Register in `backend/all/all.go` via blank import.
-- HTTP-based backends should use `lib/rest` for HTTP calls and `fs/fshttp` for the HTTP client.
-- Use `lib/dircache` for directory-ID-based remotes, `lib/oauthutil` for OAuth, `lib/pacer` for rate limiting.
+- HTTP-based backends should use `lib/rest` for HTTP calls and `fs/fshttp` for
+  the HTTP client.
+- Use `lib/dircache` for directory-ID-based remotes, `lib/oauthutil` for OAuth,
+  `lib/pacer` for rate limiting.
 
 ### Command Structure (`cmd/`)
 
-Each command is a package under `cmd/` registered in `cmd/all/all.go` via blank import. Commands use cobra via `cmd.Main()`.
+Each command is a package under `cmd/` registered in `cmd/all/all.go` via blank
+import. Commands use cobra via `cmd.Main()`.
 
 ### Key Subsystems
 
@@ -98,39 +229,65 @@ Each command is a package under `cmd/` registered in `cmd/all/all.go` via blank 
 - **`fs/config/`**: Configuration file management
 - **`vfs/`**: Virtual filesystem layer (used by mount, serve)
 - **`librclone/`**: C-compatible library interface for embedding rclone
-- **`fstest/`**: Integration test framework; `fstest/fstests/` has the generic backend test suite
+- **`fstest/`**: Integration test framework; `fstest/fstests/` has the generic
+  backend test suite
 
 ## Commit Message Convention
 
-Prefix with the directory of the change, then a colon: `drive: add team drive support - fixes #885`. For cross-cutting changes use a broader prefix like `fs` or `operations`.
+Prefix with the directory of the change, then a colon: `drive: add team drive
+support - fixes #885`. For cross-cutting changes use a broader prefix like `fs`
+or `operations`.
 
-Make the first line of your commit message a summary of the change that a user (not a developer) of rclone would like to read. So write `drive: fix server side copy of big files` instead of `drive: no longer set the MimeType in Move or Copy`. This is important because these lines go into the change log which is read by users.
+Make the first line of your commit message a summary of the change that a user
+(not a developer) of rclone would like to read. So write `drive: fix server side
+copy of big files` instead of `drive: no longer set the MimeType in Move or
+Copy`. This is important because these lines go into the change log which is
+read by users.
 
 ## Code Commenting Style
 
-Comments describe the code as it is now, for a future reader who has no knowledge of the change that introduced it.
+Comments describe the code as it is now, for a future reader who has no
+knowledge of the change that introduced it.
 
-Every exported type, function, field, and constant has a **godoc comment** that starts with its name and is phrased as a present-tense statement of what it is or does (`// Mkdir makes the directory (container, bucket)`)
+Every exported type, function, field, and constant has a **godoc comment** that
+starts with its name and is phrased as a present-tense statement of what it is
+or does (`// Mkdir makes the directory (container, bucket)`)
 
-**Document the contract** callers need - preconditions, what's returned, which sentinel errors are returned and when, and any "shouldn't return an error if it already exists" style caveats - rather than the implementation.
+**Document the contract** callers need - preconditions, what's returned, which
+sentinel errors are returned and when, and any "shouldn't return an error if it
+already exists" style caveats - rather than the implementation.
 
-**Keep comments terse**: a single line for most things, with extra paragraphs (separated by blank `//` lines) reserved for genuine subtlety.
+**Keep comments terse**: a single line for most things, with extra paragraphs
+(separated by blank `//` lines) reserved for genuine subtlety.
 
-Inline comments inside function bodies should **explain why** - a non-obvious API quirk, a workaround, a gotcha, or an ordering constraint - and may cite an external reference (forum thread, vendor docs, RFC) when that's what makes the behaviour non-obvious; skip comments that merely restate what the code plainly does.
+Inline comments inside function bodies should **explain why** - a non-obvious
+API quirk, a workaround, a gotcha, or an ordering constraint - and may cite an
+external reference (forum thread, vendor docs, RFC) when that's what makes the
+behaviour non-obvious; skip comments that merely restate what the code plainly
+does.
 
 Use `FIXME` and `TODO` for known shortcomings.
 
-**Do not write comments that narrate the change itself** or compare against the previous behaviour (no "now we also handle...", "changed to...", "previously this returned...", or references to bug/PR numbers in the code) - that context belongs in the commit message, not in source that will outlive the change.
+**Do not write comments that narrate the change itself** or compare against the
+previous behaviour (no "now we also handle...", "changed to...", "previously
+this returned...", or references to bug/PR numbers in the code) - that context
+belongs in the commit message, not in source that will outlive the change.
 
-Code comments should only refer to **current** behaviour - and shouldn't describe behaviour that is trivially deducible from reading the code.
+Code comments should only refer to **current** behaviour - and shouldn't
+describe behaviour that is trivially deducible from reading the code.
 
 ## Linting Configuration
 
-Uses golangci-lint v2 with config in `.golangci.yml`. Enabled linters: errcheck, govet, ineffassign, staticcheck, unused, gocritic, misspell, revive, unconvert. The `goimports` formatter is also enabled.
+Uses golangci-lint v2 with config in `.golangci.yml`. Enabled linters: errcheck,
+govet, ineffassign, staticcheck, unused, gocritic, misspell, revive, unconvert.
+The `goimports` formatter is also enabled.
 
 ## Documentation
 
-- Backend option docs come from `Help:` fields in the Go source Options structs, not from markdown files.
+- Backend option docs come from `Help:` fields in the Go source Options structs,
+  not from markdown files.
 - Command docs are in the command source code (e.g., `cmd/ls/ls.go`).
-- Don't commit autogenerated doc changes from `make backenddocs` or `make commanddocs`.
-- Website docs are in `docs/content/` as markdown, built with Hugo (`make serve` to preview).
+- Don't commit autogenerated doc changes from `make backenddocs` or `make
+  commanddocs`.
+- Website docs are in `docs/content/` as markdown, built with Hugo (`make serve`
+  to preview).

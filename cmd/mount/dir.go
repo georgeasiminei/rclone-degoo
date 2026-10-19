@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,6 +28,22 @@ type Dir struct {
 
 // Check interface satisfied
 var _ fusefs.Node = (*Dir)(nil)
+
+// Getxattr returns no attributes for directories when upload status is enabled.
+func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	if d.VFS().Opt.UploadStatus {
+		return fuse.ErrNoXattr
+	}
+	return syscall.ENOSYS
+}
+
+// Listxattr returns an empty attribute list for directories when upload status is enabled.
+func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+	if d.VFS().Opt.UploadStatus {
+		return nil
+	}
+	return syscall.ENOSYS
+}
 
 // Attr updates the attributes of a directory
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) (err error) {
@@ -109,6 +126,16 @@ func (d *Dir) ReadDirAll(ctx context.Context) (dirents []fuse.Dirent, err error)
 	if err != nil {
 		return nil, translateError(err)
 	}
+	entries := make([]os.FileInfo, len(items))
+	for i, item := range items {
+		entries[i] = item
+	}
+	dirents = d.readDirAll(entries)
+	itemsRead = len(dirents)
+	return dirents, nil
+}
+
+func (d *Dir) readDirAll(items []os.FileInfo) (dirents []fuse.Dirent) {
 	dirents = append(dirents, fuse.Dirent{
 		Type: fuse.DT_Dir,
 		Name: ".",
@@ -116,8 +143,8 @@ func (d *Dir) ReadDirAll(ctx context.Context) (dirents []fuse.Dirent, err error)
 		Type: fuse.DT_Dir,
 		Name: "..",
 	})
-	for _, node := range items {
-		name := node.Name()
+	for _, item := range items {
+		name := item.Name()
 		if len(name) > mountlib.MaxLeafSize {
 			fs.Errorf(d, "Name too long (%d bytes) for FUSE, skipping: %s", len(name), name)
 			continue
@@ -127,10 +154,10 @@ func (d *Dir) ReadDirAll(ctx context.Context) (dirents []fuse.Dirent, err error)
 			Type: fuse.DT_File,
 			Name: name,
 		}
-		if node.IsDir() {
+		if item.IsDir() {
 			dirent.Type = fuse.DT_Dir
 		}
-		switch node := node.(type) {
+		switch node := item.(type) {
 		case *vfs.File:
 			if node.IsSymlink() {
 				dirent.Type = fuse.DT_Link
@@ -138,8 +165,63 @@ func (d *Dir) ReadDirAll(ctx context.Context) (dirents []fuse.Dirent, err error)
 		}
 		dirents = append(dirents, dirent)
 	}
-	itemsRead = len(dirents)
-	return dirents, nil
+	return dirents
+}
+
+// dirHandle keeps a VFS directory handle open for a FUSE directory descriptor.
+type dirHandle struct {
+	mu       sync.Mutex
+	dir      *Dir
+	handle   vfs.Handle
+	released bool
+}
+
+var _ fusefs.HandleReadDirAller = (*dirHandle)(nil)
+var _ fusefs.HandleReleaser = (*dirHandle)(nil)
+
+// ReadDirAll reads the contents of the directory handle.
+func (h *dirHandle) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.released {
+		return nil, syscall.EBADF
+	}
+	dir, ok := h.handle.Node().(*vfs.Dir)
+	if !ok {
+		return nil, fmt.Errorf("unexpected directory handle node type %T", h.handle.Node())
+	}
+	items, err := dir.ReadDirAll()
+	if err != nil {
+		return nil, translateError(err)
+	}
+	entries := make([]os.FileInfo, len(items))
+	for i, item := range items {
+		entries[i] = item
+	}
+	return h.dir.readDirAll(entries), nil
+}
+
+// Release releases the VFS directory handle.
+func (h *dirHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.released {
+		return nil
+	}
+	h.released = true
+	return translateError(h.handle.Release())
+}
+
+var _ fusefs.NodeOpener = (*Dir)(nil)
+
+// Open opens the directory and returns a tracked VFS directory handle.
+func (d *Dir) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fh fusefs.Handle, err error) {
+	defer log.Trace(d, "flags=%v", req.Flags)("fh=%v, err=%v", &fh, &err)
+	handle, err := d.Dir.Open(os.O_RDONLY)
+	if err != nil {
+		return nil, translateError(err)
+	}
+	return &dirHandle{dir: d, handle: handle}, nil
 }
 
 var _ fusefs.NodeCreater = (*Dir)(nil)

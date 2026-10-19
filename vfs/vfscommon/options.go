@@ -56,6 +56,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Cache mode off|minimal|writes|full",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_upload_status",
+	Default: false,
+	Help:    "Enable reporting of the current file upload status to mount integrations",
+	Groups:  "VFS",
+}, {
 	Name:    "vfs_cache_poll_interval",
 	Default: fs.Duration(60 * time.Second),
 	Help:    "Interval to poll the cache for stale objects",
@@ -201,6 +206,7 @@ type Options struct {
 	ChunkSizeLimit     fs.SizeSuffix `config:"vfs_read_chunk_size_limit"` // if > ChunkSize double the chunk size after each chunk until reached
 	ChunkStreams       int           `config:"vfs_read_chunk_streams"`    // Number of download streams to use
 	CacheMode          CacheMode     `config:"vfs_cache_mode"`
+	UploadStatus       bool          `config:"vfs_upload_status"` // report the current file upload state to mount integrations
 	CacheMaxAge        fs.Duration   `config:"vfs_cache_max_age"`
 	CacheMaxSize       fs.SizeSuffix `config:"vfs_cache_max_size"`
 	CacheMinFreeSpace  fs.SizeSuffix `config:"vfs_cache_min_free_space"`

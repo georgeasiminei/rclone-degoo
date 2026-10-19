@@ -2,10 +2,13 @@ package vfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/rclone/rclone/fs"
@@ -14,6 +17,7 @@ import (
 	"github.com/rclone/rclone/fstest/mockfs"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/rclone/rclone/lib/ranges"
+	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -87,6 +91,114 @@ func TestFileMethods(t *testing.T) {
 
 	// VFS
 	assert.Equal(t, vfs, file.VFS())
+}
+
+func TestFileUploadStatusDisabledAndNoCache(t *testing.T) {
+	_, vfs, existing, _ := fileCreate(t, vfscommon.CacheModeOff)
+	assert.Equal(t, "unknown", existing.UploadStatus())
+	vfs.Opt.UploadStatus = true
+	assert.Equal(t, "uploaded", existing.UploadStatus())
+
+	h, err := vfs.OpenFile("new-file", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	require.NoError(t, err)
+	newFile, err := vfs.Stat("new-file")
+	require.NoError(t, err)
+	file := newFile.(*File)
+	assert.Equal(t, "pending", file.UploadStatus(), "a local-only file must not appear uploaded")
+
+	_, err = h.Write([]byte("new contents"))
+	require.NoError(t, err)
+	assert.Equal(t, "pending", file.UploadStatus(), "an open writer must not appear uploaded")
+	require.NoError(t, h.Close())
+	assert.Equal(t, "uploaded", file.UploadStatus())
+}
+
+type uploadStatusTestFs struct {
+	fs.Fs
+	putCount        atomic.Int32
+	firstPutStarted chan struct{}
+	releaseFirstPut chan struct{}
+	firstPutDone    chan struct{}
+	secondPutStart  chan struct{}
+}
+
+func (f *uploadStatusTestFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	attempt := f.putCount.Add(1)
+	if attempt == 1 {
+		close(f.firstPutStarted)
+		<-f.releaseFirstPut
+		close(f.firstPutDone)
+		return nil, errors.New("simulated temporary upload failure")
+	}
+	if attempt == 2 {
+		close(f.secondPutStart)
+	}
+	return f.Fs.Put(ctx, in, src, options...)
+}
+
+func TestFileUploadStatusWritebackRetry(t *testing.T) {
+	r := fstest.NewRun(t)
+	remote := &uploadStatusTestFs{
+		Fs:              r.Fremote,
+		firstPutStarted: make(chan struct{}),
+		releaseFirstPut: make(chan struct{}),
+		firstPutDone:    make(chan struct{}),
+		secondPutStart:  make(chan struct{}),
+	}
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.WriteBack = fs.Duration(10 * time.Second)
+	opt.UploadStatus = true
+	vfs := New(context.Background(), remote, &opt)
+	t.Cleanup(func() { cleanupVFS(t, vfs) })
+	defer func() {
+		select {
+		case <-remote.releaseFirstPut:
+		default:
+			close(remote.releaseFirstPut)
+		}
+	}()
+
+	h, err := vfs.OpenFile("new-file", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	require.NoError(t, err)
+	file := h.(*RWFileHandle).file
+	_, err = h.Write([]byte("new contents"))
+	require.NoError(t, err)
+	assert.Equal(t, "pending", file.UploadStatus(), "dirty open writes are pending")
+	require.NoError(t, h.Close())
+	assert.Equal(t, "pending", file.UploadStatus(), "queued writes are pending")
+	queue := vfs.cache.Queue()["queue"].([]writeback.QueueInfo)
+	require.Len(t, queue, 1)
+	require.NoError(t, vfs.cache.QueueSetExpiry(queue[0].ID, time.Now(), 0))
+
+	select {
+	case <-remote.firstPutStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writeback did not start")
+	}
+	assert.Equal(t, "uploading", file.UploadStatus())
+	close(remote.releaseFirstPut)
+	select {
+	case <-remote.firstPutDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first upload attempt did not finish")
+	}
+
+	require.Eventually(t, func() bool {
+		return file.UploadStatus() == "pending"
+	}, 5*time.Second, 10*time.Millisecond, "a failed upload should remain pending for retry")
+	queue = vfs.cache.Queue()["queue"].([]writeback.QueueInfo)
+	require.Len(t, queue, 1)
+	require.NoError(t, vfs.cache.QueueSetExpiry(queue[0].ID, time.Now(), 0))
+	select {
+	case <-remote.secondPutStart:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writeback retry did not start")
+	}
+	require.Eventually(t, func() bool {
+		return file.UploadStatus() == "uploaded"
+	}, 10*time.Second, 10*time.Millisecond, "successful writeback should transition to uploaded")
+	assert.GreaterOrEqual(t, remote.putCount.Load(), int32(2), "the failed upload should be retried")
 }
 
 func testFileSetModTime(t *testing.T, cacheMode vfscommon.CacheMode, open bool, write bool) {

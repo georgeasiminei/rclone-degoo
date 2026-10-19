@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -212,17 +215,35 @@ func (item *Item) load() (exists bool, err error) {
 // call with the lock held
 func (item *Item) _save() (err error) {
 	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
-	out, err := os.Create(osPathMeta)
+	// Keep the temporary file outside cache trees because startup reload walks
+	// every file beneath the metadata root.
+	out, err := os.CreateTemp(item.c.tmpRoot, ".rclone-vfs-meta-*")
 	if err != nil {
-		return fmt.Errorf("vfs cache item: failed to write metadata: %w", err)
+		return fmt.Errorf("vfs cache item: failed to create temporary metadata file: %w", err)
 	}
-	defer fs.CheckClose(out, &err)
+	tempPath := out.Name()
+	defer func() {
+		if out != nil {
+			_ = out.Close()
+		}
+		if tempPath != "" {
+			_ = os.Remove(tempPath)
+		}
+	}()
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "\t")
 	err = encoder.Encode(item.info)
 	if err != nil {
 		return fmt.Errorf("vfs cache item: failed to encode metadata: %w", err)
 	}
+	if err = out.Close(); err != nil {
+		return fmt.Errorf("vfs cache item: failed to close temporary metadata file: %w", err)
+	}
+	out = nil
+	if err = os.Rename(tempPath, osPathMeta); err != nil {
+		return fmt.Errorf("vfs cache item: failed to replace metadata: %w", err)
+	}
+	tempPath = ""
 	return nil
 }
 
@@ -1538,6 +1559,110 @@ func (item *Item) Sync() (err error) {
 		return fmt.Errorf("vfs cache item sync: failed to sync metadata: %w", err)
 	}
 	return nil
+}
+
+// SyncDurable syncs a cache item's local data and metadata to stable storage.
+func (item *Item) SyncDurable() (err error) {
+	item.preAccess()
+	defer item.postAccess()
+	item.mu.Lock()
+	defer item.mu.Unlock()
+
+	dataPath := item.c.toOSPath(item.name)
+	metaPath := item.c.toOSPathMeta(item.name)
+	_, dataStatErr := os.Stat(dataPath)
+	dataExists := dataStatErr == nil
+	if dataStatErr != nil && !os.IsNotExist(dataStatErr) {
+		return fmt.Errorf("vfs cache item sync: failed to stat data file: %w", dataStatErr)
+	}
+	_, metaStatErr := os.Stat(metaPath)
+	metaExists := metaStatErr == nil
+	if metaStatErr != nil && !os.IsNotExist(metaStatErr) {
+		return fmt.Errorf("vfs cache item sync: failed to stat metadata file: %w", metaStatErr)
+	}
+	if !dataExists && item.info.Dirty {
+		return fmt.Errorf("vfs cache item sync: dirty data file is missing: %w", dataStatErr)
+	}
+	if !dataExists && !metaExists {
+		return nil
+	}
+
+	data := item.fd
+	if dataExists && data == nil {
+		data, err = os.OpenFile(dataPath, os.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf("vfs cache item sync: failed to open data file: %w", err)
+		}
+		defer fs.CheckClose(data, &err)
+	}
+	if dataExists {
+		if err = data.Sync(); err != nil {
+			return fmt.Errorf("vfs cache item sync: failed to sync data file: %w", err)
+		}
+		if err = syncDirectoryTree(dataPath, item.c.tmpRoot); err != nil {
+			return fmt.Errorf("vfs cache item sync: failed to sync data directory: %w", err)
+		}
+	}
+
+	if dataExists {
+		if err = createDir(filepath.Dir(metaPath)); err != nil {
+			return fmt.Errorf("vfs cache item sync: failed to create metadata directory: %w", err)
+		}
+		if err = item._save(); err != nil {
+			return fmt.Errorf("vfs cache item sync: failed to save metadata: %w", err)
+		}
+	}
+	meta, err := os.OpenFile(metaPath, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("vfs cache item sync: failed to open metadata: %w", err)
+	}
+	defer fs.CheckClose(meta, &err)
+	if err = meta.Sync(); err != nil {
+		return fmt.Errorf("vfs cache item sync: failed to sync metadata: %w", err)
+	}
+	if err = syncDirectoryTree(metaPath, item.c.tmpRoot); err != nil {
+		return fmt.Errorf("vfs cache item sync: failed to sync metadata directory: %w", err)
+	}
+	return nil
+}
+
+func syncDirectoryTree(filePath, rootPath string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	rootPath, err := filepath.Abs(rootPath)
+	if err != nil {
+		return err
+	}
+	dirPath, err := filepath.Abs(filepath.Dir(filePath))
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(rootPath, dirPath)
+	if err != nil {
+		return err
+	}
+	if rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("directory %q is outside cache root %q", dirPath, rootPath)
+	}
+	for {
+		dir, err := os.Open(dirPath)
+		if err != nil {
+			return err
+		}
+		syncErr := dir.Sync()
+		closeErr := dir.Close()
+		if syncErr != nil {
+			return syncErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if dirPath == rootPath {
+			return nil
+		}
+		dirPath = filepath.Dir(dirPath)
+	}
 }
 
 // rename the item

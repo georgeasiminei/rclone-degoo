@@ -28,7 +28,7 @@ func mountOptions(fsys *FS, f fs.Fs, opt *mountlib.Options) (mountOpts *fuse.Mou
 		AllowOther:         fsys.opt.AllowOther,
 		FsName:             opt.DeviceName,
 		Name:               "rclone",
-		DisableXAttrs:      true,
+		DisableXAttrs:      !fsys.VFS.Opt.UploadStatus,
 		Debug:              fsys.opt.DebugFUSE,
 		MaxReadAhead:       int(fsys.opt.MaxReadAhead),
 		MaxWrite:           1024 * 1024, // Linux v4.20+ caps requests at 1 MiB

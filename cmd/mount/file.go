@@ -101,6 +101,13 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 //
 // If there is no xattr by that name, returns fuse.ErrNoXattr.
 func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	if f.VFS().Opt.UploadStatus {
+		if req.Name != vfs.UploadStatusXattr {
+			return fuse.ErrNoXattr
+		}
+		resp.Xattr = []byte(f.File.UploadStatus())
+		return nil
+	}
 	return syscall.ENOSYS // we never implement this
 }
 
@@ -108,6 +115,10 @@ var _ fusefs.NodeGetxattrer = (*File)(nil)
 
 // Listxattr lists the extended attributes recorded for the node.
 func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+	if f.VFS().Opt.UploadStatus {
+		resp.Append(vfs.UploadStatusXattr)
+		return nil
+	}
 	return syscall.ENOSYS // we never implement this
 }
 
@@ -116,6 +127,9 @@ var _ fusefs.NodeListxattrer = (*File)(nil)
 // Setxattr sets an extended attribute with the given name and
 // value for the node.
 func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
+	if f.VFS().Opt.UploadStatus {
+		return syscall.EPERM
+	}
 	return syscall.ENOSYS // we never implement this
 }
 
@@ -125,6 +139,9 @@ var _ fusefs.NodeSetxattrer = (*File)(nil)
 //
 // If there is no xattr by that name, returns fuse.ErrNoXattr.
 func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
+	if f.VFS().Opt.UploadStatus {
+		return syscall.EPERM
+	}
 	return syscall.ENOSYS // we never implement this
 }
 
