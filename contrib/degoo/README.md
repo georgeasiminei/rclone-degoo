@@ -86,9 +86,9 @@ a live create request.
 The wizard suggests enabling the user service by default when the systemd user
 manager is available. Otherwise, mount manually in the foreground.
 It saves the account password encrypted with the selected vault key before
-offering startup. A supplied vault file is installed before login when known
-early. If the vault is created or selected later, the wizard asks you to sign
-in again after setup to enable automatic password recovery.
+offering startup. Importing a private `vault.json` is optional. Without one,
+the wizard asks privately for your chosen encryption password and confirmation
+before account login. Imported and installed vault keys are preserved.
 
 To stage an install without opening the wizard, pass `--binary` and
 `--no-wizard`:
@@ -112,9 +112,12 @@ creates `vault.json`, run `degoo-rc login` again to save encrypted account
 credentials for automatic login after refresh is rejected.
 
 The default install root is `~/.local/share/rclone-degoo`. Existing vaults can
-be imported using their folder ID and private `vault.json`. The encryption
-secret, optional salt, chunk size, and object cap must match the remote vault;
-local remote/cache paths are rewritten for this installation. Use
+be opened using their dedicated folder and encryption password, or imported
+with their private `vault.json`. Retain any custom encryption salt and format
+settings too. Without an imported configuration, the wizard checks encrypted
+remote content before using an existing folder. A failed or inconclusive check
+blocks setup. Local remote/cache paths in imports are rewritten for this
+installation. Use
 `degoo-rc backup-config` to retain the vault key privately outside the install
 directory while omitting account credentials.
 
@@ -152,9 +155,11 @@ backup untouched. Keep the backup until recovery and mount startup are
 complete. If you omit the option, the wizard offers an optional backup
 directory prompt; leave it blank for a normal installation.
 
-The wizard's successful folder listing checks Degoo account authentication,
-not whether the vault password can decrypt remote data; the retained
-`vault.json` supplies the original vault encryption settings.
+Account folder listing verifies Degoo authentication. The separate existing-vault
+check authenticates a bounded encrypted sample; it is not a complete integrity
+audit or proof that the provider returned the latest directory state. Keep
+configuration backups: full password-only remote bootstrap and verified latest
+version recovery for the planned storage format remain open acceptance gates.
 
 ## Defaults and use
 

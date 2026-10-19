@@ -228,9 +228,9 @@ After creating the vault configuration, add `--vault-config /private/vault.json`
 to save encrypted account credentials for automatic login after rejected
 renewal. Contained `degoo-rc login` supplies this option when its vault exists.
 The install wizard ensures the encrypted account credential is saved before
-offering to start the mount. An import supplied early is installed before
-login; a vault created or selected later requires another hidden password
-prompt after setup. Ordinary upgrades keep existing saved credentials.
+offering to start the mount. It installs an imported configuration or privately
+entered vault password before account login. Ordinary upgrades keep existing
+saved credentials.
 Accounts that cannot use email/password login need a Degoo-supported password
 login or separately provisioned refresh token; browser-token extraction is
 not provided.
@@ -316,6 +316,14 @@ The salt is optional. With no custom salt, use the same password and keep that
 setting absent on other machines. If a custom salt was used, it must also be
 preserved exactly. Mounting the same folder with different encryption settings
 does not migrate or decrypt its existing files.
+
+For guided setup without a saved configuration, run `degoo-rc install --wizard`.
+Leave the optional `vault.json` import blank, enter and confirm the encryption
+password privately, then choose a new or existing dedicated remote folder.
+Supply the original custom salt if one was used. Existing folders must pass a
+bounded read-only encryption check before binding; an apparently empty folder
+requires explicit initialization confirmation. This sample check does not
+replace a complete integrity audit or the planned remote recovery protocol.
 
 Pass `--settings /private/path/mount.json` for persistent cache, read, network,
 and verification settings; the file must be owner-private, just like the vault

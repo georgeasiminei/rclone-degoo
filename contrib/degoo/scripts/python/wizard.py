@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import getpass
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +47,8 @@ MAX_MOUNTINFO_LINES = 20000
 MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 MOUNT_STATE_TIMEOUT = 15.0
 MOUNT_STATE_POLL_INTERVAL = 0.25
+CHECK_VAULT_TIMEOUT = 120
+MAX_CHECK_VAULT_OUTPUT = 4096
 
 
 class WizardError(Exception):
@@ -1018,6 +1022,143 @@ def _ensure_connection(root: Path) -> tuple[int, list[dict[str, Any]]]:
     return 0, folders
 
 
+def _prompt_vault_secrets() -> tuple[str, str]:
+    """Read a new encryption password and optional existing-vault salt without echoing them."""
+    def hidden_prompt(label: str) -> str:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                return getpass.getpass(label)
+        except getpass.GetPassWarning:
+            raise WizardError("hidden vault secret entry requires a working terminal") from None
+
+    try:
+        password = hidden_prompt("Vault encryption password: ")
+        if not password:
+            raise WizardError("the vault encryption password cannot be empty")
+        confirmation = hidden_prompt("Repeat vault encryption password: ")
+        if password != confirmation:
+            raise WizardError("the vault encryption password entries do not match")
+        salt = hidden_prompt("Existing vault custom encryption salt (optional; leave blank for new/default vaults): ")
+        if salt:
+            salt_confirmation = hidden_prompt("Repeat existing vault custom encryption salt: ")
+            if salt != salt_confirmation:
+                raise WizardError("the vault salt entries do not match")
+    except EOFError:
+        raise WizardCancelled from None
+    return password, salt
+
+
+def _check_vault_candidate(root: Path, folder_id: str) -> str:
+    """Verify an encrypted object in a selected folder without exposing provider output."""
+    try:
+        folder_id = installer.validate_folder_id(folder_id)
+        cache_dir = installer.configured_cache_dir(root)
+        installer.check_directory(cache_dir, private=True)
+        installer.read_private_file(root / "config/auth.json")
+        installer.read_private_file(root / "config/vault.json")
+        installer.check_directory(root / "tmp", private=True)
+        binary = root / "bin/rclone"
+        installer.check_components(binary)
+        info = os.lstat(binary)
+    except (installer.InstallError, OSError):
+        raise WizardError("the installed vault or account configuration is unavailable or unsafe") from None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o022
+        or info.st_mode & 0o6000
+        or not info.st_mode & 0o100
+    ):
+        raise WizardError("the contained rclone executable is unsafe")
+    env = {
+        "HOME": str(installer.home_directory()),
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_CACHE_HOME": str(cache_dir),
+        "TMPDIR": str(root / "tmp"),
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+    }
+    command = [
+        str(binary),
+        "--config",
+        str(root / "config/rclone.conf"),
+        "--log-level",
+        "ERROR",
+        "degoo",
+        "check-vault",
+        str(root / "config/auth.json"),
+        "--vault-config",
+        str(root / "config/vault.json"),
+        "--folder-id",
+        folder_id,
+    ]
+    try:
+        with tempfile.TemporaryFile(dir=root / "tmp") as output, tempfile.TemporaryFile(dir=root / "tmp") as error:
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=error,
+                env=env,
+                timeout=CHECK_VAULT_TIMEOUT,
+                check=False,
+                umask=0o077,
+            )
+            output.seek(0)
+            raw = output.read(MAX_CHECK_VAULT_OUTPUT + 1)
+    except subprocess.TimeoutExpired:
+        raise WizardError("the selected remote vault check timed out; no folder was bound") from None
+    except OSError:
+        raise WizardError("the selected remote vault check could not start; no folder was bound") from None
+    if result.returncode != 0:
+        raise WizardError(
+            "the selected remote folder was not verified; the vault password or salt may not match, or "
+            "account/provider access may have failed. No folder was bound. Verify the private configuration at "
+            f"{root / 'config/vault.json'}, check connectivity, run {_degoo_rc(root, 'login')} to save account "
+            "credentials with the current vault key, then rerun the wizard"
+        )
+    if len(raw) > MAX_CHECK_VAULT_OUTPUT:
+        raise WizardError("the vault check returned an unrecognized result; no folder was bound")
+    try:
+        response = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        raise WizardError("the vault check returned an unrecognized result; no folder was bound") from None
+    status = response.get("status") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or set(response) != {"status"} or not isinstance(status, str) or status not in {"empty", "verified"}:
+        raise WizardError("the vault check returned an unrecognized result; no folder was bound")
+    return status
+
+
+def _confirm_empty_folder(folder_id: str, *, input_fn: Callable[[str], str]) -> None:
+    print(
+        "No encrypted content was available to verify the password. A provider listing can omit stale entries, "
+        "so this does not prove the folder has never held a vault."
+    )
+    if not _yes_no(f"Initialize this apparently empty dedicated folder (ID {folder_id}) with the selected vault secret?", default=False, input_fn=input_fn):
+        raise WizardError("the apparently empty remote folder was not bound")
+
+
+def _verify_folder_for_binding(
+    root: Path,
+    folder_id: str,
+    *,
+    created: bool,
+    input_fn: Callable[[str], str],
+) -> None:
+    status = _check_vault_candidate(root, folder_id)
+    if created and status != "empty":
+        raise WizardError("the newly created folder unexpectedly contains a verified vault; no folder was bound")
+    if status == "empty":
+        if not created:
+            _confirm_empty_folder(folder_id, input_fn=input_fn)
+        else:
+            print("The newly created dedicated folder is empty and will be initialized as this vault.")
+        return
+    print("An encrypted object in the selected folder authenticated with these vault settings; full remote integrity was not checked.")
+
+
 def _choose_folder_name(root: Path, parent_id: str, name: str, import_path: str | None, *, input_fn: Callable[[str], str]) -> tuple[str | None, str, str | None]:
     try:
         folders = connection.list_folders(root, parent_id)
@@ -1035,11 +1176,9 @@ def _choose_folder_name(root: Path, parent_id: str, name: str, import_path: str 
                 if _yes_no("Use this existing directory with the imported vault configuration?", default=True, input_fn=input_fn):
                     return folder["id"], name, import_path
             else:
-                print("To reopen an encrypted vault, supply its matching private vault configuration or restore its backup.")
-                path = _prompt("Private vault.json for this existing folder (leave blank to choose another name)", "", input_fn=input_fn) or None
-                if path:
-                    _imported_settings(path, root)
-                    return folder["id"], name, path
+                print("The selected vault password and optional salt will be checked against an encrypted object before binding.")
+                if _yes_no("Check and use this existing directory?", default=False, input_fn=input_fn):
+                    return folder["id"], name, None
             name = setup._validate_name(_prompt("Name for a different new vault folder", name + "-new", input_fn=input_fn))
             confirmed = True
         else:
@@ -1296,6 +1435,10 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
         raise WizardError("an existing vault secret is already installed; it cannot be replaced during upgrade")
     if configured_folder_id and installed_vault is None and imported is None:
         raise WizardError("this install is bound to a remote vault but its secret is missing; import the matching private vault.json")
+    vault_password = None
+    vault_password_salt = None
+    if installed_vault is None and imported is None:
+        vault_password, vault_password_salt = _prompt_vault_secrets()
 
     print("Step 2 of 6: Choose the mount directory and set local cache and vault sizing.")
     mountpoint = _choose_mountpoint(
@@ -1320,6 +1463,9 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
         staged_args.folder_name = requested_folder_name
     if vault_imported_before_login:
         staged_args.vault_config = import_path
+    if vault_password is not None:
+        staged_args.vault_password = vault_password
+        staged_args.vault_password_salt = vault_password_salt
     try:
         try:
             result = installer.install(staged_args)
@@ -1402,38 +1548,86 @@ def _run(args: argparse.Namespace, *, input_fn: Callable[[str], str]) -> int:
             parent_id = _select_parent(folders, input_fn=input_fn)
             folder_id, folder_name, import_path = _choose_folder_name(
                 root, parent_id, folder_name or DEFAULT_FOLDER_NAME, import_path, input_fn=input_fn)
-            if folder_id and import_path:
-                vault_sizes = None
 
+        vault_config = None if vault_imported_before_login else import_path
         if folder_id:
+            if not (vault_imported_before_login or import_path):
+                try:
+                    _verify_folder_for_binding(root, folder_id, created=False, input_fn=input_fn)
+                except WizardError:
+                    _completion_summary(
+                        root,
+                        mount_ready=mount_ready,
+                        systemd_available=systemd_available,
+                        note="Vault verification did not complete; no remote folder binding or mount startup was attempted.",
+                    )
+                    raise
             setup_args = argparse.Namespace(
                 root=str(root),
                 folder_id=folder_id,
                 parent_id=None,
                 name=folder_name,
-                vault_config=None if vault_imported_before_login else import_path,
+                vault_config=vault_config,
             )
+            try:
+                setup_result = setup.run(setup_args)
+            except setup.SetupError:
+                _completion_summary(
+                    root,
+                    mount_ready=mount_ready,
+                    systemd_available=systemd_available,
+                    note=(
+                        "Vault folder setup did not complete; inspect "
+                        f"{_degoo_rc(root, 'info')} and retry with {_degoo_rc(root, 'setup', 'help')}."
+                    ),
+                )
+                raise
         else:
-            setup_args = argparse.Namespace(
-                root=str(root),
-                folder_id=None,
-                parent_id=parent_id,
-                name=folder_name,
-                vault_config=None if vault_imported_before_login else import_path,
-            )
-        try:
-            setup_result = setup.run(setup_args)
-        except setup.SetupError:
-            _completion_summary(
-                root,
-                mount_ready=mount_ready,
-                systemd_available=systemd_available,
-                note=(
-                    "Vault folder setup did not complete; inspect "
-                    f"{_degoo_rc(root, 'info')} and retry with {_degoo_rc(root, 'setup', 'help')}."
-                ),
-            )
-            raise
+            try:
+                folder_id = setup._run_create(root, parent_id, folder_name)
+                _verify_folder_for_binding(root, folder_id, created=True, input_fn=input_fn)
+            except (setup.SetupError, WizardError) as exc:
+                _completion_summary(
+                    root,
+                    mount_ready=mount_ready,
+                    systemd_available=systemd_available,
+                    note="Vault folder creation or verification did not complete; the folder was not bound or mounted.",
+                )
+                if folder_id:
+                    retry_command = _degoo_rc(
+                        root,
+                        "install",
+                        "--wizard",
+                        "--folder-id",
+                        folder_id,
+                        "--folder-name",
+                        folder_name,
+                    )
+                    raise WizardError(
+                        f"new folder ID {folder_id} remains unbound. Correct the private vault configuration "
+                        f"if needed, then retry with {retry_command}. {exc}"
+                    ) from None
+                raise WizardError(str(exc)) from None
+            try:
+                setup_result = setup._finish_install(
+                    root,
+                    folder_id,
+                    folder_name,
+                    created=True,
+                    vault_config=vault_config,
+                    parent_folder_id=parent_id,
+                )
+            except setup.SetupError:
+                _completion_summary(
+                    root,
+                    mount_ready=mount_ready,
+                    systemd_available=systemd_available,
+                    note=(
+                        "Vault folder setup did not complete; inspect "
+                        f"{_degoo_rc(root, 'info')} and retry with {_degoo_rc(root, 'setup', 'help')}."
+                    ),
+                )
+                raise
         if setup_result != 0:
             _completion_summary(
                 root,
