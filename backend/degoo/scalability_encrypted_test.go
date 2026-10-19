@@ -207,6 +207,7 @@ type encryptedChunkerStackOptions struct {
 	HashType     string
 	Transactions string
 	FailHard     bool
+	RmdirCleanup bool
 	WrapHandler  func(http.Handler) http.Handler
 }
 
@@ -244,6 +245,7 @@ func newEncryptedChunkerStack(t *testing.T, mock *mockDegoo, options encryptedCh
 		"auth_file":      base.opt.AuthFile,
 		"rest_url":       base.opt.RESTURL,
 		"root_folder_id": base.opt.RootFolderID,
+		"rmdir_cleanup":  fmt.Sprint(options.RmdirCleanup),
 	}).String() + ":"
 	cryptRemote := ":crypt," + (configmap.Simple{
 		"remote":              degooRemote,
@@ -252,14 +254,15 @@ func newEncryptedChunkerStack(t *testing.T, mock *mockDegoo, options encryptedCh
 		"filename_encryption": "standard",
 	}).String() + ":"
 	wrapped, err := chunker.NewFs(context.Background(), "scalability-chunker", "", configmap.Simple{
-		"remote":       cryptRemote,
-		"chunk_size":   "128B",
-		"name_format":  "*.rclone_chunk.###",
-		"start_from":   "1",
-		"meta_format":  "simplejson",
-		"hash_type":    options.HashType,
-		"transactions": options.Transactions,
-		"fail_hard":    fmt.Sprint(options.FailHard),
+		"remote":        cryptRemote,
+		"chunk_size":    "128B",
+		"name_format":   "*.rclone_chunk.###",
+		"start_from":    "1",
+		"meta_format":   "simplejson",
+		"hash_type":     options.HashType,
+		"transactions":  options.Transactions,
+		"fail_hard":     fmt.Sprint(options.FailHard),
+		"rmdir_cleanup": fmt.Sprint(options.RmdirCleanup),
 	})
 	if err != nil {
 		t.Fatalf("chunker.NewFs over crypt: %v", err)

@@ -70,6 +70,36 @@ run for that follow-up. See [VALIDATION.md](VALIDATION.md).
 
 ## Implementation decisions and validation plan
 
+### Directory deletion after interrupted uploads (2026-10-19)
+
+An empty-looking mounted directory failed `rmdir` with `EIO` because the raw
+backend still held an encrypted orphan chunk and an unpublished staged
+manifest alongside its directory marker. All three provider records used
+category 0; the setup folder helper omits this category and cannot diagnose
+these remnants. Deleting a queued dirty file already cancels its VFS upload;
+the missing behavior was cleanup below the logical directory view.
+
+The contained mount enables `rmdir_cleanup` on both chunker and Degoo.
+Chunker checks the logical directory is empty, validates every remaining
+wrapped entry as a recognized chunk, and removes those orphan chunks. Degoo
+uses fresh raw listings, accepts validated directory markers, and removes
+properly named unpublished staged uploads before removing the directory.
+Each layer validates its complete listing before its own cleanup begins;
+visible or unrecognized entries stop that cleanup. Cleanup errors remain
+errors, and remote objects go to the recycle bin rather than permanent deletion.
+
+Both cleanup options default to false outside the contained mount and require
+an exclusive writer. Per-filesystem mutation barriers prevent cleanup while
+an overlapping upload or mutation is active and prevent new overlapping work
+during cleanup. They do not coordinate separate clients or processes. This
+preserves the generic chunker default and adds no provider-specific VFS logic.
+The ordinary Linux contract remains: `rmdir` rejects visible clean or dirty
+files; `rm -r` removes them and cancels queued writeback. The remote format,
+encryption parameters and cache identity are unchanged; no reset is needed.
+
+Validation and live deployment results are recorded in
+[VALIDATION.md](VALIDATION.md).
+
 ### Durable allocation and adaptive placement experiments (2026-10-15)
 
 Continue from merged PR #48 using test-only models before P3-FORMAT. Persist

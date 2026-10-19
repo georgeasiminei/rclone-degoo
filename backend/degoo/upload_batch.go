@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/rclone/rclone/backend/degoo/api"
+	"github.com/rclone/rclone/fs"
 )
 
 const (
@@ -58,8 +60,9 @@ type uploadBatchCoordinator struct {
 }
 
 type pathLockManager struct {
-	mu    sync.Mutex
-	locks map[string]*pathLock
+	mu       sync.Mutex
+	locks    map[string]*pathLock
+	removing map[string]bool
 }
 
 type pathLock struct {
@@ -73,6 +76,12 @@ func newPathLockManager() *pathLockManager {
 
 func (m *pathLockManager) acquire(ctx context.Context, remote string) (func(), error) {
 	m.mu.Lock()
+	for dir := range m.removing {
+		if pathsOverlap(dir, remote) {
+			m.mu.Unlock()
+			return nil, errors.New("degoo: directory removal is in progress")
+		}
+	}
 	lock := m.locks[remote]
 	if lock == nil {
 		lock = &pathLock{semaphore: make(chan struct{}, 1)}
@@ -91,6 +100,34 @@ func (m *pathLockManager) acquire(ctx context.Context, remote string) (func(), e
 		m.releaseRef(remote, lock)
 		return nil, ctx.Err()
 	}
+}
+
+func pathsOverlap(a, b string) bool {
+	return a == b || a == "" || b == "" || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+func (m *pathLockManager) beginDirectoryRemoval(dir string) (func(), error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for remote := range m.locks {
+		if pathsOverlap(dir, remote) {
+			return nil, fs.ErrorDirectoryNotEmpty
+		}
+	}
+	for removing := range m.removing {
+		if pathsOverlap(dir, removing) {
+			return nil, fs.ErrorDirectoryNotEmpty
+		}
+	}
+	if m.removing == nil {
+		m.removing = make(map[string]bool)
+	}
+	m.removing[dir] = true
+	return func() {
+		m.mu.Lock()
+		delete(m.removing, dir)
+		m.mu.Unlock()
+	}, nil
 }
 
 func (m *pathLockManager) acquireMany(ctx context.Context, remotes ...string) (func(), error) {

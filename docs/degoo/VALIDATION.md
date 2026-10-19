@@ -8,6 +8,57 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Directory removal after interrupted uploads — 2026-10-19
+
+A live `rmdir` reproduced `Input/output error`, with the mount recording
+`Dir.Remove failed to remove directory: directory not empty`. Four generated
+create/delete/rmdir attempts succeeded while uploads were running, so deleting
+a dirty file alone was not a reproducer. A bounded read-only raw inspection
+of the affected directory found a category-0 directory marker, a 32-byte
+encrypted orphan chunk, and a 143-byte unpublished staged object. The folder
+setup helper omitted all three category-0 records. A fresh query of the
+zero-byte internal marker's children succeeded and returned an empty list.
+
+The generated encrypted-stack regression reproduces this exact shape without
+credentials. It failed before chunker cleanup was implemented and passes with
+both cleanup layers enabled. Raw-backend fixtures separately reproduced
+orphan-marker and abandoned-stage failures before their fixes. Tests cover
+normal clean recursive deletion, dirty queued cancellation across remount,
+visible-content refusal, active-upload exclusion, mutation barriers, malformed
+internal names, nested data below an internal placeholder, delete failures,
+listing failures, and unchanged standalone chunker defaults.
+
+Offline validation passed:
+
+- `go build` with a fresh executable on `PATH` for subprocess tests.
+- `RCLONE_CONFIG=/notfound go test -timeout 20m ./...`: all 195 tested packages.
+- Scoped package tests and `go test -race` for chunker, Degoo, its API/auth
+  and internal packages, and `cmd/degoo`.
+- `go vet` and golangci-lint on those packages; lint reported zero issues.
+- `go test ./cmd/degoo -run '^TestVaultNativeDirectoryRemoval$'
+  -degoo-fuse-test -count=1`: real local FUSE deletion of queued dirty data,
+  nonempty-directory refusal, and cleanup of a hidden encrypted orphan chunk.
+- Packaging self-check, Markdown lint and `git diff --check`.
+
+Initial scoped and race command tests hit the existing Unix-socket path limit
+when `TMPDIR` included the validation directory name. The failing socket tests
+passed with `TMPDIR=/tmp`; the full suite and final command race run used that
+normal short temporary path. No storage format, encryption setting or cache
+identity changed, and no reset was performed.
+
+The candidate was packaged from commit `d44a3d744` and transferred to the
+affected host for the ordinary contained updater. Its initial preflight
+refused an unsafe generated Python bytecode cache; only owned regular `.pyc`
+files and that generated directory were removed before retry. The retry
+verified the package and flushed cached writes, but normal FUSE unmount was
+blocked by a user's Bash working directory inside the mount. The update
+stopped without replacing the running program. The mounted service remained
+active with four uploads and all 335 pending files retained at that check.
+Vault configuration, cache location and cache identity hashes were unchanged.
+Live verification of the patched mount remains pending until that terminal
+leaves the mount and the update can be retried; no forced or lazy unmount was
+attempted. This is a deployment prerequisite, not a failed deletion regression.
+
 ## Uninstall with a missing unused cache directory — 2026-10-19
 
 An installation using an external `cache_dir` failed before the uninstall

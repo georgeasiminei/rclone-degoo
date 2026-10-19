@@ -542,7 +542,7 @@ func mountRawConfig(remote string, verify bool, credentialsFile ...string) (*rfs
 	if fsInfo.Name != "degoo" {
 		return nil, "", "", nil, errors.New("mount remote must be a configured Degoo remote")
 	}
-	overrides := configmap.Simple{"skip_upload_verification": strconv.FormatBool(!verify)}
+	overrides := configmap.Simple{"skip_upload_verification": strconv.FormatBool(!verify), "rmdir_cleanup": "true"}
 	if len(credentialsFile) != 0 && credentialsFile[0] != "" {
 		overrides["credentials_file"] = credentialsFile[0]
 	}
@@ -616,7 +616,7 @@ func newStack(ctx context.Context, base rfs.Fs, c *VaultConfig) (rfs.Fs, error) 
 		return nil, err
 	}
 	cache.Put(name+"-crypt:", cf)
-	chunkConfig := configmap.Simple{"remote": name + "-crypt:", "chunk_size": fmt.Sprintf("%dB", int64(c.ChunkSize)), "name_format": "*.rclone_chunk.###", "start_from": "1", "meta_format": "simplejson", "hash_type": "sha1all", "transactions": "norename", "fail_hard": "true"}
+	chunkConfig := configmap.Simple{"remote": name + "-crypt:", "chunk_size": fmt.Sprintf("%dB", int64(c.ChunkSize)), "name_format": "*.rclone_chunk.###", "start_from": "1", "meta_format": "simplejson", "hash_type": "sha1all", "transactions": "norename", "fail_hard": "true", "rmdir_cleanup": "true"}
 	return chunker.NewFs(ctx, name, "", chunkConfig)
 }
 

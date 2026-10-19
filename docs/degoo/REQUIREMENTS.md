@@ -108,6 +108,10 @@ instead of weakening password-only recovery.
   equivalent Linux mechanism. The rclone-based approach is recommended below.
 - Mounted paths should behave like ordinary files for common operations:
   create, read, update, make directories, rename, and delete.
+- Keep standard Linux directory deletion: `rm -r` removes visible contents,
+  including pending dirty files, while `rmdir` rejects visible contents. A
+  directory containing only abandoned internal upload objects must be
+  removable once its active writes have been cancelled or completed.
 - The mounted view must transparently decrypt files for local applications.
 - Preserve enough remote metadata to reopen files after unmounting, remounting,
   or restarting the client.
