@@ -456,6 +456,70 @@ class UninstallTest(unittest.TestCase):
         self.assertFalse(cache_data.exists())
         self.assertEqual(sibling_file.read_bytes(), b"unrelated generated data")
 
+    def test_external_cache_works_without_unused_contained_cache_directory(self) -> None:
+        cache = self.base / "external-cache"
+        self.set_external_cache(cache)
+        cache_name = restore._cache_name()
+        pending = self.add_cache_file("pending.bin", b"pending payload", cache=cache)
+        pending_meta = cache / "vfsMeta" / cache_name / "pending.bin"
+        identity = cache / f"{cache_name}.identity"
+        expected = {
+            "identity": identity.read_bytes(),
+            "pending": pending.read_bytes(),
+            "metadata": pending_meta.read_bytes(),
+        }
+        self.assertTrue((self.root / "cache").is_dir())
+        (self.root / "cache").rmdir()
+
+        code, stdout, stderr = self.invoke()
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["mode"], "inventory")
+        self.assertEqual(identity.read_bytes(), expected["identity"])
+        self.assertEqual(pending.read_bytes(), expected["pending"])
+        self.assertEqual(pending_meta.read_bytes(), expected["metadata"])
+
+        destination = self.base / "retained-external-cache-without-legacy-dir"
+        self.write_rclone("Pending local uploads: 1 files, 15 bytes")
+        with mock.patch.object(uninstall, "read_mountpoints", return_value=set()):
+            code, stdout, stderr = self.invoke(
+                "--delete-local", "--keep-config", "--keep-cache", "--keep-directory", str(destination)
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("were preserved in", stdout)
+        retained_cache = destination / "cache"
+        self.assertEqual((retained_cache / f"{cache_name}.identity").read_bytes(), expected["identity"])
+        self.assertEqual((retained_cache / "vfs" / cache_name / "pending.bin").read_bytes(), expected["pending"])
+        self.assertEqual((retained_cache / "vfsMeta" / cache_name / "pending.bin").read_bytes(), expected["metadata"])
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(sorted(path.name for path in cache.iterdir()), [f"{cache_name}.lock"])
+        self.assertFalse(self.root.exists())
+
+    def test_external_cache_still_rejects_symlink_at_missing_contained_cache_path(self) -> None:
+        cache = self.base / "external-cache"
+        self.set_external_cache(cache)
+        outside = self.base / "outside-cache-data"
+        outside.mkdir(mode=0o700)
+        (self.root / "cache").rmdir()
+        (self.root / "cache").symlink_to(outside, target_is_directory=True)
+
+        code, _, stderr = self.invoke()
+
+        self.assertEqual(code, 2)
+        self.assertIn("symlink path components are not allowed", stderr)
+        self.assertTrue((self.root / "cache").is_symlink())
+        self.assertTrue(outside.is_dir())
+        self.assertTrue(cache.is_dir())
+
+    def test_missing_configured_contained_cache_is_still_rejected(self) -> None:
+        (self.root / "cache").rmdir()
+
+        code, _, stderr = self.invoke()
+
+        self.assertEqual(code, 2)
+        self.assertIn("a required path is missing", stderr)
+        self.assertTrue(self.root.exists())
+
     def test_cache_cleanup_refuses_an_unknown_file_added_after_audit(self) -> None:
         cache = self.base / "external cache"
         self.set_external_cache(cache)

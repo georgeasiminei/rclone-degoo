@@ -8,6 +8,33 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Uninstall with a missing unused cache directory — 2026-10-19
+
+An installation using an external `cache_dir` failed before the uninstall
+wizard's first prompt because layout validation required the unused contained
+`cache/` directory. Layout validation now resolves the configured path first
+and permits only the unused contained directory to be absent. A present
+contained path is still checked, and a missing configured contained cache
+remains a refusal. Ownership, private permissions, symlink checks, cache
+identity and pending-write retention remain enforced.
+
+Generated fixtures reproduce the original failure and exercise read-only
+inventory plus removal with retained pending bytes and recovery metadata.
+The retained payload, VFS metadata and identity bytes match exactly. Additional
+cases reject a substituted symlink and the missing configured contained cache.
+All 70 focused uninstall tests and all 499 Python helper tests pass. Python
+compilation, Markdown lint on three changed documents, 57 relative targets
+and diff checks pass. No Go source is changed.
+
+On the affected host, restoring an empty unused contained directory made its
+older installed helper usable. The owned external cache was empty; its root
+permissions were restricted to `0700`, and the failing user service was stopped
+without changing enablement. Read-only inventory and cache safety inspection
+then passed. The wizard reached its first retention prompt and was cancelled
+before any retention or deletion choice; the vault configuration hash remained
+unchanged. Configuration and cache contents were preserved; no Degoo request
+or remote-data operation was needed.
+
 ## Optional vault import and chosen encryption password — 2026-10-19
 
 A fresh wizard installation accepts a chosen encryption password without a

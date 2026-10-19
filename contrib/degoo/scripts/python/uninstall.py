@@ -216,7 +216,7 @@ def _validate_manifest(root: Path) -> dict[str, Any]:
 def _validate_layout(root: Path) -> dict[str, Any]:
     """Check the fixed install layout, private configs, and manifest."""
     _check_directory(root, private=True)
-    for name in ("bin", "config", "cache", "mount", "tools", "tmp", "logs"):
+    for name in ("bin", "config", "mount", "tools", "tmp", "logs"):
         _check_directory(root / name)
 
     manifest = _validate_manifest(root)
@@ -246,6 +246,9 @@ def _validate_layout(root: Path) -> dict[str, Any]:
         cache_dir = installer.configured_cache_dir(root)
     except installer.InstallError as exc:
         raise CleanupError(str(exc)) from None
+    contained_cache = root / "cache"
+    if cache_dir == contained_cache or os.path.lexists(contained_cache):
+        _check_directory(contained_cache)
     if vault is not None:
         if type(vault.get("version")) is not int or vault["version"] != 1 or vault.get("remote") != f"{REMOTE_NAME}:":
             raise CleanupError("the vault configuration does not match this install")
