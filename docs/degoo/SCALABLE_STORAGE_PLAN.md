@@ -897,3 +897,18 @@ shipping local-only authority would violate the explicit recovery requirement.
   195-package offline Go suite, scoped race/vet/lint and documentation checks
   pass. Evidence and the staged-install resume correction are recorded in
   [VALIDATION.md](VALIDATION.md).
+
+### 2026-10-19 — cleanup with an absent unused contained cache
+
+- Uninstall layout validation now permits the unused contained `cache/` to be
+  absent when `cache_dir` points elsewhere. The configured cache retains its
+  existing identity, private-permission, namespace and retention safeguards;
+  present contained paths remain validated and symlinks remain refused.
+- Generated regression fixtures cover inventory and retention of pending
+  bytes, VFS metadata and cache identity without that legacy directory. An
+  affected older installation passed inventory after a compatibility repair;
+  its empty external cache and configuration contents were preserved and its
+  failing user service was stopped. No provider operation was performed.
+- This is maintenance behavior only and changes no storage format or recovery
+  gate. All 499 Python helper tests, compilation and documentation checks
+  pass. Validation details are in [VALIDATION.md](VALIDATION.md).
