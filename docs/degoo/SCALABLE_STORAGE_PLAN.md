@@ -917,8 +917,10 @@ shipping local-only authority would violate the explicit recovery requirement.
 
 - Owner: coordinating Codex agent with delegated chunker implementation and
   deletion regression tests. Branch: `fix/degoo-directory-removal`, based on
-  `origin/staging`. This fixes the active legacy mount and does not select a
-  new format or close the storage-redesign acceptance gates.
+  `origin/staging`. Delivery: [PR #59](https://github.com/georgeasiminei/rclone-degoo/pull/59),
+  targeting `staging` and awaiting the user's merge. This fixes the active
+  legacy mount and does not select a new format or close the storage-redesign
+  acceptance gates.
 - Live inspection reproduced an empty-looking directory's `rmdir` failure
   and identified hidden category-0 upload remnants. The native mount enables
   opt-in cleanup at the chunker and raw Degoo layers, with local mutation
@@ -929,3 +931,8 @@ shipping local-only authority would violate the explicit recovery requirement.
   FUSE deletion regression, packaging self-check and documentation checks
   pass. No format/cache reset or reseeding is needed. Evidence and the
   temporary-socket-path rerun are recorded in [VALIDATION.md](VALIDATION.md).
+- The verified candidate's live update is blocked at normal unmount by a
+  user's shell working inside the mount. The old runtime remains active;
+  configuration, cache identity and pending writes are preserved. Next action:
+  leave the mounted working directory, retry the contained update, and verify
+  the originally failing `rmdir` through the patched mount.

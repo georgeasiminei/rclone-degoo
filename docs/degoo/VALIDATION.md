@@ -46,6 +46,19 @@ passed with `TMPDIR=/tmp`; the full suite and final command race run used that
 normal short temporary path. No storage format, encryption setting or cache
 identity changed, and no reset was performed.
 
+The candidate was packaged from commit `d44a3d744` and transferred to the
+affected host for the ordinary contained updater. Its initial preflight
+refused an unsafe generated Python bytecode cache; only owned regular `.pyc`
+files and that generated directory were removed before retry. The retry
+verified the package and flushed cached writes, but normal FUSE unmount was
+blocked by a user's Bash working directory inside the mount. The update
+stopped without replacing the running program. The mounted service remained
+active with four uploads and all 335 pending files retained at that check.
+Vault configuration, cache location and cache identity hashes were unchanged.
+Live verification of the patched mount remains pending until that terminal
+leaves the mount and the update can be retried; no forced or lazy unmount was
+attempted. This is a deployment prerequisite, not a failed deletion regression.
+
 ## Uninstall with a missing unused cache directory — 2026-10-19
 
 An installation using an external `cache_dir` failed before the uninstall
