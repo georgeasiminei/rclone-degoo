@@ -373,31 +373,28 @@ func (cr *parallel) Seek(offset int64, whence int) (int64, error) {
 		return cr.offset, nil
 	}
 
-	cr.offset = newOffset
-
-	// Ditch out of range streams
-	for len(cr.streams) > 0 {
-		stream := cr.streams[0]
-		if newOffset >= stream.offset+stream.size {
-			_ = cr._popStream()
-		} else {
-			break
-		}
+	// Find the stream containing the new offset without discarding the
+	// current streams until the seek can be completed.
+	streamIndex := 0
+	for streamIndex < len(cr.streams) && newOffset >= cr.streams[streamIndex].offset+cr.streams[streamIndex].size {
+		streamIndex++
 	}
 
-	// If no streams remain we can just restart
-	if len(cr.streams) == 0 {
+	// If no streams contain the new offset we can just restart there.
+	if streamIndex == len(cr.streams) {
+		_ = cr._popStreams()
+		cr.offset = newOffset
 		fs.Debugf(cr.o, "parallel chunked reader: no streams remain")
 		cr.endStream = cr.offset
 		return cr.offset, nil
 	}
 
-	// Current stream
-	stream := cr.streams[0]
+	stream := cr.streams[streamIndex]
 
-	// If new offset is before current stream then ditch all the streams
+	// If the new offset is before the first stream then restart there.
 	if newOffset < stream.offset {
 		_ = cr._popStreams()
+		cr.offset = newOffset
 		fs.Debugf(cr.o, "parallel chunked reader: new offset is before current stream - ditch all")
 		cr.endStream = cr.offset
 		return cr.offset, nil
@@ -405,7 +402,6 @@ func (cr *parallel) Seek(offset int64, whence int) (int64, error) {
 
 	// Seek the current stream
 	streamOffset := newOffset - stream.offset
-	stream.readBytes = streamOffset // correct read value
 	fs.Debugf(cr.o, "parallel chunked reader: seek the current stream to %d", streamOffset)
 	// Wait for the read to the correct part of the data
 	for stream.rw.Size() < streamOffset {
@@ -431,6 +427,13 @@ func (cr *parallel) Seek(offset int64, whence int) (int64, error) {
 	if err != nil {
 		return cr.offset, fmt.Errorf("parallel chunked reader: failed to seek stream: %w", err)
 	}
+
+	// Discard streams before the target only after its buffer is ready.
+	for i := 0; i < streamIndex; i++ {
+		_ = cr._popStream()
+	}
+	stream.readBytes = streamOffset
+	cr.offset = newOffset
 
 	return cr.offset, nil
 }

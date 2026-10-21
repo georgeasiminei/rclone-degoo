@@ -128,6 +128,81 @@ func TestParallelUnexpectedEOF(t *testing.T) {
 	assert.NoError(t, cr.Close())
 }
 
+func TestParallelSeekFailurePreservesPosition(t *testing.T) {
+	const size = 2 * multipart.BufferSize
+	payload := []byte("short response")
+	o := &customOpenObject{
+		ContentMockObject: mockobject.New("test.bin").WithContent(make([]byte, size), mockobject.SeekModeNone),
+		openFn: func(context.Context, ...fs.OpenOption) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(payload)), nil
+		},
+	}
+	cr := New(context.Background(), o, multipart.BufferSize, 0, 2)
+	_, err := cr.Open()
+	require.NoError(t, err)
+	parallelReader := cr.(*parallel)
+	select {
+	case <-parallelReader.streams[0].done:
+	case <-time.After(time.Second):
+		t.Fatal("stream did not finish its short response")
+	}
+
+	offset, err := cr.Seek(100, io.SeekStart)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Equal(t, int64(0), offset)
+	assert.Equal(t, int64(0), parallelReader.offset)
+	assert.Equal(t, int64(0), parallelReader.streams[0].readBytes)
+
+	buf := make([]byte, len(payload)+1)
+	n, err := cr.Read(buf)
+	assert.Equal(t, payload, buf[:n])
+	assert.Equal(t, len(payload), n)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Equal(t, int64(len(payload)), parallelReader.offset)
+	assert.NoError(t, cr.Close())
+}
+
+func TestParallelSeekFailureKeepsEarlierStream(t *testing.T) {
+	const size = 2 * multipart.BufferSize
+	short := []byte("short second stream")
+	o := &customOpenObject{
+		ContentMockObject: mockobject.New("test.bin").WithContent(make([]byte, size), mockobject.SeekModeNone),
+		openFn: func(_ context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+			for _, option := range options {
+				if rangeOption, ok := option.(*fs.RangeOption); ok && rangeOption.Start >= multipart.BufferSize {
+					return io.NopCloser(bytes.NewReader(short)), nil
+				}
+			}
+			return io.NopCloser(bytes.NewReader(make([]byte, multipart.BufferSize))), nil
+		},
+	}
+	cr := New(context.Background(), o, multipart.BufferSize, 0, 2)
+	_, err := cr.Open()
+	require.NoError(t, err)
+	parallelReader := cr.(*parallel)
+	for _, stream := range parallelReader.streams {
+		select {
+		case <-stream.done:
+		case <-time.After(time.Second):
+			t.Fatal("stream did not finish")
+		}
+	}
+
+	offset, err := cr.Seek(multipart.BufferSize+100, io.SeekStart)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Equal(t, int64(0), offset)
+	assert.Equal(t, int64(0), parallelReader.offset)
+	assert.Len(t, parallelReader.streams, 2)
+	assert.Equal(t, int64(0), parallelReader.streams[0].offset)
+
+	buf := make([]byte, 1)
+	n, err := cr.Read(buf)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.Equal(t, byte(0), buf[0])
+	assert.NoError(t, cr.Close())
+}
+
 func TestParallelReadCancellationAndClose(t *testing.T) {
 	const size = 2 * multipart.BufferSize
 	ctx, cancel := context.WithCancel(context.Background())
