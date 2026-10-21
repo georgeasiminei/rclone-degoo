@@ -17,18 +17,28 @@ After each operation, wait for writeback before starting the next one:
 3. Prune the selected archive set and drain uploads.
 4. Compact the repository and drain uploads before reporting success.
 
-For the contained Degoo mount, use `degoo-rc wait --timeout 7200`. This command
-reads aggregate local statistics and the private provider cooldown record. It
-does not send requests to Degoo. A timeout, missing runtime service, unsafe
-cooldown record or unknown upload state is a failure, never an empty queue.
-Writes from other applications are not excluded by this command.
+For the contained Degoo mount, use `degoo-rc wait --timeout 7200 --json`. This
+command reads aggregate local statistics and the private provider cooldown
+record. It does not send requests to Degoo. A timeout, missing runtime service,
+unsafe cooldown record or unknown upload state is a failure, never an empty
+queue. Writes from other applications are not excluded by this command.
 
 A generic rclone mount can expose queue statistics through its private RC
-service. For an older mount without that service, a backup-specific waiter may
-inspect its persisted VFS metadata after Borg exits and closes every handle.
-It must use the actual configured cache, reject invalid records and unsafe
-paths, and require repeated idle samples. This does not establish that a
-concurrently running application has closed its own writes.
+service. For the older Google Drive mount without that service, the deployed
+Immich backup script uses a read-only waiter over the configured VFS metadata
+after Borg exits and closes every handle. The current cache base is
+`/data/gdrive-rclone-cache`; the waiter validates the expected data and
+metadata roots and requires two unchanged, clean metadata scans. It accepts
+owner-owned regular metadata files without group/world write or special mode
+bits (including rclone 1.60's `0644` files) inside owner-private directories.
+Invalid JSON, unsafe paths, or files that change during scanning fail closed.
+This does not establish that a concurrently running application has closed
+its own writes.
+
+The deployed Immich script drains uploads before and after each Borg phase. It
+allows at most one retry for eligible `info` or `compact` transient I/O
+failures after writeback is confirmed; it never retries `create` or `prune`,
+and it does not run `borg break-lock` automatically.
 
 ## Failures and recovery
 

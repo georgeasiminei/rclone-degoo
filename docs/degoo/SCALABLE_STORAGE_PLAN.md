@@ -964,10 +964,18 @@ shipping local-only authority would violate the explicit recovery requirement.
   cancellation fixtures now return the terminal status and preserve buffered
   data; the outer reader no longer discards the error. This fixes error
   propagation without removing provider cooldown protection.
-- Backup orchestration is being corrected in the separate application
-  repository to drain before/after Borg phases, limit eligible maintenance
-  retries and remove unconditional lock breaking. Existing archive data and
-  cache identities are preserved. No format reset is involved.
+- Backup orchestration was deployed from merged Immich PR #3. It drains
+  before/after Borg phases, limits eligible maintenance retries and removes
+  unconditional lock breaking. A complete Google Drive backup passed under
+  a cron-like environment, including create, prune, compact and upload drains.
+- The Degoo client at `3d257df4e` is installed with unchanged configuration
+  and cache identities. Two generated live Borg-lock cycles and the latest
+  archive reference check passed. Normal compaction and its final upload
+  drain also passed; stale compaction-entry warnings are recorded in the
+  validation evidence. Failed seeks also preserve their prior
+  position and streams. Google Drive's replacement client is staged, but
+  activating it requires a user's shell to leave the mounted directory so
+  normal unmount can succeed. No format reset or forced unmount was used.
 - Offline full-suite, scoped race, lint, native FUSE and live deployment
   evidence is recorded in [VALIDATION.md](VALIDATION.md). These changes do not
   close the storage-redesign, independent integrity or password-only recovery

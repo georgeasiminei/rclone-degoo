@@ -16,6 +16,19 @@ failed deleting an obsolete segment while `GetFileChildren5` was rate limited.
 The client held requests for about one hour; uploads later drained. Borg's
 missing-segment compaction warnings did not establish repository integrity.
 
+Immich PR #3, squash commit `ccdcaf448443f9299b13e8028c8dd33aa625044f`, was
+merged to clean `staging` and deployed. A cron-like run of
+`backup-immich.sh extra /mnt/gdrive` completed in 179 seconds, including
+archive creation, pruning, compaction, and the phase upload drains.
+
+The Degoo runtime update at commit
+`f1df4e6e8c87a937f4a03d8a1829c10db6070dea` was deployed while preserving the
+existing configuration and cache-identity hashes. The mount used
+`--tpslimit 2 --tpslimit-burst 1` as a cautious operational request cap, not a
+verified provider quota. Two generated Borg-lock rename/unlink/rmdir cycles
+passed in 48 seconds; the generated objects were removed and the upload queue
+ended at zero.
+
 A generated local-Fs regression deterministically reproduced a zero-byte lock
 marker upload landing after fallback directory move's source snapshot. It
 failed with `RenameDir rmdir: directory not empty` before the fix. With a
@@ -52,16 +65,42 @@ Offline validation passed:
 The separate backup-application patch passed 35 mocked script/cache-waiter
 tests. A read-only scan confirmed that its older rclone cache uses `0644`
 metadata files inside owner-private directories; the waiter accepts this
-layout while rejecting writable, replaced or changing records. The real cache
-wait succeeded with zero dirty files. No cache permissions were changed.
+layout while rejecting group/world-writable, replaced or changing records.
+The real cache wait succeeded with zero dirty files. No cache permissions were
+changed.
 
 Live Google Drive validation passed a latest-archive reference check and
 restored a 661,174,206-byte compressed database dump. SHA-256 matched the
 source and gzip validation passed. The restored temporary copy was removed.
 This is a representative restore through the mount, not full repository CRC or
-cryptographic file-content verification. Degoo reference checking and patched
-runtime deployment remain in progress; no repair mode or format reset has
-been used.
+cryptographic file-content verification. Degoo's latest-archive reference
+check passed in 766.8 seconds on the patched mount, reporting no problems;
+the check did not examine all archives or verify payload contents. No repair
+mode or format reset has been used. The older Google Drive runtime remains
+active because a user Bash process (PID
+2162351) has `/mnt/gdrive` as its working directory, preventing a normal
+unmount. A replacement binary and mount drop-in are staged; no forced or lazy
+unmount was used.
+
+Follow-up commit `3d257df4e7cabe7937a2628ef58a228b4c3699c4` preserves the
+read position when a parallel `Seek` fails, including when the target is a
+later stream. Both generated regressions failed before the correction and
+pass afterward. All 195 credential-free Go packages, chunked-reader/pool race
+tests, scoped vet/lint and package checks passed for this candidate. The full
+suite requires the newly built `rclone` on `PATH`; an initial run selected the
+older system executable and failed the archive backend's subprocess test.
+The follow-up was installed through the contained updater; its user service
+restarted normally, and configuration and cache-identity hashes remained
+unchanged. The staged Google Drive client at the same commit successfully
+listed the remote directly using the existing authenticated configuration.
+
+Normal Degoo compaction then completed on the final candidate in 471.1
+seconds, with both pre/post upload waits passing and no provider cooldown
+observed. It freed about 5.27 kB. It reported stale compaction entries for
+missing old segments 0, 1, 188, 189, 190, 196 and 197, then exited zero;
+these warnings are recorded separately from the successful latest-archive
+reference check. This was ordinary compaction under the backup destination's
+application lock, with no repair or automatic lock breaking.
 
 ## Directory removal after interrupted uploads — 2026-10-19
 

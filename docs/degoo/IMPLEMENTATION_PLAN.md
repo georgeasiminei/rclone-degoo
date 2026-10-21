@@ -90,7 +90,8 @@ stream failed to open during throttling. Stream reads and seeks now observe
 producer completion and cancellation, retain buffered bytes, and return the
 terminal error instead of waiting forever. The outer reader preserves that
 error, including retry information. Short successful streams return unexpected
-EOF rather than being treated as complete.
+EOF rather than being treated as complete. A failed seek preserves the prior
+read position and earlier streams until the target buffer can be positioned.
 
 `degoo-rc wait` separately waits for local dirty writes, upload queues and the
 persisted cooldown to clear. Runtime statistics read disk-cache counters without
