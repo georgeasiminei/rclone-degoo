@@ -40,6 +40,11 @@ operation. Bound total waiting and retry attempts, preserve the original error
 when recovery fails, and never retry arbitrary repository or authentication
 errors as if they were throttling.
 
+Rclone's `--tpslimit` and `--tpslimit-burst` can also bound HTTP request bursts.
+Apply them to the mount process, including after a service restart. A chosen
+rate is an operational setting, not a verified Degoo quota, and does not
+replace cooldown handling or writeback checks.
+
 Do not automatically repeat `borg create` after a failure: its archive commit
 may be ambiguous. Do not run unconditional `borg break-lock`; confirm no
 repository user remains before any deliberate lock recovery. Failed `borg info`

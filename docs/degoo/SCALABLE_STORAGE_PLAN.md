@@ -959,6 +959,11 @@ shipping local-only authority would violate the explicit recovery requirement.
   cooldown record with a bounded timeout and consecutive idle samples. Local
   runtime statistics bypass the directory-tree walk so slow remote listings
   do not block this monitoring path.
+- A live archive check also reproduced a parallel-reader hang after a stream
+  failed during throttling. Generated Open-error, partial-error, short-EOF and
+  cancellation fixtures now return the terminal status and preserve buffered
+  data; the outer reader no longer discards the error. This fixes error
+  propagation without removing provider cooldown protection.
 - Backup orchestration is being corrected in the separate application
   repository to drain before/after Borg phases, limit eligible maintenance
   retries and remove unconditional lock breaking. Existing archive data and

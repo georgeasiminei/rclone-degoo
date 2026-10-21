@@ -30,6 +30,14 @@ walking VFS directory metadata and passes afterward. This reproduces the
 monitoring delay observed during live repository inspection without requiring
 provider credentials.
 
+A subsequent live archive check hung after a parallel stream failed to open
+while Degoo was throttling. Its producer had exited, but the consumer continued
+waiting for bytes. An offline Open-429 regression reproduced the hang before
+the fix. Open errors, partial buffered data followed by an error, short EOF,
+and cancellation/close ordering pass afterward, including scoped race tests
+for the chunked reader and pool. The outer reader also preserves stream errors
+instead of shadowing and dropping them.
+
 Offline validation passed:
 
 - `go build` and all 195 packages in the credential-free full Go test suite.

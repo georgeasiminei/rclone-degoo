@@ -39,7 +39,8 @@ type stream struct {
 	size      int64           // and the size it is reading
 	readBytes int64           // bytes read from the stream
 	rw        *pool.RW        // buffer for read
-	err       chan error      // error returned from the read
+	done      chan struct{}   // closed when the background read has finished
+	err       error           // final error from the background read, set before done is closed
 	name      string          // name of this stream for debugging
 }
 
@@ -56,7 +57,7 @@ func (cr *parallel) newStream(ctx context.Context, offset, size int64) (s *strea
 		offset: offset,
 		size:   size,
 		rw:     rw,
-		err:    make(chan error, 1),
+		done:   make(chan struct{}),
 	}
 	s.name = fmt.Sprintf("stream(%d,%d,%p)", s.offset, s.size, s)
 
@@ -69,13 +70,21 @@ func (cr *parallel) newStream(ctx context.Context, offset, size int64) (s *strea
 
 // read the file into the buffer
 func (s *stream) readFrom(ctx context.Context) {
+	var err error
+	defer func() {
+		s.err = err
+		close(s.done)
+		// Wake readers waiting for more bytes after the producer has stopped.
+		s.cancel()
+	}()
+
 	// Open the object at the correct range
 	fs.Debugf(s.cr.o, "%s: open", s.name)
 	rc, err := operations.Open(ctx, s.cr.o,
 		&fs.HashesOption{Hashes: hash.Set(hash.None)},
 		&fs.RangeOption{Start: s.offset, End: s.offset + s.size - 1})
 	if err != nil {
-		s.err <- fmt.Errorf("parallel chunked reader: failed to open stream at %d size %d: %w", s.offset, s.size, err)
+		err = fmt.Errorf("parallel chunked reader: failed to open stream at %d size %d: %w", s.offset, s.size, err)
 		return
 	}
 	s.rc = rc
@@ -83,7 +92,6 @@ func (s *stream) readFrom(ctx context.Context) {
 	fs.Debugf(s.cr.o, "%s: readfrom started", s.name)
 	_, err = s.rw.ReadFrom(s.rc)
 	fs.Debugf(s.cr.o, "%s: readfrom finished (%d bytes): %v", s.name, s.rw.Size(), err)
-	s.err <- err
 }
 
 // eof is true when we've read all the data we are expecting
@@ -100,7 +108,13 @@ func (s *stream) read(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return n, nil
 	}
+	producerDone := false
 	for {
+		select {
+		case <-s.done:
+			producerDone = true
+		default:
+		}
 		var nn int
 		nn, err = s.rw.Read(p[n:])
 		fs.Debugf(s.cr.o, "%s: rw.Read nn=%d, err=%v", s.name, nn, err)
@@ -116,10 +130,40 @@ func (s *stream) read(p []byte) (n int, err error) {
 		if n >= len(p) {
 			break
 		}
+		if producerDone {
+			return n, s.readResult()
+		}
 		// Wait for a write to happen to read more
 		s.rw.WaitWrite(s.ctx)
+		select {
+		case <-s.done:
+			producerDone = true
+			continue
+		default:
+		}
+		if err := s.ctx.Err(); err != nil {
+			select {
+			case <-s.done:
+				producerDone = true
+				continue
+			default:
+				return n, err
+			}
+		}
 	}
 	return n, nil
+}
+
+// readResult returns the terminal stream error once the producer has stopped.
+// It is called after observing s.done, which synchronizes with readFrom.
+func (s *stream) readResult() error {
+	if s.err != nil {
+		return s.err
+	}
+	if !s.eof() {
+		return io.ErrUnexpectedEOF
+	}
+	return io.EOF
 }
 
 // Sets *perr to newErr if err is nil
@@ -133,7 +177,8 @@ func orErr(perr *error, newErr error) {
 func (s *stream) close() (err error) {
 	defer log.Trace(s.cr.o, "%s: close", s.name)("err=%v", &err)
 	s.cancel()
-	err = <-s.err // wait for readFrom to stop and return error
+	<-s.done // wait for readFrom to stop and publish its error
+	err = s.err
 	orErr(&err, s.rw.Close())
 	if s.rc != nil {
 		orErr(&err, s.rc.Close())
@@ -265,7 +310,8 @@ func (cr *parallel) Read(p []byte) (n int, err error) {
 
 		// Read from the stream
 		stream := cr.streams[0]
-		nn, err := stream.read(p[n:])
+		var nn int
+		nn, err = stream.read(p[n:])
 		n += nn
 		cr.offset += int64(nn)
 		if err == io.EOF {
@@ -363,7 +409,23 @@ func (cr *parallel) Seek(offset int64, whence int) (int64, error) {
 	fs.Debugf(cr.o, "parallel chunked reader: seek the current stream to %d", streamOffset)
 	// Wait for the read to the correct part of the data
 	for stream.rw.Size() < streamOffset {
-		stream.rw.WaitWrite(cr.ctx)
+		select {
+		case <-stream.done:
+			if stream.rw.Size() < streamOffset {
+				return cr.offset, stream.readResult()
+			}
+			continue
+		default:
+		}
+		stream.rw.WaitWrite(stream.ctx)
+		if err := stream.ctx.Err(); err != nil {
+			select {
+			case <-stream.done:
+				continue
+			default:
+				return cr.offset, err
+			}
+		}
 	}
 	_, err := stream.rw.Seek(streamOffset, io.SeekStart)
 	if err != nil {

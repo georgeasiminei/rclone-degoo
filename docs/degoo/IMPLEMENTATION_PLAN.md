@@ -85,6 +85,13 @@ Unrelated uploads remain eligible. Cancellation releases the pause without
 discarding pending writes. Generated tests cover the failing snapshot race,
 active-upload callbacks, nested pauses and the complete Borg marker lifecycle.
 
+Live archive validation also exposed a parallel chunked-reader hang after a
+stream failed to open during throttling. Stream reads and seeks now observe
+producer completion and cancellation, retain buffered bytes, and return the
+terminal error instead of waiting forever. The outer reader preserves that
+error, including retry information. Short successful streams return unexpected
+EOF rather than being treated as complete.
+
 `degoo-rc wait` separately waits for local dirty writes, upload queues and the
 persisted cooldown to clear. Runtime statistics read disk-cache counters without
 walking directory metadata, so a remote listing cannot block them through its
