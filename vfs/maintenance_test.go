@@ -141,8 +141,8 @@ func TestPrepareMaintenanceWaitsForDirectoryHandle(t *testing.T) {
 		return false
 	}, time.Second, 10*time.Millisecond)
 	select {
-	case <-prepared:
-		t.Fatal("maintenance returned while a directory handle was open")
+	case err := <-prepared:
+		t.Fatalf("maintenance returned while a directory handle was open: %v", err)
 	default:
 	}
 

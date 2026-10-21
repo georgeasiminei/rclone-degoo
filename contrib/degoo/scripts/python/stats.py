@@ -191,15 +191,17 @@ def _validate_stats(value: Any) -> dict[str, Any]:
     return value
 
 
-def request_stats(root: Path) -> dict[str, Any]:
+def request_stats(root: Path, *, timeout: float = STATS_TIMEOUT) -> dict[str, Any]:
     """Read aggregate statistics from the private local mount socket only."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise StatsError("the mounted vault statistics request timed out")
     try:
         local_sync._validate_install(root)
         socket_path = local_sync._socket_path(root)
     except local_sync.SyncError as exc:
         raise StatsError(str(exc)) from None
 
-    connection = local_sync.UnixHTTPConnection(socket_path, timeout=STATS_TIMEOUT)
+    connection = local_sync.UnixHTTPConnection(socket_path, timeout=timeout)
     try:
         connection.request("GET", "/stats", headers={"Accept": "application/json"})
         response = connection.getresponse()

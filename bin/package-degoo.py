@@ -39,12 +39,14 @@ PYTHON_HELPERS = (
     "sync.py",
     "status.py",
     "stats.py",
+    "wait.py",
     "benchmark.py",
     "update.py",
     "update_preflight.py",
 )
 DOC_FILES = (
     "API_EVIDENCE.md",
+    "BORG_BACKUP_OPERATIONS.md",
     "IMPLEMENTATION_PLAN.md",
     "INSTALLATION.md",
     "REQUIREMENTS.md",
@@ -56,7 +58,7 @@ SHELL_LAUNCHERS = (
     "scripts/install.sh", "scripts/uninstall.sh", "scripts/trash.sh",
 )
 CLI_COMMANDS = (
-    "install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "mount", "stop", "status", "stats", "update",
+    "install", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "mount", "stop", "status", "stats", "wait", "update",
     "location", "folders", "service", "info", "logs", "trash", "empty-trash", "completion",
 )
 PACKAGE_ENTRIES = (

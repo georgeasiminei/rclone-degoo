@@ -13,7 +13,6 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/vfs"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
@@ -24,9 +23,8 @@ const maxRequestStatsBytes = 64 * 1024
 // collectRuntimeStats inspects local VFS state without listing remote directories
 // or opening remote objects. Cached ranges exclude filesystem allocation overhead.
 func collectRuntimeStats(ctx context.Context, mounted *vfs.VFS, started time.Time) (map[string]any, error) {
-	stats := mounted.Stats()
-	disk, ok := stats["diskCache"].(rc.Params)
-	if !ok {
+	disk := mounted.DiskCacheStats()
+	if disk == nil {
 		return nil, errors.New("VFS disk cache statistics unavailable")
 	}
 	cache := make(map[string]any)

@@ -8,6 +8,53 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Borg lock writeback and cloud maintenance — 2026-10-21
+
+The latest scheduled Google Drive backup completed after account
+reauthorization. Degoo created its archive and completed pruning, then compact
+failed deleting an obsolete segment while `GetFileChildren5` was rate limited.
+The client held requests for about one hour; uploads later drained. Borg's
+missing-segment compaction warnings did not establish repository integrity.
+
+A generated local-Fs regression deterministically reproduced a zero-byte lock
+marker upload landing after fallback directory move's source snapshot. It
+failed with `RenameDir rmdir: directory not empty` before the fix. With a
+writeback prefix pause, it passes through rename, marker upload, unlink and
+directory removal without late resurrection. Additional tests cover an active
+upload's VFS callback, unrelated uploads, nested pauses, renamed queue items,
+context cancellation and pending-write preservation.
+
+A second generated regression held a remote directory listing open while
+requesting local runtime statistics. It failed before statistics stopped
+walking VFS directory metadata and passes afterward. This reproduces the
+monitoring delay observed during live repository inspection without requiring
+provider credentials.
+
+Offline validation passed:
+
+- `go build` and all 195 packages in the credential-free full Go test suite.
+- Scoped VFS/cache/writeback tests and race tests, plus the runtime-statistics
+  regression under the race detector.
+- `go vet` for VFS and Degoo commands; golangci-lint 2.15.0 for VFS, Degoo
+  commands and the Degoo backend reported zero issues.
+- The native Linux FUSE directory-removal regression, retaining dirty-file
+  cancellation and hidden-orphan cleanup behavior.
+- All 515 Python helper tests, package self-check and Markdown/diff checks.
+
+The separate backup-application patch passed 35 mocked script/cache-waiter
+tests. A read-only scan confirmed that its older rclone cache uses `0644`
+metadata files inside owner-private directories; the waiter accepts this
+layout while rejecting writable, replaced or changing records. The real cache
+wait succeeded with zero dirty files. No cache permissions were changed.
+
+Live Google Drive validation passed a latest-archive reference check and
+restored a 661,174,206-byte compressed database dump. SHA-256 matched the
+source and gzip validation passed. The restored temporary copy was removed.
+This is a representative restore through the mount, not full repository CRC or
+cryptographic file-content verification. Degoo reference checking and patched
+runtime deployment remain in progress; no repair mode or format reset has
+been used.
+
 ## Directory removal after interrupted uploads — 2026-10-19
 
 A live `rmdir` reproduced `Input/output error`, with the mount recording

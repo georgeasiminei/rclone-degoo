@@ -212,6 +212,262 @@ func TestWriteBackResetTimer(t *testing.T) {
 	assertTimerRunning(t, wb, true)
 }
 
+func addNamedWrite(wb *WriteBack, puts chan<- string, name string) Handle {
+	var id Handle
+	id = wb.Add(0, name, 0, true, func(context.Context) error {
+		wb.mu.Lock()
+		currentName := wb.lookup[id].name
+		wb.mu.Unlock()
+		puts <- currentName
+		return nil
+	})
+	return id
+}
+
+func expireWrite(t *testing.T, wb *WriteBack, id Handle) {
+	t.Helper()
+	require.NoError(t, wb.SetExpiry(id, time.Now().Add(-time.Second), 0))
+}
+
+func requireNoWrite(t *testing.T, puts <-chan string) {
+	t.Helper()
+	select {
+	case name := <-puts:
+		t.Fatalf("unexpected writeback for %q", name)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func requireNamedWrite(t *testing.T, puts <-chan string, expected string) {
+	t.Helper()
+	select {
+	case name := <-puts:
+		require.Equal(t, expected, name)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for writeback of %q", expected)
+	}
+}
+
+func waitForEmptyQueue(t *testing.T, wb *WriteBack) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		inProgress, queued := wb.Stats()
+		return inProgress == 0 && queued == 0
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestWriteBackPausePrefixAndOverlappingPauses(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+	// Keep new items pending until the test explicitly expires them.
+	wb.opt.WriteBack = fs.Duration(time.Hour)
+
+	puts := make(chan string, 8)
+	fooID := addNamedWrite(wb, puts, "foo/item")
+	nestedID := addNamedWrite(wb, puts, "foo/bar/item")
+	foobarID := addNamedWrite(wb, puts, "foobar/item")
+	outerPause, err := wb.PausePrefix(context.Background(), "foo")
+	require.NoError(t, err)
+	innerPause, err := wb.PausePrefix(context.Background(), "foo/bar")
+	require.NoError(t, err)
+	newID := addNamedWrite(wb, puts, "foo/new-item")
+
+	expireWrite(t, wb, fooID)
+	expireWrite(t, wb, nestedID)
+	expireWrite(t, wb, foobarID)
+	expireWrite(t, wb, newID)
+	requireNamedWrite(t, puts, "foobar/item")
+	requireNoWrite(t, puts)
+
+	outerPause.Release()
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case name := <-puts:
+			seen[name] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for writes released by outer pause")
+		}
+	}
+	require.True(t, seen["foo/item"])
+	require.True(t, seen["foo/new-item"])
+	requireNoWrite(t, puts)
+
+	innerPause.Release()
+	requireNamedWrite(t, puts, "foo/bar/item")
+	waitForEmptyQueue(t, wb)
+}
+
+func TestWriteBackPauseTracksRenamedItems(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+	wb.opt.WriteBack = fs.Duration(time.Hour)
+
+	puts := make(chan string, 2)
+	id := addNamedWrite(wb, puts, "source/marker")
+	pause, err := wb.PausePrefix(context.Background(), "source")
+	require.NoError(t, err)
+	wb.Rename(id, "destination/marker")
+	expireWrite(t, wb, id)
+	requireNoWrite(t, puts)
+
+	pause.Release()
+	requireNamedWrite(t, puts, "destination/marker")
+	waitForEmptyQueue(t, wb)
+}
+
+func TestWriteBackPauseContextCancellationKeepsQueuedItems(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+	wb.opt.WriteBack = fs.Duration(time.Hour)
+
+	puts := make(chan string, 2)
+	id := addNamedWrite(wb, puts, "foo/marker")
+	ctx, cancelPause := context.WithCancel(context.Background())
+	pause, err := wb.PausePrefix(ctx, "foo")
+	require.NoError(t, err)
+	_, queued := wb.Stats()
+	require.Equal(t, 1, queued)
+
+	cancelPause()
+	expireWrite(t, wb, id)
+	requireNamedWrite(t, puts, "foo/marker")
+	waitForEmptyQueue(t, wb)
+	pause.Release() // Explicit release remains safe after context cancellation.
+}
+
+func TestWriteBackPauseWaitsForActiveUploadWithoutCanceling(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+	wb.opt.WriteBack = fs.Duration(time.Hour)
+
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	cancelled := make(chan struct{}, 1)
+	id := wb.Add(0, "foo/active", 0, true, func(ctx context.Context) error {
+		close(started)
+		select {
+		case <-finish:
+			return nil
+		case <-ctx.Done():
+			cancelled <- struct{}{}
+			return ctx.Err()
+		}
+	})
+	expireWrite(t, wb, id)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	type pauseResult struct {
+		pause *PrefixPause
+		err   error
+	}
+	paused := make(chan pauseResult, 1)
+	go func() {
+		pause, err := wb.PausePrefix(context.Background(), "foo")
+		paused <- pauseResult{pause: pause, err: err}
+	}()
+	select {
+	case <-paused:
+		t.Fatal("pause returned before the active upload finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("pause canceled an active upload")
+	default:
+	}
+
+	close(finish)
+	result := <-paused
+	require.NoError(t, result.err)
+	require.NotNil(t, result.pause)
+	result.pause.Release()
+	waitForEmptyQueue(t, wb)
+	select {
+	case <-cancelled:
+		t.Fatal("upload context was canceled while waiting for the pause")
+	default:
+	}
+}
+
+func TestWriteBackPauseCancellationWhileWaitingKeepsActiveUpload(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+	wb.opt.WriteBack = fs.Duration(time.Hour)
+
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	cancelled := make(chan struct{}, 1)
+	id := wb.Add(0, "foo/active", 0, true, func(ctx context.Context) error {
+		close(started)
+		select {
+		case <-finish:
+			return nil
+		case <-ctx.Done():
+			cancelled <- struct{}{}
+			return ctx.Err()
+		}
+	})
+	expireWrite(t, wb, id)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	ctx, cancelPause := context.WithCancel(context.Background())
+	paused := make(chan error, 1)
+	go func() {
+		_, err := wb.PausePrefix(ctx, "foo")
+		paused <- err
+	}()
+	require.Eventually(t, func() bool {
+		wb.mu.Lock()
+		defer wb.mu.Unlock()
+		return len(wb.pauses) == 1
+	}, 2*time.Second, 10*time.Millisecond)
+	cancelPause()
+	select {
+	case err := <-paused:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled pause did not return")
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("canceling the pause canceled the active upload")
+	default:
+	}
+
+	close(finish)
+	waitForEmptyQueue(t, wb)
+}
+
+func TestWriteBackPauseDeleteAndAddRespectGate(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+	wb.opt.WriteBack = fs.Duration(time.Hour)
+
+	puts := make(chan string, 3)
+	deletedID := addNamedWrite(wb, puts, "foo/deleted")
+	pause, err := wb.PausePrefix(context.Background(), "foo")
+	require.NoError(t, err)
+	newID := addNamedWrite(wb, puts, "foo/new")
+	require.True(t, wb.Remove(deletedID))
+	expireWrite(t, wb, newID)
+	requireNoWrite(t, puts)
+	_, queued := wb.Stats()
+	require.Equal(t, 1, queued, "delete should remove only its queued item")
+
+	pause.Release()
+	requireNamedWrite(t, puts, "foo/new")
+	waitForEmptyQueue(t, wb)
+}
+
 // A "transfer" for testing
 type putItem struct {
 	wg        sync.WaitGroup

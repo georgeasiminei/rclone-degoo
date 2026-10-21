@@ -234,6 +234,11 @@ func (c *Cache) QueueSetExpiry(id writeback.Handle, expiry time.Time, relative t
 	return c.writeback.SetExpiry(id, expiry, relative)
 }
 
+// PauseWriteBackPrefix holds queued uploads in a path subtree until released.
+func (c *Cache) PauseWriteBackPrefix(ctx context.Context, prefix string) (*writeback.PrefixPause, error) {
+	return c.writeback.PausePrefix(ctx, prefix)
+}
+
 // createDir creates a directory path, along with any necessary parents
 func createDir(dir string) error {
 	return file.MkdirAll(dir, 0700)

@@ -935,4 +935,35 @@ shipping local-only authority would violate the explicit recovery requirement.
   user's shell working inside the mount. The old runtime remains active;
   configuration, cache identity and pending writes are preserved. Next action:
   leave the mounted working directory, retry the contained update, and verify
-  the originally failing `rmdir` through the patched mount.
+  the originally failing `rmdir` through the patched mount. A subsequent
+  2026-10-21 inspection confirmed that the affected host had installed the
+  merged PR #59 build, commit `5b3cfda13`; the later backup failures below
+  occurred with that build already running.
+
+### 2026-10-21 — Borg backup failures and writeback coordination
+
+- Owner: coordinating Codex agent, with delegated VFS regression/fix, local
+  wait helper and backup-script implementation. Branch:
+  `fix/degoo-backup-maintenance`, based on `origin/staging` at `5b3cfda13`.
+- Google Drive authentication was restored on 2026-10-20 and the following
+  scheduled backup completed. Degoo's 2026-10-21 snapshot creation and pruning
+  returned success, but compact failed deleting an obsolete segment during a
+  one-hour provider cooldown. Uploads later resumed; an empty queue did not
+  establish repository integrity.
+- A generated VFS regression reproduced a queued zero-byte lock marker
+  arriving after fallback directory move's source snapshot. A scoped writeback
+  pause now waits for active descendants, holds queued descendants through
+  rename and releases them under their new names. It preserves unrelated
+  uploads and pending-write accounting.
+- `degoo-rc wait` checks local queues, dirty cache and the protected provider
+  cooldown record with a bounded timeout and consecutive idle samples. Local
+  runtime statistics bypass the directory-tree walk so slow remote listings
+  do not block this monitoring path.
+- Backup orchestration is being corrected in the separate application
+  repository to drain before/after Borg phases, limit eligible maintenance
+  retries and remove unconditional lock breaking. Existing archive data and
+  cache identities are preserved. No format reset is involved.
+- Offline full-suite, scoped race, lint, native FUSE and live deployment
+  evidence is recorded in [VALIDATION.md](VALIDATION.md). These changes do not
+  close the storage-redesign, independent integrity or password-only recovery
+  acceptance gates.

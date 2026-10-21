@@ -70,6 +70,29 @@ run for that follow-up. See [VALIDATION.md](VALIDATION.md).
 
 ## Implementation decisions and validation plan
 
+### Cloud backup maintenance and lock writeback (2026-10-21)
+
+Borg backup diagnosis identified two separate failures in the active legacy
+mount: synchronous deletion fails during the provider cooldown, and directory
+rename can race a queued descendant upload. The latter is a generic VFS race:
+fallback directory move snapshots the source before a queued zero-byte lock
+marker is uploaded, then cannot remove that source directory.
+
+VFS now pauses queued writeback for the source subtree during directory rename
+and lets active uploads finish before the remote move. Cached descendants keep
+their queue identities through the move and resume under their new names.
+Unrelated uploads remain eligible. Cancellation releases the pause without
+discarding pending writes. Generated tests cover the failing snapshot race,
+active-upload callbacks, nested pauses and the complete Borg marker lifecycle.
+
+`degoo-rc wait` separately waits for local dirty writes, upload queues and the
+persisted cooldown to clear. Runtime statistics read disk-cache counters without
+walking directory metadata, so a remote listing cannot block them through its
+directory lock. Backup scripts must drain between phases and preserve failures;
+this does not turn local `fsync` into remote publication or remove provider
+limits. See [Borg backup operations](BORG_BACKUP_OPERATIONS.md). This change
+does not activate the scalable format or close its recovery gates.
+
 ### Directory deletion after interrupted uploads (2026-10-19)
 
 An empty-looking mounted directory failed `rmdir` with `EIO` because the raw

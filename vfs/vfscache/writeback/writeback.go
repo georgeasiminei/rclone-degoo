@@ -6,7 +6,9 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"path"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,14 +33,29 @@ type WriteBack struct {
 	// read and written with atomic, must be 64-bit aligned
 	id Handle // id of the last writeBackItem created
 
-	ctx     context.Context
-	mu      sync.Mutex
-	items   writeBackItems            // priority queue of *writeBackItem - writeBackItems are in here while awaiting transfer only
-	lookup  map[Handle]*writeBackItem // for getting a *writeBackItem from a Handle - writeBackItems are in here until cancelled
-	opt     *vfscommon.Options        // VFS options
-	timer   *time.Timer               // next scheduled time for the uploader
-	expiry  time.Time                 // time the next item expires or IsZero
-	uploads int                       // number of uploads in progress
+	ctx         context.Context
+	mu          sync.Mutex
+	items       writeBackItems            // priority queue of *writeBackItem - writeBackItems are in here while awaiting transfer only
+	lookup      map[Handle]*writeBackItem // for getting a *writeBackItem from a Handle - writeBackItems are in here until cancelled
+	pauses      map[uint64]*prefixPauseState
+	lastPauseID uint64
+	opt         *vfscommon.Options // VFS options
+	timer       *time.Timer        // next scheduled time for the uploader
+	expiry      time.Time          // time the next item expires or IsZero
+	uploads     int                // number of uploads in progress
+}
+
+// PrefixPause holds queued writebacks in a path subtree until it is released.
+type PrefixPause struct {
+	wb       *WriteBack
+	id       uint64
+	once     sync.Once
+	released chan struct{}
+}
+
+type prefixPauseState struct {
+	prefix string
+	items  map[*writeBackItem]struct{}
 }
 
 // New make a new WriteBack
@@ -49,6 +66,7 @@ func New(ctx context.Context, opt *vfscommon.Options) *WriteBack {
 		ctx:    ctx,
 		items:  writeBackItems{},
 		lookup: make(map[Handle]*writeBackItem),
+		pauses: make(map[uint64]*prefixPauseState),
 		opt:    opt,
 	}
 	heap.Init(&wb.items)
@@ -205,6 +223,157 @@ func (wb *WriteBack) _peekItem() (wbItem *writeBackItem) {
 	return wb.items[0]
 }
 
+// _inPrefix reports whether name is prefix or a descendant of prefix.
+func _inPrefix(name, prefix string) bool {
+	name = path.Clean(name)
+	if name == "." {
+		name = ""
+	}
+	if prefix == "" || prefix == "." {
+		return true
+	}
+	prefix = path.Clean(prefix)
+	return name == prefix || strings.HasPrefix(name, prefix+"/")
+}
+
+// _itemInPause reports whether item belongs to state, including items which
+// have been renamed out of the paused subtree while the pause is held.
+func (wb *WriteBack) _itemInPause(state *prefixPauseState, item *writeBackItem) bool {
+	if _, ok := state.items[item]; ok {
+		return true
+	}
+	return _inPrefix(item.name, state.prefix)
+}
+
+// _bindItemToPauses records path membership before a queued item is renamed.
+// Call with the lock held.
+func (wb *WriteBack) _bindItemToPauses(item *writeBackItem, names ...string) {
+	for _, state := range wb.pauses {
+		if _, ok := state.items[item]; ok {
+			continue
+		}
+		for _, name := range names {
+			if _inPrefix(name, state.prefix) {
+				state.items[item] = struct{}{}
+				break
+			}
+		}
+	}
+}
+
+// _peekUnpausedItem finds the earliest queued item which is not held by a
+// prefix pause. Call with the lock held.
+func (wb *WriteBack) _peekUnpausedItem() (next *writeBackItem) {
+	if len(wb.pauses) == 0 {
+		return wb._peekItem()
+	}
+	if len(wb.items) == 0 {
+		return nil
+	}
+	if !wb._isPaused(wb.items[0]) {
+		return wb.items[0]
+	}
+	for _, item := range wb.items {
+		if !wb._isPaused(item) && (next == nil || wb.items.Less(item.index, next.index)) {
+			next = item
+		}
+	}
+	return next
+}
+
+// _isPaused reports whether a queued item is held by any prefix pause. Call
+// with the lock held.
+func (wb *WriteBack) _isPaused(item *writeBackItem) bool {
+	for _, state := range wb.pauses {
+		if wb._itemInPause(state, item) {
+			return true
+		}
+	}
+	return false
+}
+
+// PausePrefix holds new queued uploads in prefix and waits for active uploads
+// in that subtree to finish. It does not cancel uploads already in progress.
+// The returned pause must be released when the operation protecting the
+// subtree is complete. Context cancellation releases the pause automatically.
+func (wb *WriteBack) PausePrefix(ctx context.Context, prefix string) (*PrefixPause, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix = path.Clean(prefix)
+	if prefix == "." {
+		prefix = ""
+	}
+
+	wb.mu.Lock()
+	wb.lastPauseID++
+	id := wb.lastPauseID
+	state := &prefixPauseState{prefix: prefix, items: make(map[*writeBackItem]struct{})}
+	for _, item := range wb.lookup {
+		if _inPrefix(item.name, prefix) {
+			state.items[item] = struct{}{}
+		}
+	}
+	wb.pauses[id] = state
+	wb._resetTimer()
+	wb.mu.Unlock()
+
+	pause := &PrefixPause{wb: wb, id: id, released: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			pause.Release()
+		case <-pause.released:
+		}
+	}()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			pause.Release()
+			return nil, err
+		}
+		wb.mu.Lock()
+		var done <-chan struct{}
+		for _, item := range wb.lookup {
+			if item.uploading && wb._itemInPause(state, item) {
+				done = item.done
+				break
+			}
+		}
+		wb.mu.Unlock()
+		if done == nil {
+			if err := ctx.Err(); err != nil {
+				pause.Release()
+				return nil, err
+			}
+			return pause, nil
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+			pause.Release()
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// Release resumes queued uploads held by this prefix pause.
+func (pause *PrefixPause) Release() {
+	if pause == nil {
+		return
+	}
+	pause.once.Do(func() {
+		close(pause.released)
+		pause.wb.mu.Lock()
+		delete(pause.wb.pauses, pause.id)
+		pause.wb._resetTimer()
+		pause.wb.mu.Unlock()
+	})
+}
+
 // stop the timer which runs the expiries
 func (wb *WriteBack) _stopTimer() {
 	if wb.expiry.IsZero() {
@@ -220,7 +389,7 @@ func (wb *WriteBack) _stopTimer() {
 
 // reset the timer which runs the expiries
 func (wb *WriteBack) _resetTimer() {
-	wbItem := wb._peekItem()
+	wbItem := wb._peekUnpausedItem()
 	if wbItem == nil {
 		wb._stopTimer()
 	} else {
@@ -272,6 +441,7 @@ func (wb *WriteBack) Add(id Handle, name string, size int64, modified bool, putF
 		// Kick the timer on
 		wb.items._update(wbItem, wb._newExpiry())
 	}
+	wb._bindItemToPauses(wbItem, name, wbItem.name)
 	wbItem.putFn = putFn
 	wbItem.size = size
 	wb._resetTimer()
@@ -334,6 +504,7 @@ func (wb *WriteBack) Rename(id Handle, name string) {
 		}
 	}
 
+	wb._bindItemToPauses(wbItem, wbItem.name, name)
 	wbItem.name = name
 	// Kick the timer on
 	wb.items._update(wbItem, wb._newExpiry())
@@ -441,7 +612,7 @@ func (wb *WriteBack) processItems(ctx context.Context) {
 	}
 
 	resetTimer := true
-	for wbItem := wb._peekItem(); wbItem != nil; wbItem = wb._peekItem() {
+	for wbItem := wb._peekUnpausedItem(); wbItem != nil; wbItem = wb._peekUnpausedItem() {
 		// If reached transfer limit stop the timer - it will be
 		// restarted when an upload finishes
 		if wb.uploads >= fs.GetConfig(wb.ctx).Transfers {
@@ -454,7 +625,7 @@ func (wb *WriteBack) processItems(ctx context.Context) {
 			break
 		}
 		// Pop the item, mark as uploading and start the uploader
-		wbItem = wb._popItem()
+		wb._removeItem(wbItem)
 		//fs.Debugf(wbItem.name, "uploading = true %p item %p", wbItem, wbItem.item)
 		wbItem.uploading = true
 		wb.uploads++
