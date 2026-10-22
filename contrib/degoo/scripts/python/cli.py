@@ -26,6 +26,7 @@ COMMANDS = {
     "stop": "Unmount the foreground vault safely, preserving pending cached writes.",
     "status": "Show authentication, mount health, pending uploads, and optional per-file upload state.",
     "stats": "Show local cache, transfer, upload queue, and Degoo API statistics.",
+    "wait": "Wait for local writeback to remain idle and any saved provider cooldown to expire.",
     "benchmark": "Measure mounted read/write throughput with cleanup by default.",
     "sync": "Refresh the mounted remote directory view for a local path, preserving pending writes.",
     "location": "Query Degoo for the configured vault folder and its ancestry.",
@@ -37,7 +38,7 @@ COMMANDS = {
     "empty-trash": "Permanently delete all account trash after confirmation; supports dry-run.",
     "completion": "Print a shell completion script for command names and subcommands.",
 }
-PYTHON_COMMANDS = {"install", "update", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "service", "info", "logs", "status", "stats", "mount-setup"}
+PYTHON_COMMANDS = {"install", "update", "uninstall", "backup-config", "benchmark", "sync", "login", "setup", "service", "info", "logs", "status", "stats", "wait", "mount-setup"}
 DETAILS = {
     "update": "Downloads the latest successful staging package using authenticated gh. Verifies checksums and build provenance before stopping anything. Waits up to --writer-timeout (30s by default) for open handles and flushes the local cache before normal unmount. --wait-for-uploads optionally waits for remote writeback; preparation failure leaves the mount running. Restores an active service or recognised manual mount; inactive installs stay inactive. Configuration and cache are preserved. --delete-cache refuses pending or unverifiable writes, and has no effect when already current. --archive PATH uses a local tar.gz and its checksum sidecar. Install failures restore the previous program files; startup failures retain the installed update for recovery.",
     "install": "With no parameters, starts the wizard. Installs into ~/.local/share/rclone-degoo and links ~/.local/bin/degoo-rc. The wizard accepts an optional vault.json import; otherwise it asks privately for the encryption password and offers new or existing remote folders. An unattended install needs --binary and --no-wizard. Upgrade preserves configuration and cached writes.",
@@ -49,6 +50,7 @@ DETAILS = {
     "stop": "Takes no parameters. Unmounts the contained mount using FUSE. To stop a service-managed mount, use degoo-rc service stop so systemd does not restart it. Cached pending writes remain available for recovery.",
     "status": "Reports authentication failures first, then mount/service health and local pending uploads. An optional local file path shows upload state; --json returns machine-readable status. Unhealthy states return a nonzero exit code. A zero pending count does not confirm cloud contents. Uploaded describes the current version known to VFS, without independent remote integrity verification.",
     "stats": "Reads aggregate counters from the running mount's private local socket and makes no requests to Degoo. Cache byte counts describe VFS cached ranges: dirty includes open unsent writes, while clean is split into evictable and pinned (open or within a grace period). The configured cache maximum is a soft target. Upload traffic counts encrypted HTTP body bytes, including retries; speed uses a recent mount-side sample. --watch refreshes every 2 seconds by default; --json cannot be combined with --watch.",
+    "wait": "Reads only local mount statistics and the private persisted cooldown sidecar. Requires two consecutive idle samples, an expired cooldown, no cache errors, and no out-of-space state. --timeout defaults to 7200 seconds (maximum 86400); --json reports completion and whether a cooldown was observed. Completion describes local writeback evidence and is not an independent remote integrity check.",
     "sync": "Use sync . from inside the mount, or pass an absolute mounted path. Refreshes remote directory metadata recursively; a file path refreshes its containing directory, and a missing path refreshes its nearest existing directory inside the mount. Preserves pending local writes. Reopen files to see changed content. This command does not upload, mirror, or download the whole directory.",
     "location": "Takes no positional parameters. Contacts Degoo and may renew account tokens. Returns the configured folder ancestry as JSON; does not download file contents.",
     "folders": "Uses the contained account authentication. Defaults to account root ID 0 to discover device folders. --parent-id ID lists children of that folder; output is JSON. Does not modify remote files.",

@@ -8,6 +8,123 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Google Drive activation and scheduled follow-up — 2026-10-22
+
+After the user's shell left the mount, Google Drive unmounted normally. The
+replacement initially refused the nonempty underlying mountpoint: it held one
+33-byte local `a.txt`, dated October 13. That file was moved to a private
+recovery directory with its checksum verified; no data was deleted or hidden
+under a replacement mount. The client at `3d257df4e` then started successfully
+using the existing configuration and cache.
+
+Two isolated Borg-lock rename/unlink/rmdir cycles passed in 14 seconds. After
+writeback drained, direct remote listing confirmed no resurrected children;
+the generated root was removed. A full backup under the cron environment on
+the upgraded mount completed in 129.2 seconds, including create, prune,
+compact and all upload drains. The earlier scheduled Google Drive backup also
+completed at 04:48:01.
+
+The next scheduled Degoo run failed during `borg info` at 06:51:28 with an I/O
+error listing the repository's data directory; provider logs reported HTTP
+403. The backup preserved that failure without a maintenance retry; the exact
+retry-gate inputs were not logged. A bounded follow-up at 07:50 failed with authentication HTTP
+401, and the local helper reported unsuccessful automatic account recovery.
+Explicit account login is required before another Degoo backup can be
+validated. The mount remains active with zero dirty files, queued uploads or
+cache errors. No repair or reset was performed.
+
+## Borg lock writeback and cloud maintenance — 2026-10-21
+
+The latest scheduled Google Drive backup completed after account
+reauthorization. Degoo created its archive and completed pruning, then compact
+failed deleting an obsolete segment while `GetFileChildren5` was rate limited.
+The client held requests for about one hour; uploads later drained. Borg's
+missing-segment compaction warnings did not establish repository integrity.
+
+Immich PR #3, squash commit `ccdcaf448443f9299b13e8028c8dd33aa625044f`, was
+merged to clean `staging` and deployed. A cron-like run of
+`backup-immich.sh extra /mnt/gdrive` completed in 179 seconds, including
+archive creation, pruning, compaction, and the phase upload drains.
+
+The Degoo runtime update at commit
+`f1df4e6e8c87a937f4a03d8a1829c10db6070dea` was deployed while preserving the
+existing configuration and cache-identity hashes. The mount used
+`--tpslimit 2 --tpslimit-burst 1` as a cautious operational request cap, not a
+verified provider quota. Two generated Borg-lock rename/unlink/rmdir cycles
+passed in 48 seconds; the generated objects were removed and the upload queue
+ended at zero.
+
+A generated local-Fs regression deterministically reproduced a zero-byte lock
+marker upload landing after fallback directory move's source snapshot. It
+failed with `RenameDir rmdir: directory not empty` before the fix. With a
+writeback prefix pause, it passes through rename, marker upload, unlink and
+directory removal without late resurrection. Additional tests cover an active
+upload's VFS callback, unrelated uploads, nested pauses, renamed queue items,
+context cancellation and pending-write preservation.
+
+A second generated regression held a remote directory listing open while
+requesting local runtime statistics. It failed before statistics stopped
+walking VFS directory metadata and passes afterward. This reproduces the
+monitoring delay observed during live repository inspection without requiring
+provider credentials.
+
+A subsequent live archive check hung after a parallel stream failed to open
+while Degoo was throttling. Its producer had exited, but the consumer continued
+waiting for bytes. An offline Open-429 regression reproduced the hang before
+the fix. Open errors, partial buffered data followed by an error, short EOF,
+and cancellation/close ordering pass afterward, including scoped race tests
+for the chunked reader and pool. The outer reader also preserves stream errors
+instead of shadowing and dropping them.
+
+Offline validation passed:
+
+- `go build` and all 195 packages in the credential-free full Go test suite.
+- Scoped VFS/cache/writeback tests and race tests, plus the runtime-statistics
+  regression under the race detector.
+- `go vet` for VFS and Degoo commands; golangci-lint 2.15.0 for VFS, Degoo
+  commands and the Degoo backend reported zero issues.
+- The native Linux FUSE directory-removal regression, retaining dirty-file
+  cancellation and hidden-orphan cleanup behavior.
+- All 515 Python helper tests, package self-check and Markdown/diff checks.
+
+The separate backup-application patch passed 35 mocked script/cache-waiter
+tests. A read-only scan confirmed that its older rclone cache uses `0644`
+metadata files inside owner-private directories; the waiter accepts this
+layout while rejecting group/world-writable, replaced or changing records.
+The real cache wait succeeded with zero dirty files. No cache permissions were
+changed.
+
+Live Google Drive validation passed a latest-archive reference check and
+restored a 661,174,206-byte compressed database dump. SHA-256 matched the
+source and gzip validation passed. The restored temporary copy was removed.
+This is a representative restore through the mount, not full repository CRC or
+cryptographic file-content verification. Degoo's latest-archive reference
+check passed in 766.8 seconds on the patched mount, reporting no problems;
+the check did not examine all archives or verify payload contents. No repair
+mode or format reset has been used. Google Drive's replacement was initially
+blocked by a user's shell working inside the mount; activation completed on
+October 22 as recorded above, without forced or lazy unmount.
+
+Follow-up commit `3d257df4e7cabe7937a2628ef58a228b4c3699c4` preserves the
+read position when a parallel `Seek` fails, including when the target is a
+later stream. Both generated regressions failed before the correction and
+pass afterward. All 195 credential-free Go packages, chunked-reader/pool race
+tests, scoped vet/lint and package checks passed for this candidate. The full
+suite requires the newly built `rclone` on `PATH`; an initial run selected the
+older system executable and failed the archive backend's subprocess test.
+The follow-up was installed through the contained updater; its user service
+restarted normally, and configuration and cache-identity hashes remained
+unchanged. The staged Google Drive client at the same commit successfully
+listed the remote directly using the existing authenticated configuration.
+
+Normal Degoo compaction then completed on the final candidate in 471.1
+seconds, with both pre/post upload waits passing and no provider cooldown
+observed. It freed about 5.27 kB. It reported stale compaction entries for
+missing old segments 0, 1, 188, 189, 190, 196 and 197, then exited zero;
+these warnings are recorded separately from the successful latest-archive
+reference check. This was ordinary compaction under the backup destination's
+application lock, with no repair or automatic lock breaking.
+
 ## Directory removal after interrupted uploads — 2026-10-19
 
 A live `rmdir` reproduced `Input/output error`, with the mount recording

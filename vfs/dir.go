@@ -1332,6 +1332,13 @@ func (d *Dir) renameEntry(oldName, newName string, destDir *Dir) error {
 		}
 		srcRemote := x.Remote()
 		dstRemote := newPath
+		if d.vfs.cache != nil {
+			pause, pauseErr := d.vfs.cache.PauseWriteBackPrefix(d.vfs.ctx, srcRemote)
+			if pauseErr != nil {
+				return pauseErr
+			}
+			defer pause.Release()
+		}
 		err = operations.DirMove(d.vfs.ctx, d.f, srcRemote, dstRemote)
 		if err != nil {
 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)

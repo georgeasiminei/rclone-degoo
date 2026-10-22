@@ -324,6 +324,14 @@ func (vfs *VFS) signalHandler(ctx context.Context) {
 	}
 }
 
+// DiskCacheStats returns local disk-cache statistics, or nil when caching is disabled.
+func (vfs *VFS) DiskCacheStats() rc.Params {
+	if vfs.cache == nil {
+		return nil
+	}
+	return vfs.cache.Stats()
+}
+
 // Stats returns info about the VFS
 func (vfs *VFS) Stats() (out rc.Params) {
 	out = make(rc.Params)
@@ -344,8 +352,8 @@ func (vfs *VFS) Stats() (out rc.Params) {
 	inf["dirs"] = dirs
 	inf["files"] = files
 
-	if vfs.cache != nil {
-		out["diskCache"] = vfs.cache.Stats()
+	if diskCache := vfs.DiskCacheStats(); diskCache != nil {
+		out["diskCache"] = diskCache
 	}
 	return out
 }

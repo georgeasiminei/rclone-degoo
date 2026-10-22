@@ -51,7 +51,7 @@ checkout and the extracted archive use `degoo-rc` as their sole installer and
 maintenance entrypoint. Examples here use `degoo-rc`.
 
 The command set is `install`, `update`, `uninstall`, `backup-config`, `login`, `setup`,
-`mount`, `stop`, `status`, `stats`, `benchmark`, `sync`, `location`, `folders`,
+`mount`, `stop`, `status`, `stats`, `wait`, `benchmark`, `sync`, `location`, `folders`,
 `service`, `info`, `logs`, `trash`, `empty-trash`, and `completion`.
 Service actions are `install`, `enable`, `disable`, `start`, `stop`, `restart`,
 and `status`.
@@ -453,6 +453,28 @@ proven. The VFS exposes the read-only Linux extended attribute
 `user.rclone.upload-status`; generic mounts leave it disabled by default, while
 `rclone degoo mount` enables it. `uploaded` is not a new remote read or an
 independent integrity audit.
+
+For scripts that must finish writeback before continuing, close their files and
+wait for the mount's upload queue, dirty cache and provider cooldown to clear:
+
+```sh
+degoo-rc wait --timeout 7200
+degoo-rc wait --timeout 7200 --json
+```
+
+The command reads local statistics and the private cooldown record only; it
+makes no provider requests and does not renew authentication. It requires two
+consecutive idle samples, returns nonzero on timeout or unavailable state, and
+preserves pending writes. Other applications can still write to the mount;
+the command does not reserve it or prevent future writes. Success describes
+VFS writeback completion, without an independent cloud integrity check.
+
+Borg backups need this distinction between filesystem completion and upload
+completion. Drain uploads before accessing a repository and after each Borg
+phase, especially before prune or compact. Preserve a failed operation's exit
+status. Only retry maintenance after an identified transient failure and a
+bounded recovery wait; do not automatically repeat archive creation or break
+repository locks. See [Borg backup operations](BORG_BACKUP_OPERATIONS.md).
 
 When the mount is absent, ordinary files found under the mountpoint are
 reported as `local-only`; they are not pending and will never be uploaded by

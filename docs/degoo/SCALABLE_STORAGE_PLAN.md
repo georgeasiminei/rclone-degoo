@@ -935,4 +935,55 @@ shipping local-only authority would violate the explicit recovery requirement.
   user's shell working inside the mount. The old runtime remains active;
   configuration, cache identity and pending writes are preserved. Next action:
   leave the mounted working directory, retry the contained update, and verify
-  the originally failing `rmdir` through the patched mount.
+  the originally failing `rmdir` through the patched mount. A subsequent
+  2026-10-21 inspection confirmed that the affected host had installed the
+  merged PR #59 build, commit `5b3cfda13`; the later backup failures below
+  occurred with that build already running.
+
+### 2026-10-21 — Borg backup failures and writeback coordination
+
+- Owner: coordinating Codex agent, with delegated VFS regression/fix, local
+  wait helper and backup-script implementation. Branch:
+  `fix/degoo-backup-maintenance`, based on `origin/staging` at `5b3cfda13`.
+- Google Drive authentication was restored on 2026-10-20 and the following
+  scheduled backup completed. Degoo's 2026-10-21 snapshot creation and pruning
+  returned success, but compact failed deleting an obsolete segment during a
+  one-hour provider cooldown. Uploads later resumed; an empty queue did not
+  establish repository integrity.
+- A generated VFS regression reproduced a queued zero-byte lock marker
+  arriving after fallback directory move's source snapshot. A scoped writeback
+  pause now waits for active descendants, holds queued descendants through
+  rename and releases them under their new names. It preserves unrelated
+  uploads and pending-write accounting.
+- `degoo-rc wait` checks local queues, dirty cache and the protected provider
+  cooldown record with a bounded timeout and consecutive idle samples. Local
+  runtime statistics bypass the directory-tree walk so slow remote listings
+  do not block this monitoring path.
+- A live archive check also reproduced a parallel-reader hang after a stream
+  failed during throttling. Generated Open-error, partial-error, short-EOF and
+  cancellation fixtures now return the terminal status and preserve buffered
+  data; the outer reader no longer discards the error. This fixes error
+  propagation without removing provider cooldown protection.
+- Backup orchestration was deployed from merged Immich PR #3. It drains
+  before/after Borg phases, limits eligible maintenance retries and removes
+  unconditional lock breaking. A complete Google Drive backup passed under
+  a cron-like environment, including create, prune, compact and upload drains.
+- The Degoo client at `3d257df4e` is installed with unchanged configuration
+  and cache identities. Two generated live Borg-lock cycles and the latest
+  archive reference check passed. Normal compaction and its final upload
+  drain also passed; stale compaction-entry warnings are recorded in the
+  validation evidence. Failed seeks also preserve their prior
+  position and streams. Google Drive's replacement client was activated on
+  October 22 after the user's shell left the mount. Its generated lock tests
+  and complete backup passed. One small local file below the mountpoint was
+  preserved separately before mounting; no format reset or forced unmount
+  was used.
+- The October 22 scheduled Degoo run encountered provider HTTP 403 during
+  repository inspection. A later bounded check returned authentication HTTP
+  401 and automatic account recovery did not complete. Pending writes remain
+  preserved and queues are empty; explicit account login and a subsequent
+  successful backup remain required. See [VALIDATION.md](VALIDATION.md).
+- Offline full-suite, scoped race, lint, native FUSE and live deployment
+  evidence is recorded in [VALIDATION.md](VALIDATION.md). These changes do not
+  close the storage-redesign, independent integrity or password-only recovery
+  acceptance gates.

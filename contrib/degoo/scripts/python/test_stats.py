@@ -100,6 +100,26 @@ class StatsTest(unittest.TestCase):
         connection.close.assert_called_once_with()
         self.assertEqual(result, sample_stats())
 
+    def test_local_socket_request_accepts_a_caller_deadline(self) -> None:
+        response = mock.Mock(status=200)
+        response.read.return_value = json.dumps(sample_stats()).encode("utf-8")
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        with (
+            mock.patch.object(stats.local_sync, "_validate_install"),
+            mock.patch.object(stats.local_sync, "_socket_path", return_value=Path("/private/vfs-sync.sock")),
+            mock.patch.object(stats.local_sync, "UnixHTTPConnection", return_value=connection) as make_connection,
+        ):
+            result = stats.request_stats(Path("/private"), timeout=0.25)
+
+        make_connection.assert_called_once_with(Path("/private/vfs-sync.sock"), timeout=0.25)
+        self.assertEqual(result, sample_stats())
+
+    def test_local_socket_request_rejects_nonpositive_or_nonfinite_timeouts(self) -> None:
+        for timeout in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(timeout=timeout), self.assertRaises(stats.StatsError):
+                stats.request_stats(Path("/private"), timeout=timeout)
+
     def test_unsupported_mount_has_actionable_restart_error(self) -> None:
         response = mock.Mock(status=200)
         response.read.return_value = b'{"api":{},"metadata_cache":{}}'
