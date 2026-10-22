@@ -973,9 +973,16 @@ shipping local-only authority would violate the explicit recovery requirement.
   archive reference check passed. Normal compaction and its final upload
   drain also passed; stale compaction-entry warnings are recorded in the
   validation evidence. Failed seeks also preserve their prior
-  position and streams. Google Drive's replacement client is staged, but
-  activating it requires a user's shell to leave the mounted directory so
-  normal unmount can succeed. No format reset or forced unmount was used.
+  position and streams. Google Drive's replacement client was activated on
+  October 22 after the user's shell left the mount. Its generated lock tests
+  and complete backup passed. One small local file below the mountpoint was
+  preserved separately before mounting; no format reset or forced unmount
+  was used.
+- The October 22 scheduled Degoo run encountered provider HTTP 403 during
+  repository inspection. A later bounded check returned authentication HTTP
+  401 and automatic account recovery did not complete. Pending writes remain
+  preserved and queues are empty; explicit account login and a subsequent
+  successful backup remain required. See [VALIDATION.md](VALIDATION.md).
 - Offline full-suite, scoped race, lint, native FUSE and live deployment
   evidence is recorded in [VALIDATION.md](VALIDATION.md). These changes do not
   close the storage-redesign, independent integrity or password-only recovery

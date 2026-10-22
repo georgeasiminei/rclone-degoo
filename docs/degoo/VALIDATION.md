@@ -8,6 +8,31 @@ provider compatibility or complete release acceptance.
 See [API_EVIDENCE.md](API_EVIDENCE.md) and the remaining checklist in
 [USAGE.md](USAGE.md).
 
+## Google Drive activation and scheduled follow-up — 2026-10-22
+
+After the user's shell left the mount, Google Drive unmounted normally. The
+replacement initially refused the nonempty underlying mountpoint: it held one
+33-byte local `a.txt`, dated October 13. That file was moved to a private
+recovery directory with its checksum verified; no data was deleted or hidden
+under a replacement mount. The client at `3d257df4e` then started successfully
+using the existing configuration and cache.
+
+Two isolated Borg-lock rename/unlink/rmdir cycles passed in 14 seconds. After
+writeback drained, direct remote listing confirmed no resurrected children;
+the generated root was removed. A full backup under the cron environment on
+the upgraded mount completed in 129.2 seconds, including create, prune,
+compact and all upload drains. The earlier scheduled Google Drive backup also
+completed at 04:48:01.
+
+The next scheduled Degoo run failed during `borg info` at 06:51:28 with an I/O
+error listing the repository's data directory; provider logs reported HTTP
+403. The backup preserved that failure without a maintenance retry; the exact
+retry-gate inputs were not logged. A bounded follow-up at 07:50 failed with authentication HTTP
+401, and the local helper reported unsuccessful automatic account recovery.
+Explicit account login is required before another Degoo backup can be
+validated. The mount remains active with zero dirty files, queued uploads or
+cache errors. No repair or reset was performed.
+
 ## Borg lock writeback and cloud maintenance — 2026-10-21
 
 The latest scheduled Google Drive backup completed after account
@@ -76,11 +101,9 @@ This is a representative restore through the mount, not full repository CRC or
 cryptographic file-content verification. Degoo's latest-archive reference
 check passed in 766.8 seconds on the patched mount, reporting no problems;
 the check did not examine all archives or verify payload contents. No repair
-mode or format reset has been used. The older Google Drive runtime remains
-active because a user Bash process (PID
-2162351) has `/mnt/gdrive` as its working directory, preventing a normal
-unmount. A replacement binary and mount drop-in are staged; no forced or lazy
-unmount was used.
+mode or format reset has been used. Google Drive's replacement was initially
+blocked by a user's shell working inside the mount; activation completed on
+October 22 as recorded above, without forced or lazy unmount.
 
 Follow-up commit `3d257df4e7cabe7937a2628ef58a228b4c3699c4` preserves the
 read position when a parallel `Seek` fails, including when the target is a
